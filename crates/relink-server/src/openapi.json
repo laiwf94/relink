@@ -1,0 +1,348 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "relink",
+    "version": "0.1.0",
+    "description": "URL shortener. Redirects are served at /{code}; links are managed under /v1 with an API key (Authorization: Bearer rlk_...). Errors are {\"error\":{\"code\",\"message\",\"request_id\"}}.",
+    "license": { "name": "MIT", "identifier": "MIT" }
+  },
+  "servers": [{ "url": "/" }],
+  "security": [{ "apiKey": [] }],
+  "paths": {
+    "/{code}": {
+      "get": {
+        "summary": "Follow a short link",
+        "operationId": "redirect",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/Code" }],
+        "responses": {
+          "301": { "$ref": "#/components/responses/Redirect" },
+          "302": { "$ref": "#/components/responses/Redirect" },
+          "307": { "$ref": "#/components/responses/Redirect" },
+          "308": { "$ref": "#/components/responses/Redirect" },
+          "404": { "description": "Unknown or disabled code.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "410": { "description": "Expired or click limit reached.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "451": { "description": "Not available in the visitor's country and no fallback URL is set.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "503": { "description": "The link is not cached and the database is unavailable.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/plain": { "schema": { "type": "string" } } } }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Liveness",
+        "operationId": "healthz",
+        "security": [],
+        "responses": { "200": { "description": "The process is running.", "content": { "application/json": { "schema": { "type": "object", "required": ["status"], "properties": { "status": { "const": "ok" } } } } } } }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Readiness",
+        "operationId": "readyz",
+        "security": [],
+        "description": "Ready while not shutting down, even when the database is down (cached redirects are still served). The body reports the database state.",
+        "responses": {
+          "200": { "description": "Ready.", "content": { "application/json": { "schema": { "type": "object", "required": ["status", "database"], "properties": { "status": { "const": "ready" }, "database": { "enum": ["up", "down"] } } } } } },
+          "503": { "description": "Shutting down.", "content": { "application/json": { "schema": { "type": "object", "required": ["status"], "properties": { "status": { "const": "shutting_down" } } } } } }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "The OpenAPI description of this API",
+        "operationId": "openapi",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI 3.1 document.", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/v1/links": {
+      "post": {
+        "summary": "Create a link",
+        "operationId": "createLink",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateLink" } } } },
+        "responses": {
+          "201": { "description": "Created.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List your links, newest first",
+        "operationId": "listLinks",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "next_cursor from the previous page." }
+        ],
+        "responses": {
+          "200": { "description": "A page of links.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LinkList" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/links/{code}": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }],
+      "get": {
+        "summary": "Get one of your links",
+        "operationId": "getLink",
+        "responses": {
+          "200": { "description": "The link.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Update a link",
+        "operationId": "updateLink",
+        "description": "Only the fields present change. null clears expires_at, max_clicks, geo and fallback_url. Changing destinations resets their health and invalidates A/B assignments.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchLink" } } } },
+        "responses": {
+          "200": { "description": "The updated link.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a link and its statistics",
+        "operationId": "deleteLink",
+        "responses": {
+          "204": { "description": "Deleted." },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/edge/clicks": {
+      "post": {
+        "summary": "Clicks served by the edge worker",
+        "operationId": "edgeClicks",
+        "description": "Only present when RELINK_EDGE_TOKEN is set; 404 otherwise. Clicks are validated as strictly as on the origin and queued with them.",
+        "security": [{ "edgeToken": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClickBatch" } } } },
+        "responses": {
+          "202": { "description": "Queued.", "content": { "application/json": { "schema": { "type": "object", "required": ["accepted"], "properties": { "accepted": { "type": "integer" } } } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/links/{code}/stats": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }],
+      "get": {
+        "summary": "Click statistics",
+        "operationId": "linkStats",
+        "description": "Totals per UTC day and breakdowns by country, device class and referrer host (top 50 each). Unique visitors are per day only: visitor hashes are keyed with a salt that changes daily, so visitors cannot be linked across days.",
+        "parameters": [
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Default: 29 days before to." },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Default: today (UTC). The range is at most 366 days." }
+        ],
+        "responses": {
+          "200": { "description": "Statistics.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Stats" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "edgeToken": { "type": "http", "scheme": "bearer", "description": "The shared secret in RELINK_EDGE_TOKEN, held by the edge worker." },
+      "apiKey": { "type": "http", "scheme": "bearer", "description": "rlk_ followed by 64 hex characters, created with `relink create-key OWNER`." }
+    },
+    "parameters": {
+      "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } }
+    },
+    "responses": {
+      "Redirect": {
+        "description": "Redirect to the destination (or the fallback URL). A/B links may set an assignment cookie.",
+        "headers": {
+          "Location": { "schema": { "type": "string" } },
+          "Cache-Control": { "schema": { "type": "string" } },
+          "Set-Cookie": { "schema": { "type": "string" } }
+        }
+      },
+      "Error": {
+        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message", "request_id"],
+            "properties": {
+              "code": { "enum": ["invalid_argument", "unauthenticated", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "internal", "unavailable"] },
+              "message": { "type": "string" },
+              "request_id": { "type": "string" }
+            }
+          }
+        }
+      },
+      "DestinationInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "maxLength": 2048, "description": "http or https; no credentials; public hosts only unless configured otherwise." },
+          "weight": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 1 }
+        }
+      },
+      "Geo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mode", "countries"],
+        "properties": {
+          "mode": { "enum": ["allow", "deny"] },
+          "countries": { "type": "array", "minItems": 1, "maxItems": 300, "items": { "type": "string", "pattern": "^[A-Za-z]{2}$" } }
+        }
+      },
+      "CreateLink": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Give exactly one of url and destinations.",
+        "properties": {
+          "url": { "type": "string", "maxLength": 2048 },
+          "destinations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/components/schemas/DestinationInput" } },
+          "alias": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{1,62}[A-Za-z0-9]$", "description": "Custom code. Reserved words are refused." },
+          "redirect_type": { "enum": [301, 302, 307, 308], "default": 302 },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "max_clicks": { "type": "integer", "minimum": 1, "maximum": 1000000000000 },
+          "geo": { "$ref": "#/components/schemas/Geo" },
+          "fallback_url": { "type": "string", "maxLength": 2048, "description": "Used for geo-blocked visitors and when every destination is unhealthy." },
+          "enabled": { "type": "boolean", "default": true },
+          "health_check": { "type": "boolean", "default": false }
+        }
+      },
+      "PatchLink": {
+        "type": "object",
+        "additionalProperties": false,
+        "minProperties": 1,
+        "properties": {
+          "url": { "type": "string", "maxLength": 2048 },
+          "destinations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/components/schemas/DestinationInput" } },
+          "redirect_type": { "enum": [301, 302, 307, 308] },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "max_clicks": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000000000000 },
+          "geo": { "oneOf": [{ "$ref": "#/components/schemas/Geo" }, { "type": "null" }] },
+          "fallback_url": { "type": ["string", "null"], "maxLength": 2048 },
+          "enabled": { "type": "boolean" },
+          "health_check": { "type": "boolean" }
+        }
+      },
+      "Link": {
+        "type": "object",
+        "required": ["code", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "created_at", "updated_at"],
+        "properties": {
+          "code": { "type": "string" },
+          "short_url": { "type": "string" },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["url", "weight", "healthy"],
+              "properties": {
+                "url": { "type": "string" },
+                "weight": { "type": "integer" },
+                "healthy": { "type": ["boolean", "null"], "description": "null when health checks are off." }
+              }
+            }
+          },
+          "redirect_type": { "enum": [301, 302, 307, 308] },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "max_clicks": { "type": ["integer", "null"] },
+          "geo": { "oneOf": [{ "$ref": "#/components/schemas/Geo" }, { "type": "null" }] },
+          "fallback_url": { "type": ["string", "null"] },
+          "enabled": { "type": "boolean" },
+          "health_check": { "type": "boolean" },
+          "health_checked_at": { "type": ["string", "null"], "format": "date-time" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "LinkList": {
+        "type": "object",
+        "required": ["links", "next_cursor"],
+        "properties": {
+          "links": { "type": "array", "items": { "$ref": "#/components/schemas/Link" } },
+          "next_cursor": { "type": ["string", "null"] }
+        }
+      },
+      "ClickBatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["clicks"],
+        "properties": {
+          "clicks": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["link_id", "day", "country", "device", "fingerprint"],
+              "properties": {
+                "link_id": { "type": "integer", "minimum": 1 },
+                "day": { "type": "integer", "description": "UTC days since the Unix epoch; today, yesterday or tomorrow." },
+                "country": { "type": "string", "pattern": "^[A-Z][A-Z0-9]$" },
+                "device": { "enum": ["desktop", "mobile", "tablet", "bot", "other"] },
+                "referrer": { "type": ["string", "null"] },
+                "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+              }
+            }
+          }
+        }
+      },
+      "Bucket": {
+        "type": "object",
+        "required": ["value", "clicks"],
+        "properties": { "value": { "type": "string" }, "clicks": { "type": "integer" } }
+      },
+      "Stats": {
+        "type": "object",
+        "required": ["code", "from", "to", "total_clicks", "days", "countries", "devices", "referrers"],
+        "properties": {
+          "code": { "type": "string" },
+          "from": { "type": "string", "format": "date" },
+          "to": { "type": "string", "format": "date" },
+          "total_clicks": { "type": "integer" },
+          "days": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["day", "clicks", "unique_visitors"],
+              "properties": { "day": { "type": "string", "format": "date" }, "clicks": { "type": "integer" }, "unique_visitors": { "type": "integer" } }
+            }
+          },
+          "countries": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "XX means unknown." },
+          "devices": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "desktop, mobile, tablet, bot or other." },
+          "referrers": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "Referrer host, or (direct) when there was none." }
+        }
+      }
+    }
+  }
+}

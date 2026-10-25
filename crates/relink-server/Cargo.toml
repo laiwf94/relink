@@ -10,6 +10,9 @@ publish = false
 [lib]
 name = "relink_server"
 
+[[bin]]
+name = "relink"
+path = "src/main.rs"
 
 [dependencies]
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
