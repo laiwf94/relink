@@ -14,6 +14,7 @@ pub mod clicks;
 pub mod code;
 pub mod config;
 pub mod health;
+pub mod kvsync;
 pub mod limiter;
 pub mod metrics;
 pub mod ratelimit;
