@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 494cfec048fa6fa07484f5d83c3bec59b194680a6cdbe008fed6d0211b52b989 # shrinks to parts = UrlParts { scheme: "http", userinfo: None, host: V4([224, 0, 0, 0]), port: None, path: [], query: None }, policy = Policy { allow_ip_literals: true, allow_private: false }
+cc 9149851068a7abe7e1e707b6dd54644a00ad742ce1bf3a087ab5529a7a7f0792 # shrinks to parts = UrlParts { scheme: "http", userinfo: None, host: Reserved("0", "internal"), port: None, path: [], query: None }, policy = Policy { allow_ip_literals: false, allow_private: false }
+cc 8100699c8320fae0bee34b01cefa8ccdb071e839bbfdc0647c085378bc079c24 # shrinks to parts = UrlParts { scheme: "http", userinfo: Some("a"), host: Domain(["a"], "com"), port: None, path: [], query: None }, policy = Policy { allow_ip_literals: false, allow_private: false }
