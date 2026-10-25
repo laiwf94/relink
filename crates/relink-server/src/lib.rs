@@ -8,6 +8,7 @@
 //! Postgres and [`server`] wires it together. The rules shared with the edge
 //! come from `relink_core` and are re-exported below.
 
+pub mod auth;
 pub mod cache;
 pub mod clicks;
 pub mod code;
