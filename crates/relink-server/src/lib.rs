@@ -11,12 +11,14 @@
 pub mod cache;
 pub mod clicks;
 pub mod code;
+pub mod config;
 pub mod limiter;
 pub mod metrics;
 pub mod ratelimit;
 pub mod resolver;
 pub mod singleflight;
 pub mod store;
+pub mod trust;
 pub mod util;
 
 pub use relink_core::{abtest, classify, destination, model, netguard, rules};
