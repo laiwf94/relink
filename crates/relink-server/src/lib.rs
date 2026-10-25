@@ -9,6 +9,7 @@
 //! come from `relink_core` and are re-exported below.
 
 pub mod cache;
+pub mod clicks;
 pub mod code;
 pub mod limiter;
 pub mod metrics;
