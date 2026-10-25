@@ -1,0 +1,18 @@
+# Local development and the shape of a deployment. The KV id below is only a
+# label for the local simulator; a real deployment needs `wrangler kv
+# namespace create` and its id here, plus the COOKIE_KEY and EDGE_TOKEN
+# secrets (`wrangler secret put`). Local runs read secrets from .dev.vars.
+name = "relink-edge"
+main = "build/index.js"
+compatibility_date = "2025-09-01"
+
+[build]
+command = "worker-build --release"
+
+[[kv_namespaces]]
+binding = "LINKS"
+id = "relink-links-local"
+
+[vars]
+ORIGIN_URL = "http://127.0.0.1:8080"
+COOKIE_SECURE = "true"
