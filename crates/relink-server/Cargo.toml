@@ -36,3 +36,6 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 proptest = { workspace = true }
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 
+[[bench]]
+name = "hot_path"
+harness = false
