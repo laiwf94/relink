@@ -77,10 +77,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl binary and defaults to its own
+      # target, where sanitizers cannot link; name the gnu target explicitly.
       - name: Fuzz (short)
         run: |
           for target in destination alias headers api_input; do
-            cargo fuzz run "$target" -- -max_total_time=30
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=30
           done
 
   supply-chain:
