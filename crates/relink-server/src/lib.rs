@@ -14,6 +14,7 @@ pub mod limiter;
 pub mod metrics;
 pub mod ratelimit;
 pub mod singleflight;
+pub mod store;
 pub mod util;
 
 pub use relink_core::{abtest, classify, destination, model, netguard, rules};
