@@ -1,0 +1,6 @@
+target
+fuzz
+crates/relink-edge/build
+crates/relink-edge/.wrangler
+crates/relink-edge/.dev.vars
+.git
