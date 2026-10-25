@@ -1,0 +1,51 @@
+[package]
+name = "relink-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.154"
+url = "=2.5.8"
+
+[dependencies.relink-core]
+path = "../crates/relink-core"
+
+[dependencies.relink-server]
+path = "../crates/relink-server"
+
+# Keep the fuzz crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "destination"
+path = "fuzz_targets/destination.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "alias"
+path = "fuzz_targets/alias.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_input"
+path = "fuzz_targets/api_input.rs"
+test = false
+doc = false
+bench = false
