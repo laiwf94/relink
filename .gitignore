@@ -1,0 +1,10 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+*.profraw
+lcov.info
+/crates/relink-edge/build
+/crates/relink-edge/.wrangler
+/crates/relink-edge/.dev.vars
