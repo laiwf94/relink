@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/relink-core"]
-default-members = ["crates/relink-core"]
+members = ["crates/relink-core", "crates/relink-server"]
+default-members = ["crates/relink-core", "crates/relink-server"]
 
 [workspace.package]
 edition = "2024"
