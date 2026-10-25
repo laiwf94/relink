@@ -13,6 +13,7 @@ pub mod code;
 pub mod limiter;
 pub mod metrics;
 pub mod ratelimit;
+pub mod resolver;
 pub mod singleflight;
 pub mod store;
 pub mod util;
