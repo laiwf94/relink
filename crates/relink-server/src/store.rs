@@ -20,7 +20,7 @@ use crate::util::BoxFuture;
 /// Columns read into a [`Link`], as a literal so queries stay `&'static str`.
 macro_rules! columns {
     () => {
-        "id, code, owner, destinations, destinations_version, redirect_status, \
+        "id, code, owner, workspace_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
          health_failures, health_checked_at, created_at, updated_at"
     };
@@ -28,6 +28,16 @@ macro_rules! columns {
 
 /// Embedded migrations from `migrations/`.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// The role a tenant transaction runs as. Row-level security policies
+/// (migration 0003) apply to it; the connecting role, which runs system work
+/// such as redirect lookups, the click flusher and the health worker, owns
+/// the tables and is not subject to them.
+pub const TENANT_ROLE: &str = "relink_tenant";
+
+/// The transaction-local setting naming the workspace a tenant transaction
+/// acts for. Unset, a tenant transaction sees no rows.
+pub const WORKSPACE_SETTING: &str = "relink.workspace_id";
 
 /// Channel for link change notifications. Payload: `<id>:<code>`.
 pub const CHANGES_CHANNEL: &str = "relink_link_changes";
@@ -89,6 +99,7 @@ impl DbError {
 pub struct StoredLink {
     pub link: Link,
     pub owner: String,
+    pub workspace_id: i64,
     pub health_checked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -310,6 +321,7 @@ impl Db {
         Ok(StoredLink {
             link,
             owner: row.try_get("owner")?,
+            workspace_id: row.try_get("workspace_id")?,
             health_checked_at: row.try_get("health_checked_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -376,10 +388,12 @@ impl Db {
             let res = self
                 .timed(async {
                     let mut tx = self.pool.begin().await?;
+                    let workspace_id = personal_workspace(&mut tx, &new.owner).await?;
                     let row = sqlx::query(concat!(
                         "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
-                         max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ",
+                         max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
+                         workspace_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING ",
                         columns!()
                     ))
                     .bind(&code)
@@ -393,6 +407,7 @@ impl Db {
                     .bind(&new.fallback_url)
                     .bind(new.enabled)
                     .bind(new.health_check)
+                    .bind(workspace_id)
                     .fetch_one(&mut *tx)
                     .await?;
                     let id: i64 = row.try_get("id")?;
@@ -996,22 +1011,59 @@ impl Db {
         .await
     }
 
-    /// Stores a new API key hash. Returns the key's ID.
+    /// Stores a new API key hash in the owner's personal workspace (created
+    /// on first use). Returns the key's ID.
     pub async fn insert_api_key(
         &self,
         owner: &str,
         name: &str,
         hash: &[u8; 32],
     ) -> Result<i64, DbError> {
-        self.timed(
-            sqlx::query_scalar(
-                "INSERT INTO api_keys (owner, name, key_hash) VALUES ($1, $2, $3) RETURNING id",
+        self.timed(async {
+            let mut tx = self.pool.begin().await?;
+            let workspace_id = personal_workspace(&mut tx, owner).await?;
+            let id = sqlx::query_scalar(
+                "INSERT INTO api_keys (owner, name, key_hash, workspace_id) \
+                 VALUES ($1, $2, $3, $4) RETURNING id",
             )
             .bind(owner)
             .bind(name)
             .bind(&hash[..])
-            .fetch_one(&self.pool),
-        )
+            .bind(workspace_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(id)
+        })
+        .await
+    }
+
+    /// The ID of `owner`'s personal workspace, created (with `owner` as its
+    /// owner member) if it does not exist yet.
+    pub async fn personal_workspace(&self, owner: &str) -> Result<i64, DbError> {
+        self.timed(async {
+            let mut tx = self.pool.begin().await?;
+            let id = personal_workspace(&mut tx, owner).await?;
+            tx.commit().await?;
+            Ok(id)
+        })
+        .await
+    }
+
+    /// Starts a transaction that acts for one workspace: it runs as
+    /// [`TENANT_ROLE`] with [`WORKSPACE_SETTING`] set, both local to the
+    /// transaction, so row-level security limits every statement in it to
+    /// that workspace's rows. Both are reset at commit or rollback, so the
+    /// pooled connection goes back to the pool unscoped.
+    pub async fn begin_tenant(
+        &self,
+        workspace_id: i64,
+    ) -> Result<Transaction<'static, Postgres>, DbError> {
+        self.timed(async {
+            let mut tx = self.pool.begin().await?;
+            scope_to_workspace(&mut tx, workspace_id).await?;
+            Ok(tx)
+        })
         .await
     }
 
@@ -1051,6 +1103,59 @@ impl Db {
         )
         .await
         .map(|r| r.rows_affected() == 1)
+    }
+}
+
+/// Scopes an open transaction to `workspace_id` (see [`Db::begin_tenant`]).
+/// One round trip: `set_config('role', ..)` is `SET LOCAL ROLE`, and unlike
+/// `SET` it takes the workspace as a bound parameter.
+pub async fn scope_to_workspace(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('role', $1, true), set_config($2, $3, true)")
+        .bind(TENANT_ROLE)
+        .bind(WORKSPACE_SETTING)
+        .bind(workspace_id.to_string())
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
+/// Finds or creates `owner`'s personal workspace inside the caller's
+/// transaction. The common case is one indexed read. A concurrent creator
+/// makes our insert do nothing and its row invisible to that statement's
+/// snapshot, so the read is repeated as a new statement, which sees it.
+async fn personal_workspace(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &str,
+) -> Result<i64, sqlx::Error> {
+    const FIND: &str = "SELECT id FROM workspaces WHERE personal_owner = $1";
+    if let Some(id) = sqlx::query_scalar(FIND)
+        .bind(owner)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        return Ok(id);
+    }
+    let created: Option<i64> = sqlx::query_scalar(
+        "WITH w AS (INSERT INTO workspaces (name, personal_owner) VALUES ($1, $1)
+                    ON CONFLICT (personal_owner) DO NOTHING RETURNING id),
+              m AS (INSERT INTO workspace_members (workspace_id, member, role)
+                    SELECT id, $1, 'owner' FROM w)
+         SELECT id FROM w",
+    )
+    .bind(owner)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match created {
+        Some(id) => Ok(id),
+        None => {
+            sqlx::query_scalar(FIND)
+                .bind(owner)
+                .fetch_one(&mut **tx)
+                .await
+        }
     }
 }
 

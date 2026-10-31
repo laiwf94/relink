@@ -40,8 +40,10 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 
 | Table | Holds |
 |---|---|
-| `links` | Code, owner, destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
-| `api_keys` | Owner, name, SHA-256 of the key, revocation time. |
+| `workspaces` | The tenant boundary: name, and `personal_owner` for the workspace each API key owner gets implicitly. |
+| `workspace_members` | Member, workspace and role (`owner`, `admin`, `editor` or `viewer`). |
+| `links` | Code, workspace, owner (its creator), destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
+| `api_keys` | Workspace, owner, name, SHA-256 of the key, revocation time. |
 | `click_daily` | Click counts per link, UTC day, country, device class and referrer host. |
 | `visitor_daily` | Visitor hashes for unique counts, today and yesterday only. |
 | `visitor_rollup` | Unique visitor counts for older days. |
@@ -62,6 +64,38 @@ read, so a hand-edited row produces an error instead of a panic.
 | `click_daily` primary key | The flusher's upsert; stats use its `(link_id, day)` prefix. |
 | `visitor_daily` primary key | `ON CONFLICT DO NOTHING` deduplication; the table holds two days, so the roll-up scan by day stays small. |
 | `kv_outbox (next_attempt_at)` | The sync worker's "what is due". |
+| `links (workspace_id, id DESC)` | Workspace listing with keyset pagination, and the row-level security predicate. |
+| `workspace_members (member)` | The workspaces one person belongs to. |
+| `workspaces (personal_owner)` unique | Finding an owner's personal workspace; concurrent first uses create one. |
+
+### Tenancy
+
+Every link and API key carries a `workspace_id`; statistics belong to the
+workspace of their link. Migration 0003 created one personal workspace per
+existing owner, with that owner as its `owner` member, and moved every row
+into it.
+
+The boundary is enforced by Postgres, not only by `WHERE` clauses in the
+service. A transaction that acts for a tenant (`Db::begin_tenant`) runs as the
+role `relink_tenant` and sets `relink.workspace_id`, both with `is_local`, in
+one statement before anything else. Row-level security policies on
+`workspaces`, `workspace_members`, `links`, `api_keys` and the three
+statistics tables compare against that setting through
+`relink_current_workspace()`, which reads an unset or reset setting as NULL.
+So a tenant query that forgot to name a workspace matches no rows and can
+write none, and an insert or update that names another workspace is refused
+by the same policy acting as its `WITH CHECK`. Inserts default
+`workspace_id` to the transaction's workspace. Because both settings are
+transaction-local, a pooled connection returns to the pool unscoped whether
+the transaction committed, rolled back or was dropped.
+
+The connecting role owns the tables, so policies do not apply to it. It runs
+the work that crosses workspaces by design: redirect lookups by code, click
+flushes, health checks, the KV outbox and key lookups during authentication.
+`relink_tenant` is `NOLOGIN NOBYPASSRLS`, holds only the table privileges the
+API needs, and is created by the migration if missing (roles are
+cluster-wide); where the migrating user lacks `CREATEROLE`, an administrator
+creates it in advance and grants it to that user.
 
 ## The redirect path on the origin
 
