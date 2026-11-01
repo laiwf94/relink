@@ -57,6 +57,20 @@ fn usage_and_configuration_errors() {
     assert!(!out.status.success());
     let out = relink("postgres://x@127.0.0.1:1/x", &["revoke-key", "abc"]);
     assert!(!out.status.success());
+    for bad in [
+        &["create-key", "alice", "--scopes", "links:delete"][..],
+        &["create-key", "alice", "--expires-in", "forever"],
+        &["create-key", "alice", "--workspace"],
+        &["rotate-key"],
+        &["rotate-key", "1", "--overlap", "31d"],
+    ] {
+        let out = relink("postgres://x@127.0.0.1:1/x", bad);
+        assert!(!out.status.success(), "{bad:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("usage: relink"),
+            "{bad:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -154,6 +168,52 @@ async fn admin_commands_and_graceful_sigterm() {
     assert!(out.status.success());
     let out = relink(&db.url, &["revoke-key", &id]);
     assert!(!out.status.success(), "already revoked");
+
+    // Scoped, expiring keys and rotation.
+    let out = relink(
+        &db.url,
+        &[
+            "create-key",
+            "alice",
+            "ci",
+            "--scopes",
+            "links:read,stats:read",
+            "--expires-in",
+            "30d",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8(out.stdout).unwrap();
+    let field = |line: &str, name: &str| {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("{name} missing from {line}"))
+            .to_owned()
+    };
+    assert_eq!(field(&line, "scopes"), "links:read,stats:read");
+    assert_eq!(field(&line, "role"), "owner");
+    assert_ne!(field(&line, "expires_at"), "never");
+    let scoped = field(&line, "id");
+    let out = relink(&db.url, &["rotate-key", &scoped, "--overlap", "1h"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(field(&line, "replaces"), scoped);
+    assert_eq!(field(&line, "scopes"), "links:read,stats:read");
+    assert!(relink_server::auth::is_well_formed(&field(&line, "key")));
+    let out = relink(&db.url, &["rotate-key", &scoped]);
+    assert!(!out.status.success(), "a key is rotated once");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already rotated"));
+    let out = relink(&db.url, &["create-key", "alice", "--workspace", "999999"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a member"));
 }
 
 fn free_port() -> u16 {

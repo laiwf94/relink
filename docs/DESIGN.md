@@ -43,7 +43,7 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `workspaces` | The tenant boundary: name, and `personal_owner` for the workspace each API key owner gets implicitly. |
 | `workspace_members` | Member, workspace and role (`owner`, `admin`, `editor` or `viewer`). |
 | `links` | Code, workspace, owner (its creator), destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
-| `api_keys` | Workspace, owner, name, SHA-256 of the key, revocation time. |
+| `api_keys` | Workspace, owner, name, SHA-256 of the key, scopes, expiry, the key that replaced it on rotation, revocation time. |
 | `click_daily` | Click counts per link, UTC day, country, device class and referrer host. |
 | `visitor_daily` | Visitor hashes for unique counts, today and yesterday only. |
 | `visitor_rollup` | Unique visitor counts for older days. |
@@ -126,6 +126,50 @@ this pool cannot list links, read keys, statistics or salts, or write
 anything, so a bug on the hottest path cannot become a dump of every tenant's
 links. The separate pool also keeps a burst of cache misses from queueing
 behind API transactions, and the reverse.
+
+### Roles and API key scopes
+
+A member's role in a workspace is `viewer`, `editor`, `admin` or `owner`. A
+key carries scopes, a non-empty subset of `links:read`, `links:write` and
+`stats:read` (migration 0005; keys made before it keep all three). What a
+request may do is the intersection of the two: the key must carry the scope
+and its owner's role must grant it. Viewers are granted `links:read` and
+`stats:read`; editors, admins and owners all three. Admins and owners differ
+in whom they manage (admins manage editors and viewers, owners everyone),
+which the member and key administration built on this uses.
+
+Both halves are checked because they change for different reasons. A scope
+narrows one key for one job (a dashboard that only reads statistics); a role
+says what a person may do at all. Reading the role at authentication, rather
+than copying it into the key, means demoting someone narrows every key they
+hold and removing them disables those keys, without finding and rewriting
+the keys. The role comes from a primary-key probe of `workspace_members`
+joined into the key lookup, so it costs no round trip, and it is cached with
+the key for the same 30 s as revocation.
+
+Each management route declares its scope as a type (`Allowed<LinksWrite>`
+and so on in `src/tenant.rs`), and the OpenAPI document lists the same scope
+on each operation; a test reads the document and checks, route by route, that
+a key with every other scope gets `permission_denied` (403) and a key with
+only that scope succeeds. The check runs in the extractor, before the body is
+read, so a read-only key learns it cannot write before it learns its JSON is
+malformed. The message says which half failed: the key lacks the scope, or
+the role does not grant it. `relink create-key` refuses scopes the owner's
+role does not grant, so such a key exists only after a demotion.
+
+A key may expire. The lookup filters expired keys, and a cached key's expiry
+is checked against the clock on every request, so expiry is exact rather
+than "within the cache TTL". Rotation (`relink rotate-key ID --overlap 1d`)
+is one transaction: it locks the old key, inserts a successor with the same
+owner, workspace, name and lifetime (counted from now) and the scopes the
+owner's role grants today, records it in `rotated_to`, and moves the old
+key's expiry to the end of the overlap (never later than it already was).
+Both keys work during the overlap, so a deployment can roll to the new key
+with no moment where neither works. A key is rotated once; rotating it again
+is refused and names the successor, so a chain of keys never forks. The
+overlap is capped at 30 days and a lifetime at ten years. An instance that
+cached the old key before the rotation honours the new end within the cache
+TTL, the same bound as revocation.
 
 ## The redirect path on the origin
 
@@ -397,7 +441,8 @@ on requests from clients; Cloudflare does this for `CF-Connecting-IP` and
 API keys are `rlk_` plus 256 random bits. Only SHA-256 hashes are stored; a
 fast hash suits a secret with full entropy, unlike a password. A key is found
 through the unique hash index and the stored hash compared in constant time.
-Known keys are cached for 30 s (so revocation takes up to 30 s everywhere);
+Known keys are cached for 30 s (so revocation and role changes take up to
+30 s everywhere, while expiry is exact);
 unknown ones for 5 s in a separate cache, so a flood of made-up keys cannot
 evict real ones. Lookups of uncached keys are limited per client address
 (5 per second) and globally (200 per second), so guessing keys costs a bounded

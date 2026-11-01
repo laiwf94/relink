@@ -19,6 +19,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
+use crate::auth::{Role, Scopes};
 use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
@@ -159,13 +160,133 @@ pub struct LinkPatch {
     pub health_check: Option<bool>,
 }
 
-/// An active API key as stored.
+/// An active API key as stored, with its owner's role in its workspace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyRow {
     pub id: i64,
     pub owner: String,
     pub workspace_id: i64,
     pub hash: Vec<u8>,
+    pub scopes: Scopes,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// None when the owner is no longer a member of the workspace.
+    pub role: Option<Role>,
+}
+
+impl KeyRow {
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|e| e <= now)
+    }
+}
+
+/// A key to create with [`Db::create_api_key`].
+#[derive(Clone, Debug)]
+pub struct NewApiKey<'a> {
+    pub owner: &'a str,
+    pub name: &'a str,
+    pub hash: [u8; 32],
+    /// The workspace; None means the owner's personal workspace, created on
+    /// first use.
+    pub workspace_id: Option<i64>,
+    pub scopes: Scopes,
+    /// Time to live from creation; None never expires.
+    pub lifetime: Option<Duration>,
+}
+
+/// A key as created or rotated (never its secret).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub id: i64,
+    pub owner: String,
+    pub workspace_id: i64,
+    pub role: Role,
+    pub scopes: Scopes,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// The result of [`Db::rotate_api_key`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rotation {
+    pub new: KeyInfo,
+    pub old_id: i64,
+    /// When the old key stops working: the end of the overlap, or its own
+    /// expiry if that comes first.
+    pub old_expires_at: DateTime<Utc>,
+}
+
+/// Why a key could not be created or rotated.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyError {
+    /// The owner is not a member of the workspace (or it does not exist).
+    NotMember {
+        owner: String,
+        workspace_id: i64,
+    },
+    /// The scopes asked for are more than the owner's role grants.
+    ScopesExceedRole {
+        role: Role,
+        scopes: Scopes,
+    },
+    /// No active (unrevoked, unexpired) key has that ID.
+    NoSuchKey(i64),
+    /// The key was already rotated; rotate its successor instead.
+    AlreadyRotated {
+        id: i64,
+        successor: i64,
+    },
+    Db(DbError),
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyError::NotMember {
+                owner,
+                workspace_id,
+            } => write!(
+                f,
+                "{owner} is not a member of workspace {workspace_id}, or it does not exist"
+            ),
+            KeyError::ScopesExceedRole { role, scopes } => write!(
+                f,
+                "the {role} role grants only {}, not {scopes}",
+                role.grants()
+            ),
+            KeyError::NoSuchKey(id) => write!(f, "no active key with id {id}"),
+            KeyError::AlreadyRotated { id, successor } => write!(
+                f,
+                "key {id} was already rotated to key {successor}; rotate that one instead"
+            ),
+            KeyError::Db(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
+
+impl From<DbError> for KeyError {
+    fn from(e: DbError) -> KeyError {
+        KeyError::Db(e)
+    }
+}
+
+impl From<sqlx::Error> for KeyError {
+    fn from(e: sqlx::Error) -> KeyError {
+        KeyError::Db(e.into())
+    }
+}
+
+fn row_role(row: &PgRow) -> Result<Option<Role>, sqlx::Error> {
+    let role: Option<String> = row.try_get("role")?;
+    role.map(|r| {
+        Role::parse(&r).ok_or_else(|| sqlx::Error::Decode(format!("unknown role {r:?}").into()))
+    })
+    .transpose()
+}
+
+fn row_scopes(row: &PgRow) -> Result<Scopes, sqlx::Error> {
+    let names: Vec<String> = row.try_get("scopes")?;
+    Scopes::from_names(&names).map_err(|e| sqlx::Error::Decode(e.into()))
 }
 
 /// One aggregated click row for [`Db::flush_clicks`].
@@ -789,30 +910,182 @@ impl Db {
     }
 
     /// Stores a new API key hash in the owner's personal workspace (created
-    /// on first use). Returns the key's ID.
+    /// on first use), with every scope and no expiry. Returns the key's ID.
     pub async fn insert_api_key(
         &self,
         owner: &str,
         name: &str,
         hash: &[u8; 32],
     ) -> Result<i64, DbError> {
-        self.timed(async {
+        let key = NewApiKey {
+            owner,
+            name,
+            hash: *hash,
+            workspace_id: None,
+            scopes: Scopes::ALL,
+            lifetime: None,
+        };
+        match self.create_api_key(&key).await {
+            Ok(info) => Ok(info.id),
+            Err(KeyError::Db(e)) => Err(e),
+            Err(e) => Err(DbError::Other(e.to_string())),
+        }
+    }
+
+    /// Creates a key for `key.owner` in a workspace they are a member of,
+    /// with scopes their role grants. System work: it runs before any
+    /// workspace is acting.
+    pub async fn create_api_key(&self, key: &NewApiKey<'_>) -> Result<KeyInfo, KeyError> {
+        let work = async {
             let mut tx = self.pool.begin().await?;
-            let workspace_id = personal_workspace(&mut tx, owner).await?;
-            let id = sqlx::query_scalar(
-                "INSERT INTO api_keys (owner, name, key_hash, workspace_id) \
-                 VALUES ($1, $2, $3, $4) RETURNING id",
+            let workspace_id = match key.workspace_id {
+                Some(id) => id,
+                None => personal_workspace(&mut tx, key.owner).await?,
+            };
+            let row = sqlx::query(
+                "SELECT role FROM workspace_members WHERE workspace_id = $1 AND member = $2",
             )
-            .bind(owner)
-            .bind(name)
-            .bind(&hash[..])
             .bind(workspace_id)
+            .bind(key.owner)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(role) = row.as_ref().map(row_role).transpose()?.flatten() else {
+                return Err(KeyError::NotMember {
+                    owner: key.owner.to_owned(),
+                    workspace_id,
+                });
+            };
+            if key.scopes.is_empty() || !key.scopes.is_subset(role.grants()) {
+                return Err(KeyError::ScopesExceedRole {
+                    role,
+                    scopes: key.scopes,
+                });
+            }
+            let row = sqlx::query(
+                "INSERT INTO api_keys (owner, name, key_hash, workspace_id, scopes, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, \
+                         CASE WHEN $6::float8 IS NULL THEN NULL \
+                              ELSE now() + make_interval(secs => $6::float8) END) \
+                 RETURNING id, expires_at",
+            )
+            .bind(key.owner)
+            .bind(key.name)
+            .bind(&key.hash[..])
+            .bind(workspace_id)
+            .bind(key.scopes.names())
+            .bind(key.lifetime.map(|d| d.as_secs_f64()))
             .fetch_one(&mut *tx)
             .await?;
+            let info = KeyInfo {
+                id: row.try_get("id")?,
+                owner: key.owner.to_owned(),
+                workspace_id,
+                role,
+                scopes: key.scopes,
+                expires_at: row.try_get("expires_at")?,
+            };
             tx.commit().await?;
-            Ok(id)
-        })
-        .await
+            Ok(info)
+        };
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok(r) => r,
+            Err(_) => Err(KeyError::Db(DbError::Unavailable("query timed out".into()))),
+        }
+    }
+
+    /// Rotates an active key: inserts a successor with a new hash and the
+    /// same owner, workspace, name and lifetime, with its scopes narrowed to
+    /// what the owner's role grants today, and ends the old key at
+    /// `now + overlap` (or its own expiry, if sooner). Both keys work during
+    /// the overlap. A key can be rotated once; its successor carries on.
+    pub async fn rotate_api_key(
+        &self,
+        id: i64,
+        new_hash: &[u8; 32],
+        overlap: Duration,
+    ) -> Result<Rotation, KeyError> {
+        let work = async {
+            let mut tx = self.pool.begin().await?;
+            let row = sqlx::query(
+                "SELECT k.owner, k.name, k.workspace_id, k.scopes, k.rotated_to, m.role,
+                        k.expires_at - k.created_at AS lifetime
+                   FROM api_keys k
+                   LEFT JOIN workspace_members m
+                          ON m.workspace_id = k.workspace_id AND m.member = k.owner
+                  WHERE k.id = $1 AND k.revoked_at IS NULL
+                    AND (k.expires_at IS NULL OR k.expires_at > now())
+                    FOR UPDATE OF k",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(KeyError::NoSuchKey(id))?;
+            let owner: String = row.try_get("owner")?;
+            let workspace_id: i64 = row.try_get("workspace_id")?;
+            if let Some(successor) = row.try_get::<Option<i64>, _>("rotated_to")? {
+                return Err(KeyError::AlreadyRotated { id, successor });
+            }
+            let Some(role) = row_role(&row)? else {
+                return Err(KeyError::NotMember {
+                    owner,
+                    workspace_id,
+                });
+            };
+            let old_scopes = row_scopes(&row)?;
+            let scopes = old_scopes.intersect(role.grants());
+            if scopes.is_empty() {
+                return Err(KeyError::ScopesExceedRole {
+                    role,
+                    scopes: old_scopes,
+                });
+            }
+            let lifetime: Option<sqlx::postgres::types::PgInterval> = row.try_get("lifetime")?;
+            let name: String = row.try_get("name")?;
+            let new = sqlx::query(
+                "INSERT INTO api_keys (owner, name, key_hash, workspace_id, scopes, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, now() + $6::interval)
+                 RETURNING id, expires_at",
+            )
+            .bind(&owner)
+            .bind(&name)
+            .bind(&new_hash[..])
+            .bind(workspace_id)
+            .bind(scopes.names())
+            .bind(lifetime)
+            .fetch_one(&mut *tx)
+            .await?;
+            let new_id: i64 = new.try_get("id")?;
+            let old_expires_at: DateTime<Utc> = sqlx::query_scalar(
+                "UPDATE api_keys
+                    SET rotated_to = $2,
+                        expires_at = LEAST(expires_at, now() + make_interval(secs => $3::float8))
+                  WHERE id = $1
+              RETURNING expires_at",
+            )
+            .bind(id)
+            .bind(new_id)
+            .bind(overlap.as_secs_f64())
+            .fetch_one(&mut *tx)
+            .await?;
+            let rotation = Rotation {
+                new: KeyInfo {
+                    id: new_id,
+                    owner,
+                    workspace_id,
+                    role,
+                    scopes,
+                    expires_at: new.try_get("expires_at")?,
+                },
+                old_id: id,
+                old_expires_at,
+            };
+            tx.commit().await?;
+            Ok(rotation)
+        };
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok(r) => r,
+            Err(_) => Err(KeyError::Db(DbError::Unavailable("query timed out".into()))),
+        }
     }
 
     /// The ID of `owner`'s personal workspace, created (with `owner` as its
@@ -860,14 +1133,20 @@ impl Db {
         crate::tenant::Tenant::new(self, workspace_id)
     }
 
-    /// Finds an active key by hash. Runs before the caller's workspace is
-    /// known, so it is system work, not a tenant query.
+    /// Finds an active (unrevoked, unexpired) key by hash, with its owner's
+    /// role in its workspace. Runs before the caller's workspace is known, so
+    /// it is system work, not a tenant query. One round trip: the role comes
+    /// from a primary-key probe of `workspace_members` in the same query.
     pub async fn api_key_by_hash(&self, hash: &[u8; 32]) -> Result<Option<KeyRow>, DbError> {
         let row = self
             .timed(
                 sqlx::query(
-                    "SELECT id, owner, workspace_id, key_hash FROM api_keys \
-                     WHERE key_hash = $1 AND revoked_at IS NULL",
+                    "SELECT k.id, k.owner, k.workspace_id, k.key_hash, k.scopes, k.expires_at, m.role \
+                       FROM api_keys k \
+                       LEFT JOIN workspace_members m \
+                              ON m.workspace_id = k.workspace_id AND m.member = k.owner \
+                      WHERE k.key_hash = $1 AND k.revoked_at IS NULL \
+                        AND (k.expires_at IS NULL OR k.expires_at > now())",
                 )
                 .bind(&hash[..])
                 .fetch_optional(&self.pool),
@@ -879,6 +1158,9 @@ impl Db {
                 owner: r.try_get("owner")?,
                 workspace_id: r.try_get("workspace_id")?,
                 hash: r.try_get("key_hash")?,
+                scopes: row_scopes(&r)?,
+                expires_at: r.try_get("expires_at")?,
+                role: row_role(&r)?,
             })
         })
         .transpose()

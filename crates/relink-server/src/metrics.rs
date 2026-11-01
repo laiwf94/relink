@@ -265,6 +265,9 @@ pub struct Metrics {
     pub api_requests: Counter,
     pub api_errors: Counter,
     pub rate_limited: Counter,
+    /// Requests refused because the key lacks the scope or its owner's role
+    /// does not grant it.
+    pub permission_denied: Counter,
     pub invalidations: Counter,
     pub kv_writes: Counter,
     pub kv_deletes: Counter,
@@ -296,6 +299,7 @@ impl Default for Metrics {
             api_requests: Counter::default(),
             api_errors: Counter::default(),
             rate_limited: Counter::default(),
+            permission_denied: Counter::default(),
             invalidations: Counter::default(),
             kv_writes: Counter::default(),
             kv_deletes: Counter::default(),
@@ -398,7 +402,7 @@ impl Metrics {
                 .iter()
                 .map(|r| (r.label(), self.probe_count(*r))),
         );
-        let counters: [(&str, &str, u64); 17] = [
+        let counters: [(&str, &str, u64); 18] = [
             (
                 "relink_kv_writes_total",
                 "Link records written to Workers KV.",
@@ -473,6 +477,11 @@ impl Metrics {
                 "relink_api_rate_limited_total",
                 "Management API requests refused by the per-key rate limit.",
                 self.rate_limited.get(),
+            ),
+            (
+                "relink_api_permission_denied_total",
+                "Management API requests refused for a missing scope or role right.",
+                self.permission_denied.get(),
             ),
             (
                 "relink_cache_invalidations_total",

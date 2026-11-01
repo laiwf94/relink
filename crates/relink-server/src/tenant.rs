@@ -7,6 +7,10 @@
 //! `Relink-Workspace` header is refused rather than silently served from the
 //! key's own.
 //!
+//! [`Allowed`] wraps it with the scope a handler needs: the key must carry
+//! the scope and its owner's role must grant it, or the request is refused
+//! with `permission_denied` before its body is read.
+//!
 //! [`Tenant`] holds every query the API runs. Each one runs in its own
 //! transaction opened by [`Db::begin_tenant`], so it executes as the tenant
 //! role with the workspace set and row-level security (migration 0003) keeps
@@ -14,6 +18,8 @@
 //! filter of their own: a link in another workspace is invisible, so it is
 //! "not found" exactly like a code that does not exist.
 
+use std::marker::PhantomData;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
@@ -23,7 +29,7 @@ use sqlx::types::Json;
 use sqlx::{Postgres, Row, Transaction};
 
 use crate::api::{ApiError, Authed};
-use crate::auth::Principal;
+use crate::auth::{Principal, Scope};
 use crate::server::App;
 use crate::store::{
     Bucket, DayStats, Db, DbError, LinkPatch, NewLink, STATS_COUNTRY, STATS_DEVICE, STATS_REFERRER,
@@ -85,6 +91,53 @@ impl FromRequestParts<Arc<App>> for Workspace {
             Err(WorkspaceError::Mismatch) => Err(ApiError::permission_denied(
                 "this API key does not belong to the workspace named in Relink-Workspace",
             )),
+        }
+    }
+}
+
+/// A scope a handler requires, as a type so the route declares it.
+pub trait RequiredScope: Send + Sync + 'static {
+    const SCOPE: Scope;
+}
+
+/// Requires `links:read`.
+pub struct LinksRead;
+/// Requires `links:write`.
+pub struct LinksWrite;
+/// Requires `stats:read`.
+pub struct StatsRead;
+
+impl RequiredScope for LinksRead {
+    const SCOPE: Scope = Scope::LinksRead;
+}
+impl RequiredScope for LinksWrite {
+    const SCOPE: Scope = Scope::LinksWrite;
+}
+impl RequiredScope for StatsRead {
+    const SCOPE: Scope = Scope::StatsRead;
+}
+
+/// A [`Workspace`] whose caller may use the scope `S` there.
+pub struct Allowed<S>(pub Workspace, PhantomData<S>);
+
+impl<S> Deref for Allowed<S> {
+    type Target = Workspace;
+    fn deref(&self) -> &Workspace {
+        &self.0
+    }
+}
+
+impl<S: RequiredScope> FromRequestParts<Arc<App>> for Allowed<S> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, ApiError> {
+        let ws = Workspace::from_request_parts(parts, app).await?;
+        match ws.principal.require(S::SCOPE) {
+            Ok(()) => Ok(Allowed(ws, PhantomData)),
+            Err(denied) => {
+                app.metrics.permission_denied.inc();
+                Err(ApiError::permission_denied(denied.to_string()))
+            }
         }
     }
 }
@@ -408,6 +461,9 @@ mod tests {
             key_id: 1,
             owner: "alice".into(),
             workspace_id: 42,
+            role: crate::auth::Role::Owner,
+            scopes: crate::auth::Scopes::ALL,
+            expires_at: None,
         }
     }
 

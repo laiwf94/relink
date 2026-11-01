@@ -6,12 +6,14 @@
 //! API, and [`tenant`] scopes each of its requests to one workspace; [`trust`]
 //! decides which forwarding headers to believe; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
-//! Postgres and [`server`] wires it together. The rules shared with the edge
-//! come from `relink_core` and are re-exported below.
+//! Postgres and [`server`] wires it together; [`cli`] parses the key
+//! commands. The rules shared with the edge come from `relink_core` and are
+//! re-exported below.
 
 pub mod api;
 pub mod auth;
 pub mod cache;
+pub mod cli;
 pub mod clicks;
 pub mod code;
 pub mod config;

@@ -33,7 +33,7 @@ use crate::destination::normalize;
 use crate::model::{Destination, GeoMode, GeoRule};
 use crate::server::App;
 use crate::store::{DbError, LinkPatch, NewLink, Stats, StoredLink};
-use crate::tenant::Workspace;
+use crate::tenant::{Allowed, LinksRead, LinksWrite, StatsRead};
 use crate::util::{fast_random, hex_decode, hex_encode, now_ms, utc_day};
 
 /// Largest accepted request body.
@@ -643,7 +643,7 @@ fn validate_fallback(app: &App, url: String) -> Result<String, ApiError> {
 
 pub async fn create_link(
     State(app): State<Arc<App>>,
-    ws: Workspace,
+    ws: Allowed<LinksWrite>,
     StrictJson(req): StrictJson<CreateLink>,
 ) -> Result<Response, ApiError> {
     if let Some(alias) = &req.alias {
@@ -652,7 +652,7 @@ pub async fn create_link(
     let destinations = validate_destinations(&app, req.url, req.destinations, true)?
         .expect("required destinations are present");
     let new = NewLink {
-        owner: ws.principal.owner,
+        owner: ws.principal.owner.clone(),
         alias: req.alias,
         destinations,
         redirect_status: validate_status(req.redirect_type.unwrap_or(302))?,
@@ -687,7 +687,7 @@ pub async fn create_link(
 
 pub async fn list_links(
     State(app): State<Arc<App>>,
-    ws: Workspace,
+    ws: Allowed<LinksRead>,
     StrictQuery(q): StrictQuery<ListQuery>,
 ) -> Result<Response, ApiError> {
     let limit = q.limit.unwrap_or(DEFAULT_PAGE);
@@ -722,7 +722,7 @@ pub async fn list_links(
 
 pub async fn get_link(
     State(app): State<Arc<App>>,
-    ws: Workspace,
+    ws: Allowed<LinksRead>,
     Path(code): Path<String>,
 ) -> Result<Response, ApiError> {
     let link = app.db.tenant(ws.id).link(&code).await?;
@@ -734,7 +734,7 @@ pub async fn get_link(
 
 pub async fn update_link(
     State(app): State<Arc<App>>,
-    ws: Workspace,
+    ws: Allowed<LinksWrite>,
     Path(code): Path<String>,
     StrictJson(req): StrictJson<PatchLink>,
 ) -> Result<Response, ApiError> {
@@ -783,7 +783,7 @@ pub async fn update_link(
 
 pub async fn delete_link(
     State(app): State<Arc<App>>,
-    ws: Workspace,
+    ws: Allowed<LinksWrite>,
     Path(code): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = app.db.tenant(ws.id).delete_link(&code).await?;
@@ -795,7 +795,7 @@ pub async fn delete_link(
 
 pub async fn link_stats(
     State(app): State<Arc<App>>,
-    ws: Workspace,
+    ws: Allowed<StatsRead>,
     Path(code): Path<String>,
     StrictQuery(q): StrictQuery<StatsQuery>,
 ) -> Result<Response, ApiError> {

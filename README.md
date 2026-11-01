@@ -50,7 +50,7 @@ whose salt is destroyed after two days.
 ```console
 $ docker run -d --name pg -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16-alpine
 $ export RELINK_DATABASE_URL=postgres://postgres:pg@localhost:5432/postgres
-$ cargo run --release -p relink-server -- create-key alice   # prints id=1 owner=alice key=rlk_...
+$ cargo run --release -p relink-server -- create-key alice   # prints id=1 owner=alice ... key=rlk_...
 $ cargo run --release -p relink-server                       # :8080, metrics on 127.0.0.1:9090
 $ ./examples/demo.sh          # the tour, including stopping Postgres mid-way
 $ ./examples/edge-local.sh    # the Worker under wrangler dev, in front of a local origin
@@ -73,10 +73,21 @@ turns on publishing to Workers KV; without it the origin works alone.
 ## Endpoints
 
 The management API uses hashed API keys checked in constant time, per-key rate
-limits, owner scoping, cursor pagination, strict JSON with body limits, stable
+limits, workspace scoping, cursor pagination, strict JSON with body limits, stable
 error codes and request IDs. `/v1/links` endpoints take
 `Authorization: Bearer <key>` and JSON bodies; the full schema is at
 `/openapi.json`, an OpenAPI 3.1 document that a test checks against the router.
+
+Keys carry scopes (`links:read`, `links:write`, `stats:read`) and act within
+their owner's role in the workspace: viewers read links and statistics,
+editors, admins and owners also write. Keys can expire, and rotation keeps the
+old key working for an overlap window so deployments switch without downtime:
+
+```console
+$ relink create-key alice dashboard --scopes stats:read --expires-in 90d
+$ relink create-key carol ci --workspace 3 --scopes links:read,links:write
+$ relink rotate-key 7 --overlap 1h   # prints the new key and when key 7 stops working
+```
 
 | Endpoint | Purpose |
 |---|---|
@@ -107,6 +118,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `not_found` 404,
 | Database outage | A TCP proxy in front of Postgres cuts every connection: cached redirects keep working, uncached codes and writes get 503 within the query timeout, clicks are written after recovery, shutdown still finishes within its one deadline. |
 | Analytics | Against real Postgres: 100,000 count rows plus 100,000 visitor rows drain in 5,000-row transactions; a referrer spelled like the "no referrer" marker does not collide with it; clicks for a day whose salt is gone keep their counts and drop their visitor hashes. |
 | API | Every endpoint and error code over real HTTP: 26 invalid bodies, auth and revocation, per-address throttling of key guessing, owner isolation, pagination, rate and body limits, and the OpenAPI document compared with the router and real responses. |
+| Roles and keys | Each route's documented scope is enforced (403 without it, success with only it, before the body is read); viewers cannot write even with an old all-scopes key; removed members' keys stop working; expiry is exact for cached keys; rotation keeps both keys for the overlap and no longer, cannot fork, and narrows scopes to the current role. |
 | Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |
@@ -115,7 +127,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `not_found` 404,
 ```console
 $ docker run -d -e POSTGRES_PASSWORD=postgres -p 5439:5432 postgres:16-alpine
 $ export RELINK_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5439/postgres
-$ cargo test                         # 167 tests; database tests skip if the variable is unset
+$ cargo test                         # 193 tests; database tests skip if the variable is unset
 $ cargo llvm-cov --summary-only      # CI requires 90% of lines
 $ cargo build -p relink-core --target wasm32-unknown-unknown
 $ cargo +nightly fuzz run destination -- -max_total_time=60

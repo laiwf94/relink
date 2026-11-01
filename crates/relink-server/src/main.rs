@@ -3,8 +3,17 @@
 //! ```text
 //! relink                      run the server (same as `relink serve`)
 //! relink migrate              apply database migrations and exit
-//! relink create-key OWNER [NAME]
-//!                             create an API key for OWNER; prints it once
+//! relink create-key OWNER [NAME] [--workspace ID] [--scopes LIST] [--expires-in DURATION]
+//!                             create an API key for OWNER; prints it once.
+//!                             Without --workspace, in OWNER's personal
+//!                             workspace; LIST is a comma-separated subset of
+//!                             links:read, links:write, stats:read (default:
+//!                             all) and must be granted by OWNER's role there;
+//!                             DURATION is like 90d, 12h, 30m or 45s
+//! relink rotate-key ID [--overlap DURATION]
+//!                             replace a key with a new one (same owner,
+//!                             scopes and lifetime); the old key keeps working
+//!                             for the overlap (default 1d, at most 30d)
 //! relink revoke-key ID        revoke an API key by its ID
 //! relink kv-record CODE       print the JSON the edge would get for CODE
 //! ```
@@ -60,12 +69,15 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use relink_server::auth::{generate_key, hash_key, is_valid_owner};
+use relink_server::auth::{generate_key, hash_key};
+use relink_server::cli::{CreateKey, RotateKey};
 use relink_server::config::Config;
 use relink_server::server::{migrate_with_retry, open_db, start};
+use relink_server::store::{KeyInfo, NewApiKey};
 
-const USAGE: &str =
-    "usage: relink [serve | migrate | create-key OWNER [NAME] | revoke-key ID | kv-record CODE]";
+const USAGE: &str = "usage: relink [serve | migrate | create-key OWNER [NAME] [--workspace ID] \
+                     [--scopes LIST] [--expires-in DURATION] | rotate-key ID [--overlap DURATION] \
+                     | revoke-key ID | kv-record CODE]";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -75,8 +87,8 @@ async fn main() -> ExitCode {
     let result = match args.as_slice() {
         [] | ["serve"] => serve().await,
         ["migrate"] => migrate().await,
-        ["create-key", owner] => create_key(owner, "").await,
-        ["create-key", owner, name] => create_key(owner, name).await,
+        ["create-key", rest @ ..] => create_key(rest).await,
+        ["rotate-key", rest @ ..] => rotate_key(rest).await,
         ["revoke-key", id] => revoke_key(id).await,
         ["kv-record", code] => kv_record(code).await,
         ["-h" | "--help" | "help"] => {
@@ -148,24 +160,51 @@ async fn migrate() -> Result<(), String> {
     Ok(())
 }
 
-async fn create_key(owner: &str, name: &str) -> Result<(), String> {
-    if !is_valid_owner(owner) {
-        return Err(
-            "OWNER must be 1-63 characters of a-z, 0-9, '.', '_' or '-', starting with a letter or digit"
-                .into(),
-        );
-    }
-    if name.chars().count() > 100 {
-        return Err("NAME must be at most 100 characters".into());
-    }
+fn describe(k: &KeyInfo) -> String {
+    let expires = k
+        .expires_at
+        .map_or_else(|| "never".to_owned(), |t| t.to_rfc3339());
+    format!(
+        "owner={} workspace={} role={} scopes={} expires_at={expires}",
+        k.owner, k.workspace_id, k.role, k.scopes
+    )
+}
+
+async fn create_key(args: &[&str]) -> Result<(), String> {
+    let args = CreateKey::parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
     let (_, db) = prepare().await?;
     let key = generate_key();
-    let id = db
-        .insert_api_key(owner, name, &hash_key(&key))
+    let info = db
+        .create_api_key(&NewApiKey {
+            owner: &args.owner,
+            name: &args.name,
+            hash: hash_key(&key),
+            workspace_id: args.workspace_id,
+            scopes: args.scopes,
+            lifetime: args.lifetime,
+        })
         .await
         .map_err(|e| e.to_string())?;
     // The key itself goes to stdout only, never to the log.
-    println!("id={id} owner={owner} key={key}");
+    println!("id={} {} key={key}", info.id, describe(&info));
+    Ok(())
+}
+
+async fn rotate_key(args: &[&str]) -> Result<(), String> {
+    let args = RotateKey::parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let (_, db) = prepare().await?;
+    let key = generate_key();
+    let r = db
+        .rotate_api_key(args.id, &hash_key(&key), args.overlap)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "id={} {} key={key} replaces={} old_expires_at={}",
+        r.new.id,
+        describe(&r.new),
+        r.old_id,
+        r.old_expires_at.to_rfc3339()
+    );
     Ok(())
 }
 
