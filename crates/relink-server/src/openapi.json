@@ -56,6 +56,7 @@
       }
     },
     "/v1/links": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
       "post": {
         "summary": "Create a link",
         "operationId": "createLink",
@@ -64,6 +65,7 @@
           "201": { "description": "Created.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "409": { "$ref": "#/components/responses/Error" },
           "413": { "$ref": "#/components/responses/Error" },
           "415": { "$ref": "#/components/responses/Error" },
@@ -72,7 +74,7 @@
         }
       },
       "get": {
-        "summary": "List your links, newest first",
+        "summary": "List the workspace's links, newest first",
         "operationId": "listLinks",
         "parameters": [
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
@@ -82,19 +84,21 @@
           "200": { "description": "A page of links.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LinkList" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
         }
       }
     },
     "/v1/links/{code}": {
-      "parameters": [{ "$ref": "#/components/parameters/Code" }],
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }],
       "get": {
-        "summary": "Get one of your links",
+        "summary": "Get a link in the workspace",
         "operationId": "getLink",
         "responses": {
           "200": { "description": "The link.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
@@ -109,6 +113,7 @@
           "200": { "description": "The updated link.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
           "413": { "$ref": "#/components/responses/Error" },
           "415": { "$ref": "#/components/responses/Error" },
@@ -122,6 +127,7 @@
         "responses": {
           "204": { "description": "Deleted." },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
@@ -146,7 +152,7 @@
       }
     },
     "/v1/links/{code}/stats": {
-      "parameters": [{ "$ref": "#/components/parameters/Code" }],
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }],
       "get": {
         "summary": "Click statistics",
         "operationId": "linkStats",
@@ -159,6 +165,7 @@
           "200": { "description": "Statistics.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Stats" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
@@ -172,7 +179,8 @@
       "apiKey": { "type": "http", "scheme": "bearer", "description": "rlk_ followed by 64 hex characters, created with `relink create-key OWNER`." }
     },
     "parameters": {
-      "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } }
+      "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } },
+      "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied." }
     },
     "responses": {
       "Redirect": {
@@ -184,7 +192,7 @@
         }
       },
       "Error": {
-        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
+        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, permission_denied 403, not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       }
     },
@@ -197,7 +205,7 @@
             "type": "object",
             "required": ["code", "message", "request_id"],
             "properties": {
-              "code": { "enum": ["invalid_argument", "unauthenticated", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "internal", "unavailable"] },
+              "code": { "enum": ["invalid_argument", "unauthenticated", "permission_denied", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "internal", "unavailable"] },
               "message": { "type": "string" },
               "request_id": { "type": "string" }
             }

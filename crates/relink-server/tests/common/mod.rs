@@ -388,3 +388,14 @@ where
     }
     false
 }
+
+/// Inserts a link into its owner's personal workspace (created on first
+/// use), the way an API request with that owner's key would.
+pub async fn insert_link(
+    store: &Db,
+    new: &relink_server::store::NewLink,
+    code_len: usize,
+) -> Result<relink_server::store::StoredLink, relink_server::store::DbError> {
+    let ws = store.personal_workspace(&new.owner).await?;
+    store.tenant(ws).insert_link(new, code_len).await
+}

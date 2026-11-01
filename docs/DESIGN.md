@@ -77,25 +77,55 @@ into it.
 
 The boundary is enforced by Postgres, not only by `WHERE` clauses in the
 service. A transaction that acts for a tenant (`Db::begin_tenant`) runs as the
-role `relink_tenant` and sets `relink.workspace_id`, both with `is_local`, in
-one statement before anything else. Row-level security policies on
-`workspaces`, `workspace_members`, `links`, `api_keys` and the three
-statistics tables compare against that setting through
-`relink_current_workspace()`, which reads an unset or reset setting as NULL.
-So a tenant query that forgot to name a workspace matches no rows and can
-write none, and an insert or update that names another workspace is refused
-by the same policy acting as its `WITH CHECK`. Inserts default
+role `relink_tenant` and sets `relink.workspace_id`, both with `SET LOCAL`, in
+the same simple-query message as its `BEGIN`, so scoping costs no round trip
+of its own. Row-level security policies on `workspaces`, `workspace_members`,
+`links`, `api_keys` and the three statistics tables compare against that
+setting through `relink_current_workspace()`, which reads an unset or reset
+setting as NULL. So a tenant query that forgot to name a workspace matches no
+rows and can write none, and an insert or update that names another workspace
+is refused by the same policy acting as its `WITH CHECK`. Inserts default
 `workspace_id` to the transaction's workspace. Because both settings are
 transaction-local, a pooled connection returns to the pool unscoped whether
 the transaction committed, rolled back or was dropped.
 
+On the request path, every management handler takes the `Workspace` extractor
+(`src/tenant.rs`). It authenticates the key and takes the key's workspace; a
+request may name its workspace in a `Relink-Workspace` header, and one that
+names a different workspace from its key's is refused with
+`permission_denied` (403) before anything is read, rather than quietly served
+from the key's own. Every query the API runs lives on `Tenant`
+(`Db::tenant(workspace_id)`), and each runs in its own tenant transaction.
+Those queries filter only by code or cursor: the workspace comes from the
+policies alone, so a link in another workspace is "not found" exactly like a
+code that does not exist, and links belong to the workspace, not to the key
+owner who created them (`links.owner` records the creator). Codes stay
+globally unique, because the short URL carries no workspace. Statistics read
+the link and its four aggregates in one transaction, so all parts come from
+one snapshot. A read that was one round trip is now three (`BEGIN` with the
+scoping, the query, `COMMIT`); the API is not latency-critical the way
+redirects are, and the guarantee is worth it.
+
 The connecting role owns the tables, so policies do not apply to it. It runs
-the work that crosses workspaces by design: redirect lookups by code, click
-flushes, health checks, the KV outbox and key lookups during authentication.
+the work that crosses workspaces by design: click flushes, health checks, the
+KV outbox, click leases and key lookups during authentication (a key is how
+the workspace is found, so that lookup cannot be scoped by it).
 `relink_tenant` is `NOLOGIN NOBYPASSRLS`, holds only the table privileges the
 API needs, and is created by the migration if missing (roles are
 cluster-wide); where the migrating user lacks `CREATEROLE`, an administrator
 creates it in advance and grants it to that user.
+
+Redirect lookups by code, from the redirect path, the edge publisher and
+`relink kv-record`, run as a third role, `relink_redirect` (migration 0004),
+on a pool of their own (`RELINK_DB_LOOKUP_CONNECTIONS`, default 8) whose
+connections `SET ROLE` once when they open, so the lookup is still one round
+trip. The role has no table privileges at all. Its one grant is `EXECUTE` on
+`relink_link_by_code(text)`, a `SECURITY DEFINER` function with a pinned
+`search_path` that returns the link with exactly that code. A connection on
+this pool cannot list links, read keys, statistics or salts, or write
+anything, so a bug on the hottest path cannot become a dump of every tenant's
+links. The separate pool also keeps a burst of cache misses from queueing
+behind API transactions, and the reverse.
 
 ## The redirect path on the origin
 

@@ -3,8 +3,9 @@
 //! [`redirect`] is `GET /{code}`, on top of [`resolver`], [`cache`] and
 //! [`singleflight`]; [`limiter`] holds click leases; [`clicks`] is the
 //! analytics pipeline; [`api`], [`auth`] and [`ratelimit`] are the management
-//! API; [`trust`] decides which forwarding headers to believe; [`health`]
-//! probes destinations; [`kvsync`] publishes links for the edge; [`store`] is
+//! API, and [`tenant`] scopes each of its requests to one workspace; [`trust`]
+//! decides which forwarding headers to believe; [`health`] probes
+//! destinations; [`kvsync`] publishes links for the edge; [`store`] is
 //! Postgres and [`server`] wires it together. The rules shared with the edge
 //! come from `relink_core` and are re-exported below.
 
@@ -24,6 +25,7 @@ pub mod resolver;
 pub mod server;
 pub mod singleflight;
 pub mod store;
+pub mod tenant;
 pub mod trust;
 pub mod util;
 

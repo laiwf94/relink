@@ -33,6 +33,7 @@ use crate::destination::normalize;
 use crate::model::{Destination, GeoMode, GeoRule};
 use crate::server::App;
 use crate::store::{DbError, LinkPatch, NewLink, Stats, StoredLink};
+use crate::tenant::Workspace;
 use crate::util::{fast_random, hex_decode, hex_encode, now_ms, utc_day};
 
 /// Largest accepted request body.
@@ -80,6 +81,9 @@ impl ApiError {
             "unauthenticated",
             "a valid API key is required: Authorization: Bearer rlk_...",
         )
+    }
+    pub fn permission_denied(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::FORBIDDEN, "permission_denied", message)
     }
     pub fn not_found() -> ApiError {
         ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such resource")
@@ -639,7 +643,7 @@ fn validate_fallback(app: &App, url: String) -> Result<String, ApiError> {
 
 pub async fn create_link(
     State(app): State<Arc<App>>,
-    Authed(principal): Authed,
+    ws: Workspace,
     StrictJson(req): StrictJson<CreateLink>,
 ) -> Result<Response, ApiError> {
     if let Some(alias) = &req.alias {
@@ -648,7 +652,7 @@ pub async fn create_link(
     let destinations = validate_destinations(&app, req.url, req.destinations, true)?
         .expect("required destinations are present");
     let new = NewLink {
-        owner: principal.owner,
+        owner: ws.principal.owner,
         alias: req.alias,
         destinations,
         redirect_status: validate_status(req.redirect_type.unwrap_or(302))?,
@@ -662,7 +666,11 @@ pub async fn create_link(
         enabled: req.enabled.unwrap_or(true),
         health_check: req.health_check.unwrap_or(false),
     };
-    let link = app.db.insert_link(&new, app.cfg.code_length).await?;
+    let link = app
+        .db
+        .tenant(ws.id)
+        .insert_link(&new, app.cfg.code_length)
+        .await?;
     // The code may be cached as "not found" here; other instances hear
     // about it through the change notification sent with the insert.
     app.resolver.invalidate(&link.code);
@@ -679,7 +687,7 @@ pub async fn create_link(
 
 pub async fn list_links(
     State(app): State<Arc<App>>,
-    Authed(principal): Authed,
+    ws: Workspace,
     StrictQuery(q): StrictQuery<ListQuery>,
 ) -> Result<Response, ApiError> {
     let limit = q.limit.unwrap_or(DEFAULT_PAGE);
@@ -693,7 +701,8 @@ pub async fn list_links(
     // One extra row tells whether another page exists.
     let mut links = app
         .db
-        .list_links(&principal.owner, before, i64::from(limit) + 1)
+        .tenant(ws.id)
+        .list_links(before, i64::from(limit) + 1)
         .await?;
     let next_cursor = if links.len() > limit as usize {
         links.truncate(limit as usize);
@@ -713,10 +722,10 @@ pub async fn list_links(
 
 pub async fn get_link(
     State(app): State<Arc<App>>,
-    Authed(principal): Authed,
+    ws: Workspace,
     Path(code): Path<String>,
 ) -> Result<Response, ApiError> {
-    let link = app.db.owned_link(&principal.owner, &code).await?;
+    let link = app.db.tenant(ws.id).link(&code).await?;
     Ok(json(
         StatusCode::OK,
         &LinkView::new(&link, &app.cfg.public_base_url),
@@ -725,7 +734,7 @@ pub async fn get_link(
 
 pub async fn update_link(
     State(app): State<Arc<App>>,
-    Authed(principal): Authed,
+    ws: Workspace,
     Path(code): Path<String>,
     StrictJson(req): StrictJson<PatchLink>,
 ) -> Result<Response, ApiError> {
@@ -762,7 +771,7 @@ pub async fn update_link(
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }
-    let link = app.db.update_link(&principal.owner, &code, &patch).await?;
+    let link = app.db.tenant(ws.id).update_link(&code, &patch).await?;
     app.resolver.invalidate(&link.code);
     app.limiter.invalidate(link.id).await;
     tracing::info!(code = %link.code, "link updated");
@@ -774,10 +783,10 @@ pub async fn update_link(
 
 pub async fn delete_link(
     State(app): State<Arc<App>>,
-    Authed(principal): Authed,
+    ws: Workspace,
     Path(code): Path<String>,
 ) -> Result<Response, ApiError> {
-    let id = app.db.delete_link(&principal.owner, &code).await?;
+    let id = app.db.tenant(ws.id).delete_link(&code).await?;
     app.resolver.invalidate(&code);
     app.limiter.invalidate(id).await;
     tracing::info!(code = %code, "link deleted");
@@ -786,7 +795,7 @@ pub async fn delete_link(
 
 pub async fn link_stats(
     State(app): State<Arc<App>>,
-    Authed(principal): Authed,
+    ws: Workspace,
     Path(code): Path<String>,
     StrictQuery(q): StrictQuery<StatsQuery>,
 ) -> Result<Response, ApiError> {
@@ -800,7 +809,7 @@ pub async fn link_stats(
             "the range must be at most {MAX_STATS_DAYS} days"
         )));
     }
-    let stats = app.db.stats(&principal.owner, &code, from, to).await?;
+    let stats = app.db.tenant(ws.id).stats(&code, from, to).await?;
     Ok(json(
         StatusCode::OK,
         &StatsView {

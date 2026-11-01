@@ -239,27 +239,27 @@ async fn reconciliation_repairs_drift() {
         .await
         .unwrap();
     for alias in ["keep-a", "keep-b", "keep-c", "missing-d"] {
-        store
-            .insert_link(
-                &relink_server::store::NewLink {
-                    owner: "alice".into(),
-                    alias: Some(alias.into()),
-                    destinations: vec![relink_server::model::Destination {
-                        url: "https://example.com/".into(),
-                        weight: 1,
-                    }],
-                    redirect_status: 302,
-                    expires_at: None,
-                    max_clicks: None,
-                    geo: None,
-                    fallback_url: None,
-                    enabled: true,
-                    health_check: false,
-                },
-                7,
-            )
-            .await
-            .unwrap();
+        common::insert_link(
+            &store,
+            &relink_server::store::NewLink {
+                owner: "alice".into(),
+                alias: Some(alias.into()),
+                destinations: vec![relink_server::model::Destination {
+                    url: "https://example.com/".into(),
+                    weight: 1,
+                }],
+                redirect_status: 302,
+                expires_at: None,
+                max_clicks: None,
+                geo: None,
+                fallback_url: None,
+                enabled: true,
+                health_check: false,
+            },
+            7,
+        )
+        .await
+        .unwrap();
     }
     let kv_cfg: KvConfig = cfg.kv.clone().unwrap();
     let metrics = Arc::new(Metrics::default());

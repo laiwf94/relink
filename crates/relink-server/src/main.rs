@@ -46,7 +46,8 @@
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |
-//! | `RELINK_DB_MAX_CONNECTIONS` | `16` | Pool size |
+//! | `RELINK_DB_MAX_CONNECTIONS` | `16` | Pool size for the API and background work |
+//! | `RELINK_DB_LOOKUP_CONNECTIONS` | `8` | Separate pool for redirect lookups by code, which runs as the lookup-only role `relink_redirect` |
 //! | `RELINK_DB_TIMEOUT_MS` | `2000` | Bound on every query, including waiting for a connection |
 //! | `RELINK_REDIRECT_MAX_AGE_S` | `0` | `Cache-Control: max-age` for redirects that never vary |
 //! | `RELINK_SHUTDOWN_TIMEOUT_S` | `10` | One budget for the whole shutdown: draining requests, flushing clicks, returning leases |

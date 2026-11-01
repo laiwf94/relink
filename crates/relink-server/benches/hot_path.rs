@@ -87,6 +87,7 @@ fn app(rt: &tokio::runtime::Runtime) -> Arc<App> {
         PgConnectOptions::from_str(&cfg.database_url).unwrap(),
         &DbConfig {
             max_connections: 1,
+            lookup_connections: 1,
             timeout: Duration::from_secs(1),
             health_threshold: 2,
             kv_outbox: false,

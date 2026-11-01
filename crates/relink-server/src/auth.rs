@@ -26,6 +26,8 @@ const KEY_HEX_LEN: usize = 64;
 pub struct Principal {
     pub key_id: i64,
     pub owner: String,
+    /// The workspace the key belongs to; it acts only there.
+    pub workspace_id: i64,
 }
 
 /// Why authentication failed.
@@ -160,8 +162,12 @@ impl Authenticator {
                 return Err(AuthError::Unavailable);
             }
         };
-        let principal = found.and_then(|(key_id, owner, stored)| {
-            bool::from(stored.as_slice().ct_eq(&hash)).then_some(Principal { key_id, owner })
+        let principal = found.and_then(|k| {
+            bool::from(k.hash.as_slice().ct_eq(&hash)).then_some(Principal {
+                key_id: k.id,
+                owner: k.owner,
+                workspace_id: k.workspace_id,
+            })
         });
         match &principal {
             Some(p) => {

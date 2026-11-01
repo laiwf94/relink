@@ -115,8 +115,8 @@ impl App {
             backlog_keys: self.metrics.backlog.load(Ordering::Relaxed) as usize,
             cache_entries: self.resolver.cache().len(),
             leases: self.limiter.len(),
-            db_pool_size: self.db.pool().size(),
-            db_pool_idle: self.db.pool().num_idle(),
+            db_pool_size: self.db.pool_stats().0,
+            db_pool_idle: self.db.pool_stats().1,
         }
     }
 
@@ -193,6 +193,7 @@ pub fn open_db(cfg: &Config) -> Result<Db, String> {
         options,
         &DbConfig {
             max_connections: cfg.db_max_connections,
+            lookup_connections: cfg.db_lookup_connections,
             timeout: cfg.db_timeout,
             health_threshold: cfg.health.failure_threshold,
             kv_outbox: cfg.kv.is_some(),
@@ -343,7 +344,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         {
             tracing::warn!("could not return unspent click leases before the shutdown deadline");
         }
-        supervisor_app.db.pool().close().await;
+        supervisor_app.db.close().await;
         tracing::info!("shutdown complete");
     });
 

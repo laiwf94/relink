@@ -856,3 +856,79 @@ impl JsonValue for reqwest::Response {
         serde_json::from_str(&self.text().await.unwrap()).unwrap()
     }
 }
+
+#[tokio::test]
+async fn requests_act_in_their_keys_workspace() {
+    let mut h = harness!();
+    let link = h.create(json!({"url": "https://example.com/"})).await;
+    let code = link["code"].as_str().unwrap().to_owned();
+    let alice_ws = h.store.personal_workspace("alice").await.unwrap();
+    let bob_ws = h.store.personal_workspace("bob").await.unwrap();
+
+    // A second person's key in alice's workspace: links belong to the
+    // workspace, not to whoever created them, so carol sees and edits them.
+    let carol = relink_server::auth::generate_key();
+    sqlx::query(
+        "WITH m AS (INSERT INTO workspace_members (workspace_id, member, role)
+                    VALUES ($1, 'carol', 'editor'))
+         INSERT INTO api_keys (owner, name, key_hash, workspace_id) VALUES ('carol', '', $2, $1)",
+    )
+    .bind(alice_ws)
+    .bind(&relink_server::auth::hash_key(&carol)[..])
+    .execute(h.store.pool())
+    .await
+    .unwrap();
+    let (status, list) = h.api(Method::GET, "/v1/links", &carol, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(list["links"][0]["code"], code.as_str());
+    let (status, patched) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/links/{code}"),
+            &carol,
+            Some(json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!((status, &patched["enabled"]), (200, &json!(false)));
+    let (status, made) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &carol,
+            Some(json!({"url": "https://example.org/"})),
+        )
+        .await;
+    assert_eq!(status, 201, "{made}");
+    let made_code = made["code"].as_str().unwrap();
+    let stored = h.store.link_by_code(made_code).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.workspace_id, stored.owner.as_str()),
+        (alice_ws, "carol"),
+        "filed in the key's workspace, created by the key's owner"
+    );
+    let (_, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
+    assert_eq!(list["links"].as_array().unwrap().len(), 2);
+
+    // Naming the key's own workspace is fine; naming another is refused
+    // before anything is read, and a malformed ID is a client error.
+    let send = |key: &str, ws: &str| {
+        h.http
+            .get(format!("{}/v1/links/{code}", h.base))
+            .bearer_auth(key)
+            .header("relink-workspace", ws)
+            .send()
+    };
+    let r = send(&h.alice, &alice_ws.to_string()).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = send(&h.alice, &bob_ws.to_string()).await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(r.json_value().await["error"]["code"], "permission_denied");
+    let r = send(&h.bob, &alice_ws.to_string()).await.unwrap();
+    assert_eq!(r.status(), 403, "bob cannot reach into alice's workspace");
+    for bad in ["0", "-1", "abc", "1.5"] {
+        let r = send(&h.alice, bad).await.unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+        assert_eq!(r.json_value().await["error"]["code"], "invalid_argument");
+    }
+    h.shutdown().await;
+}

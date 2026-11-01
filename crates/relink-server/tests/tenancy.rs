@@ -10,7 +10,9 @@ use std::time::Duration;
 use common::{TestDb, admin_url, config};
 use relink_server::model::Destination;
 use relink_server::server::{migrate_with_retry, open_db};
-use relink_server::store::{ClickRow, Db, MIGRATOR, NewLink, TENANT_ROLE};
+use relink_server::store::{
+    ClickRow, Db, DbError, LinkPatch, MIGRATOR, NewLink, REDIRECT_ROLE, TENANT_ROLE,
+};
 use relink_server::util::utc_day;
 use sqlx::migrate::Migrator;
 use sqlx::{Postgres, Transaction};
@@ -114,13 +116,11 @@ async fn migration_backfills_a_personal_workspace_per_owner() {
     assert_eq!(mismatched, 0);
     // New rows land in the same workspaces, and new owners get their own.
     let alice_ws = store.personal_workspace("alice").await.unwrap();
-    let link = store
-        .insert_link(&new_link("alice", "alice3"), 7)
+    let link = common::insert_link(&store, &new_link("alice", "alice3"), 7)
         .await
         .unwrap();
     assert_eq!(link.workspace_id, alice_ws);
-    let dave = store
-        .insert_link(&new_link("dave", "dave1"), 7)
+    let dave = common::insert_link(&store, &new_link("dave", "dave1"), 7)
         .await
         .unwrap();
     assert_ne!(dave.workspace_id, alice_ws);
@@ -143,16 +143,13 @@ async fn tenant_transactions_see_only_their_workspace() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let a1 = store
-        .insert_link(&new_link("alice", "alice1"), 7)
+    let a1 = common::insert_link(&store, &new_link("alice", "alice1"), 7)
         .await
         .unwrap();
-    store
-        .insert_link(&new_link("alice", "alice2"), 7)
+    common::insert_link(&store, &new_link("alice", "alice2"), 7)
         .await
         .unwrap();
-    let b1 = store
-        .insert_link(&new_link("bob", "bob1"), 7)
+    let b1 = common::insert_link(&store, &new_link("bob", "bob1"), 7)
         .await
         .unwrap();
     store
@@ -270,8 +267,7 @@ async fn without_a_workspace_set_a_tenant_sees_no_rows() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let a1 = store
-        .insert_link(&new_link("alice", "alice1"), 7)
+    let a1 = common::insert_link(&store, &new_link("alice", "alice1"), 7)
         .await
         .unwrap();
     store
@@ -365,7 +361,7 @@ async fn concurrent_first_use_creates_one_personal_workspace() {
                 if i % 2 == 0 {
                     s.personal_workspace("erin").await.unwrap()
                 } else {
-                    s.insert_link(&new_link("erin", &format!("erin{i}")), 7)
+                    common::insert_link(&s, &new_link("erin", &format!("erin{i}")), 7)
                         .await
                         .unwrap()
                         .workspace_id
@@ -386,6 +382,189 @@ async fn concurrent_first_use_creates_one_personal_workspace() {
     .await
     .unwrap();
     assert_eq!((workspaces, members), (1, 1));
+}
+
+#[tokio::test]
+async fn tenant_queries_reach_only_their_workspace() {
+    let Some((_db, store)) = fresh().await else {
+        return;
+    };
+    let a1 = common::insert_link(&store, &new_link("alice", "alice1"), 7)
+        .await
+        .unwrap();
+    let b1 = common::insert_link(&store, &new_link("bob", "bob1"), 7)
+        .await
+        .unwrap();
+    let alice = store.tenant(a1.workspace_id);
+    let bob = store.tenant(b1.workspace_id);
+    assert_eq!(alice.workspace_id(), a1.workspace_id);
+
+    // Every query treats the other workspace's link as missing.
+    assert_eq!(alice.link("bob1").await, Err(DbError::NotFound));
+    let codes: Vec<String> = alice
+        .list_links(None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|l| l.link.code)
+        .collect();
+    assert_eq!(codes, ["alice1"]);
+    let patch = LinkPatch {
+        enabled: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        alice.update_link("bob1", &patch).await,
+        Err(DbError::NotFound)
+    );
+    let day = chrono::Utc::now().date_naive();
+    assert_eq!(alice.stats("bob1", day, day).await, Err(DbError::NotFound));
+    assert_eq!(alice.delete_link("bob1").await, Err(DbError::NotFound));
+    let untouched = bob.link("bob1").await.unwrap();
+    assert!(untouched.enabled);
+
+    // Links are the workspace's, not their creator's: a link carol created
+    // in alice's workspace is alice's to change.
+    let c1 = alice
+        .insert_link(&new_link("carol", "carol1"), 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        (c1.workspace_id, c1.owner.as_str()),
+        (a1.workspace_id, "carol")
+    );
+    assert!(!alice.update_link("carol1", &patch).await.unwrap().enabled);
+    // An alias taken in another workspace is still taken: codes are global.
+    assert_eq!(
+        alice.insert_link(&new_link("alice", "bob1"), 7).await,
+        Err(DbError::Conflict)
+    );
+    assert_eq!(bob.delete_link("bob1").await.unwrap(), b1.id);
+    assert_eq!(alice.list_links(None, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn begin_tenant_scopes_in_one_message_and_leaves_nothing_behind() {
+    let Some(admin) = admin_url() else {
+        return;
+    };
+    let db = TestDb::create(&admin).await;
+    // One connection, so every transaction below reuses it.
+    let store = open_db(&config(&db.url, &[("RELINK_DB_MAX_CONNECTIONS", "1")])).unwrap();
+    migrate_with_retry(&store, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let ws = store.personal_workspace("alice").await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let mut tx = store.begin_tenant(ws).await.unwrap();
+    let (role, setting, same_pid): (String, String, bool) = sqlx::query_as(
+        "SELECT current_user::text, current_setting('relink.workspace_id'), pg_backend_pid() = $1",
+    )
+    .bind(pid)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!((role.as_str(), setting), (TENANT_ROLE, ws.to_string()));
+    assert!(same_pid);
+    tx.commit().await.unwrap();
+    // A failed statement aborts the transaction; dropping it rolls back.
+    let mut tx = store.begin_tenant(ws).await.unwrap();
+    assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
+    drop(tx);
+    let (role, setting): (String, Option<String>) = sqlx::query_as(
+        "SELECT current_user::text, NULLIF(current_setting('relink.workspace_id', true), '')",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_ne!(role, TENANT_ROLE);
+    assert_eq!(setting, None);
+}
+
+#[tokio::test]
+async fn the_redirect_role_can_only_look_up_codes() {
+    let Some((_db, store)) = fresh().await else {
+        return;
+    };
+    let a1 = common::insert_link(&store, &new_link("alice", "alice1"), 7)
+        .await
+        .unwrap();
+    store
+        .insert_api_key("alice", "a", &[0xaa; 32])
+        .await
+        .unwrap();
+    let (superuser, bypass): (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
+            .bind(REDIRECT_ROLE)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert!(!superuser && !bypass);
+
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT set_config('role', $1, true)")
+        .bind(REDIRECT_ROLE)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Exact-code lookups work, in any workspace.
+    let id: Option<i64> = sqlx::query_scalar("SELECT id FROM relink_link_by_code($1)")
+        .bind("alice1")
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(id, Some(a1.id));
+    let none: Option<i64> = sqlx::query_scalar("SELECT id FROM relink_link_by_code($1)")
+        .bind("nope")
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+    tx.commit().await.unwrap();
+    // Everything else is refused: listing links, reading keys, statistics
+    // or salts, and any write.
+    for statement in [
+        "SELECT count(*) FROM links",
+        "SELECT count(*) FROM api_keys",
+        "SELECT count(*) FROM click_daily",
+        "SELECT count(*) FROM visitor_salts",
+        "SELECT count(*) FROM workspaces",
+        "UPDATE links SET enabled = false",
+        "DELETE FROM kv_outbox",
+    ] {
+        let mut tx = store.pool().begin().await.unwrap();
+        sqlx::query("SELECT set_config('role', $1, true)")
+            .bind(REDIRECT_ROLE)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let err = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert_eq!(sqlstate(&err), "42501", "{statement}: {err}");
+        tx.rollback().await.unwrap();
+    }
+
+    // The redirect path really runs as that role: without its one grant,
+    // lookups fail; with it back, they work again.
+    assert!(store.link_by_code("alice1").await.unwrap().is_some());
+    sqlx::query("REVOKE EXECUTE ON FUNCTION relink_link_by_code(text) FROM relink_redirect")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.link_by_code("alice1").await,
+        Err(DbError::Other(_))
+    ));
+    sqlx::query("GRANT EXECUTE ON FUNCTION relink_link_by_code(text) TO relink_redirect")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(store.link_by_code("alice1").await.unwrap().is_some());
 }
 
 fn sqlstate(e: &sqlx::Error) -> String {

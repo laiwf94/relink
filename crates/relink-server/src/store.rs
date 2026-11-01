@@ -2,6 +2,12 @@
 //!
 //! Each call is bounded by a deadline so a database that stops answering
 //! (rather than refusing connections) cannot pin request tasks.
+//!
+//! This module runs the work that crosses workspaces by design: redirect
+//! lookups (as [`REDIRECT_ROLE`], through their own pool), click flushes,
+//! health checks, the KV outbox and key lookups. Everything done for one
+//! tenant goes through [`crate::tenant::Tenant`] instead, inside a
+//! transaction that row-level security limits to that tenant's workspace.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,15 +31,20 @@ macro_rules! columns {
          health_failures, health_checked_at, created_at, updated_at"
     };
 }
+pub(crate) use columns;
 
 /// Embedded migrations from `migrations/`.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The role a tenant transaction runs as. Row-level security policies
 /// (migration 0003) apply to it; the connecting role, which runs system work
-/// such as redirect lookups, the click flusher and the health worker, owns
-/// the tables and is not subject to them.
+/// such as the click flusher, the health worker and key lookups, owns the
+/// tables and is not subject to them.
 pub const TENANT_ROLE: &str = "relink_tenant";
+
+/// The role the redirect lookup pool runs as: it may only call
+/// `relink_link_by_code` (migration 0004) and has no table privileges.
+pub const REDIRECT_ROLE: &str = "relink_redirect";
 
 /// The transaction-local setting naming the workspace a tenant transaction
 /// acts for. Unset, a tenant transaction sees no rows.
@@ -45,7 +56,7 @@ pub const CHANGES_CHANNEL: &str = "relink_link_changes";
 /// Database errors as the rest of the service sees them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbError {
-    /// The row does not exist (or belongs to another owner).
+    /// The row does not exist (or belongs to another workspace).
     NotFound,
     /// A unique constraint was violated.
     Conflict,
@@ -148,6 +159,15 @@ pub struct LinkPatch {
     pub health_check: Option<bool>,
 }
 
+/// An active API key as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRow {
+    pub id: i64,
+    pub owner: String,
+    pub workspace_id: i64,
+    pub hash: Vec<u8>,
+}
+
 /// One aggregated click row for [`Db::flush_clicks`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClickRow {
@@ -194,7 +214,7 @@ pub struct Stats {
 }
 
 /// Rows returned per dimension in stats.
-const STATS_TOP_N: i64 = 50;
+pub(crate) const STATS_TOP_N: i64 = 50;
 
 /// Stored value for clicks without a referrer. Parentheses never occur in a
 /// parsed referrer host, so this cannot collide with a real one.
@@ -211,6 +231,8 @@ pub fn day_to_date(day: i32) -> NaiveDate {
 #[derive(Clone, Debug)]
 pub struct DbConfig {
     pub max_connections: u32,
+    /// Size of the separate pool for redirect lookups by code.
+    pub lookup_connections: u32,
     /// Bound on every query, including waiting for a pooled connection.
     pub timeout: Duration,
     /// Consecutive failed health probes before a destination is unhealthy.
@@ -223,6 +245,8 @@ pub struct DbConfig {
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
+    /// Connections that run as [`REDIRECT_ROLE`] for the whole session.
+    lookup: PgPool,
     timeout: Duration,
     health_threshold: i16,
     outbox: bool,
@@ -235,15 +259,32 @@ impl Db {
         let options = options
             .application_name("relink")
             .options([("statement_timeout", cfg.timeout.as_millis().to_string())]);
-        let pool = PgPoolOptions::new()
-            .max_connections(cfg.max_connections)
-            .acquire_timeout(cfg.timeout)
-            // A ping before every query would double miss-path latency; a dead
-            // connection instead fails one query and is dropped.
-            .test_before_acquire(false)
+        let pool_options = |size| {
+            PgPoolOptions::new()
+                .max_connections(size)
+                .acquire_timeout(cfg.timeout)
+                // A ping before every query would double miss-path latency; a
+                // dead connection instead fails one query and is dropped.
+                .test_before_acquire(false)
+        };
+        let pool = pool_options(cfg.max_connections).connect_lazy_with(options.clone());
+        // Session-level SET ROLE, once per connection: the lookup itself
+        // stays one round trip. Nothing else runs on these connections, so
+        // the role is never reset.
+        let lookup = pool_options(cfg.lookup_connections)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('role', $1, false)")
+                        .bind(REDIRECT_ROLE)
+                        .execute(conn)
+                        .await
+                        .map(|_| ())
+                })
+            })
             .connect_lazy_with(options);
         Db {
             pool,
+            lookup,
             timeout: cfg.timeout,
             health_threshold: cfg.health_threshold,
             outbox: cfg.kv_outbox,
@@ -254,7 +295,20 @@ impl Db {
         &self.pool
     }
 
-    async fn timed<T>(
+    /// Open and idle connections across both pools, for metrics.
+    pub fn pool_stats(&self) -> (u32, usize) {
+        (
+            self.pool.size() + self.lookup.size(),
+            self.pool.num_idle() + self.lookup.num_idle(),
+        )
+    }
+
+    /// Closes both pools, waiting for checked-out connections to return.
+    pub async fn close(&self) {
+        tokio::join!(self.pool.close(), self.lookup.close());
+    }
+
+    pub(crate) async fn timed<T>(
         &self,
         f: impl Future<Output = Result<T, sqlx::Error>>,
     ) -> Result<T, DbError> {
@@ -279,7 +333,7 @@ impl Db {
             .map(|_| ())
     }
 
-    fn row_to_link(&self, row: &PgRow) -> Result<StoredLink, sqlx::Error> {
+    pub(crate) fn row_to_link(&self, row: &PgRow) -> Result<StoredLink, sqlx::Error> {
         let Json(destinations): Json<Vec<Destination>> = row.try_get("destinations")?;
         // The redirect path relies on these; a row edited by hand into
         // another shape is reported as an error, not served.
@@ -328,10 +382,12 @@ impl Db {
         })
     }
 
-    /// The link for a code, regardless of owner (redirect path). Retried
-    /// once on an I/O error from a pooled connection that died while idle
-    /// (the pool does not ping before use, and a read is safe to repeat).
-    /// Both attempts share one deadline.
+    /// The link for a code, in any workspace (redirect path and edge
+    /// publishing). Runs on the lookup pool as [`REDIRECT_ROLE`], through
+    /// the one function that role may call. Retried once on an I/O error
+    /// from a pooled connection that died while idle (the pool does not ping
+    /// before use, and a read is safe to repeat). Both attempts share one
+    /// deadline.
     pub async fn link_by_code(&self, code: &str) -> Result<Option<StoredLink>, DbError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut retried = false;
@@ -339,10 +395,10 @@ impl Db {
             let query = sqlx::query(concat!(
                 "SELECT ",
                 columns!(),
-                " FROM links WHERE code = $1"
+                " FROM relink_link_by_code($1)"
             ))
             .bind(code)
-            .fetch_optional(&self.pool);
+            .fetch_optional(&self.lookup);
             match tokio::time::timeout_at(deadline, query).await {
                 Ok(Ok(row)) => {
                     return row
@@ -357,207 +413,10 @@ impl Db {
         }
     }
 
-    /// A link owned by `owner`.
-    pub async fn owned_link(&self, owner: &str, code: &str) -> Result<StoredLink, DbError> {
-        let row = self
-            .timed(
-                sqlx::query(concat!(
-                    "SELECT ",
-                    columns!(),
-                    " FROM links WHERE owner = $1 AND code = $2"
-                ))
-                .bind(owner)
-                .bind(code)
-                .fetch_optional(&self.pool),
-            )
-            .await?
-            .ok_or(DbError::NotFound)?;
-        self.row_to_link(&row).map_err(DbError::from)
-    }
-
-    /// Inserts a link. With an alias, a taken code is `Conflict`; with a
-    /// random code, collisions are retried with a fresh code up to five times.
-    pub async fn insert_link(&self, new: &NewLink, code_len: usize) -> Result<StoredLink, DbError> {
-        let attempts = if new.alias.is_some() { 1 } else { 5 };
-        for _ in 0..attempts {
-            let code = new
-                .alias
-                .clone()
-                .unwrap_or_else(|| crate::code::random_code(code_len));
-            let (geo_mode, geo_countries) = geo_columns(new.geo.as_ref());
-            let res = self
-                .timed(async {
-                    let mut tx = self.pool.begin().await?;
-                    let workspace_id = personal_workspace(&mut tx, &new.owner).await?;
-                    let row = sqlx::query(concat!(
-                        "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
-                         max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-                         workspace_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING ",
-                        columns!()
-                    ))
-                    .bind(&code)
-                    .bind(&new.owner)
-                    .bind(Json(&new.destinations))
-                    .bind(new.redirect_status as i16)
-                    .bind(new.expires_at)
-                    .bind(new.max_clicks)
-                    .bind(geo_mode)
-                    .bind(geo_countries)
-                    .bind(&new.fallback_url)
-                    .bind(new.enabled)
-                    .bind(new.health_check)
-                    .bind(workspace_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    let id: i64 = row.try_get("id")?;
-                    // Instances may hold a negative cache entry for this code.
-                    self.changed(&mut tx, id, &code).await?;
-                    tx.commit().await?;
-                    Ok(row)
-                })
-                .await;
-            match res {
-                Ok(row) => return self.row_to_link(&row).map_err(DbError::from),
-                Err(DbError::Conflict) if new.alias.is_none() => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(DbError::Other(
-            "could not allocate a unique code after 5 attempts".into(),
-        ))
-    }
-
-    /// Lists an owner's links, newest first, after the cursor (a link ID).
-    pub async fn list_links(
-        &self,
-        owner: &str,
-        before_id: Option<i64>,
-        limit: i64,
-    ) -> Result<Vec<StoredLink>, DbError> {
-        let rows = self
-            .timed(
-                sqlx::query(concat!(
-                    "SELECT ",
-                    columns!(),
-                    " FROM links WHERE owner = $1 AND ($2::bigint IS NULL OR id < $2) \
-                     ORDER BY id DESC LIMIT $3"
-                ))
-                .bind(owner)
-                .bind(before_id)
-                .bind(limit)
-                .fetch_all(&self.pool),
-            )
-            .await?;
-        rows.iter()
-            .map(|r| self.row_to_link(r))
-            .collect::<Result<_, _>>()
-            .map_err(DbError::from)
-    }
-
-    /// Applies `patch` to an owned link in one transaction and notifies other
-    /// instances.
-    pub async fn update_link(
-        &self,
-        owner: &str,
-        code: &str,
-        patch: &LinkPatch,
-    ) -> Result<StoredLink, DbError> {
-        self.timed(async {
-            let mut tx = self.pool.begin().await?;
-            let row = sqlx::query(concat!(
-                "SELECT ",
-                columns!(),
-                " FROM links WHERE owner = $1 AND code = $2 FOR NO KEY UPDATE"
-            ))
-            .bind(owner)
-            .bind(code)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(sqlx::Error::RowNotFound)?;
-            let mut link = self.row_to_link(&row)?;
-            let destinations_changed = match &patch.destinations {
-                Some(d) if *d != link.destinations => {
-                    link.destinations = d.clone();
-                    true
-                }
-                _ => false,
-            };
-            if let Some(s) = patch.redirect_status {
-                link.redirect_status = s;
-            }
-            if let Some(e) = patch.expires_at {
-                link.expires_at = e;
-            }
-            if let Some(m) = patch.max_clicks {
-                link.max_clicks = m;
-            }
-            if let Some(g) = &patch.geo {
-                link.geo = g.clone();
-            }
-            if let Some(f) = &patch.fallback_url {
-                link.fallback_url = f.clone();
-            }
-            if let Some(e) = patch.enabled {
-                link.enabled = e;
-            }
-            if let Some(h) = patch.health_check {
-                link.health_check = h;
-            }
-            let (geo_mode, geo_countries) = geo_columns(link.geo.as_ref());
-            let row = sqlx::query(concat!(
-                "UPDATE links SET destinations = $2, \
-                 destinations_version = destinations_version + CASE WHEN $3 THEN 1 ELSE 0 END, \
-                 health_failures = CASE WHEN $3 THEN '{}'::smallint[] ELSE health_failures END, \
-                 redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
-                 geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
-                 updated_at = now() WHERE id = $1 RETURNING ",
-                columns!()
-            ))
-            .bind(link.id)
-            .bind(Json(&link.destinations))
-            .bind(destinations_changed)
-            .bind(link.redirect_status as i16)
-            .bind(link.expires_at)
-            .bind(link.max_clicks)
-            .bind(geo_mode)
-            .bind(geo_countries)
-            .bind(&link.fallback_url)
-            .bind(link.enabled)
-            .bind(link.health_check)
-            .fetch_one(&mut *tx)
-            .await?;
-            let updated = self.row_to_link(&row)?;
-            self.changed(&mut tx, updated.id, &updated.code).await?;
-            tx.commit().await?;
-            Ok(updated)
-        })
-        .await
-    }
-
-    /// Deletes an owned link and its statistics, and notifies other instances.
-    /// Returns the deleted link's ID.
-    pub async fn delete_link(&self, owner: &str, code: &str) -> Result<i64, DbError> {
-        self.timed(async {
-            let mut tx = self.pool.begin().await?;
-            let id: i64 =
-                sqlx::query_scalar("DELETE FROM links WHERE owner = $1 AND code = $2 RETURNING id")
-                    .bind(owner)
-                    .bind(code)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .ok_or(sqlx::Error::RowNotFound)?;
-            self.changed(&mut tx, id, code).await?;
-            tx.commit().await?;
-            Ok(id)
-        })
-        .await
-    }
-
     /// Records that link `code` changed, inside the caller's transaction:
     /// other instances are told to drop their cached copy, and, when edge
     /// publishing is on, the code joins the KV outbox.
-    async fn changed(
+    pub(crate) async fn changed(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         id: i64,
@@ -823,88 +682,6 @@ impl Db {
         }
     }
 
-    /// Statistics for an owned link between two dates, inclusive.
-    pub async fn stats(
-        &self,
-        owner: &str,
-        code: &str,
-        from: NaiveDate,
-        to: NaiveDate,
-    ) -> Result<Stats, DbError> {
-        let link = self.owned_link(owner, code).await?;
-        self.timed(async {
-            let day_rows = sqlx::query(
-                "SELECT d.day, d.clicks, COALESCE(v.visitors, 0)::bigint AS visitors
-                   FROM (SELECT day, sum(clicks)::bigint AS clicks FROM click_daily
-                          WHERE link_id = $1 AND day BETWEEN $2 AND $3 GROUP BY day) d
-                   LEFT JOIN (
-                        SELECT day, count(*) AS visitors FROM visitor_daily
-                         WHERE link_id = $1 AND day BETWEEN $2 AND $3 GROUP BY day
-                        UNION ALL
-                        SELECT day, visitors FROM visitor_rollup
-                         WHERE link_id = $1 AND day BETWEEN $2 AND $3) v ON v.day = d.day
-                  ORDER BY d.day",
-            )
-            .bind(link.id)
-            .bind(from)
-            .bind(to)
-            .fetch_all(&self.pool)
-            .await?;
-            let mut days: Vec<DayStats> = Vec::with_capacity(day_rows.len());
-            for r in &day_rows {
-                let day: NaiveDate = r.try_get("day")?;
-                let clicks: i64 = r.try_get("clicks")?;
-                let visitors: i64 = r.try_get("visitors")?;
-                // A day can have both live hashes and a rollup during the
-                // hand-over; the JOIN then yields two rows to merge.
-                match days.last_mut() {
-                    Some(last) if last.day == day => last.unique_visitors += visitors,
-                    _ => days.push(DayStats {
-                        day,
-                        clicks,
-                        unique_visitors: visitors,
-                    }),
-                }
-            }
-            let total_clicks = days.iter().map(|d| d.clicks).sum();
-            let countries = self.top(STATS_COUNTRY, link.id, from, to).await?;
-            let devices = self.top(STATS_DEVICE, link.id, from, to).await?;
-            let referrers = self.top(STATS_REFERRER, link.id, from, to).await?;
-            Ok(Stats {
-                total_clicks,
-                days,
-                countries,
-                devices,
-                referrers,
-            })
-        })
-        .await
-    }
-
-    async fn top(
-        &self,
-        query: &'static str,
-        link_id: i64,
-        from: NaiveDate,
-        to: NaiveDate,
-    ) -> Result<Vec<Bucket>, sqlx::Error> {
-        let rows = sqlx::query(query)
-            .bind(link_id)
-            .bind(from)
-            .bind(to)
-            .bind(STATS_TOP_N)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|r| {
-                Ok(Bucket {
-                    value: r.try_get("value")?,
-                    clicks: r.try_get("clicks")?,
-                })
-            })
-            .collect()
-    }
-
     /// Claims up to `limit` links due for a health check (not checked within
     /// `interval`), marking them checked now. `SKIP LOCKED` lets several
     /// instances share the work without checking a link twice. The lock is
@@ -1055,38 +832,54 @@ impl Db {
     /// transaction, so row-level security limits every statement in it to
     /// that workspace's rows. Both are reset at commit or rollback, so the
     /// pooled connection goes back to the pool unscoped.
+    ///
+    /// The scoping travels with `BEGIN` in one simple-query message, so a
+    /// tenant transaction costs no extra round trip. The values are a
+    /// constant and an integer, so formatting them into the text is safe.
     pub async fn begin_tenant(
         &self,
         workspace_id: i64,
     ) -> Result<Transaction<'static, Postgres>, DbError> {
-        self.timed(async {
-            let mut tx = self.pool.begin().await?;
-            scope_to_workspace(&mut tx, workspace_id).await?;
-            Ok(tx)
-        })
-        .await
+        self.timed(self.begin_tenant_untimed(workspace_id)).await
     }
 
-    /// Finds an active key by hash: `(id, owner, stored hash)`.
-    pub async fn api_key_by_hash(
+    /// [`Db::begin_tenant`] without its own deadline, for callers that bound
+    /// the whole transaction with one.
+    pub(crate) async fn begin_tenant_untimed(
         &self,
-        hash: &[u8; 32],
-    ) -> Result<Option<(i64, String, Vec<u8>)>, DbError> {
+        workspace_id: i64,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        let begin = format!(
+            "BEGIN; SET LOCAL ROLE {TENANT_ROLE}; SET LOCAL {WORKSPACE_SETTING} = '{workspace_id}'"
+        );
+        self.pool.begin_with(sqlx::AssertSqlSafe(begin)).await
+    }
+
+    /// The tenant-scoped queries for one workspace.
+    pub fn tenant(&self, workspace_id: i64) -> crate::tenant::Tenant<'_> {
+        crate::tenant::Tenant::new(self, workspace_id)
+    }
+
+    /// Finds an active key by hash. Runs before the caller's workspace is
+    /// known, so it is system work, not a tenant query.
+    pub async fn api_key_by_hash(&self, hash: &[u8; 32]) -> Result<Option<KeyRow>, DbError> {
         let row = self
             .timed(
                 sqlx::query(
-                    "SELECT id, owner, key_hash FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
+                    "SELECT id, owner, workspace_id, key_hash FROM api_keys \
+                     WHERE key_hash = $1 AND revoked_at IS NULL",
                 )
                 .bind(&hash[..])
                 .fetch_optional(&self.pool),
             )
             .await?;
         row.map(|r| {
-            Ok((
-                r.try_get("id")?,
-                r.try_get("owner")?,
-                r.try_get("key_hash")?,
-            ))
+            Ok(KeyRow {
+                id: r.try_get("id")?,
+                owner: r.try_get("owner")?,
+                workspace_id: r.try_get("workspace_id")?,
+                hash: r.try_get("key_hash")?,
+            })
         })
         .transpose()
         .map_err(|e: sqlx::Error| DbError::from(e))
@@ -1184,7 +977,7 @@ async fn notify(
         .map(|_| ())
 }
 
-fn geo_columns(geo: Option<&GeoRule>) -> (Option<&'static str>, Vec<String>) {
+pub(crate) fn geo_columns(geo: Option<&GeoRule>) -> (Option<&'static str>, Vec<String>) {
     match geo {
         Some(g) => (Some(g.mode.as_str()), g.country_strings()),
         None => (None, Vec::new()),
@@ -1222,11 +1015,11 @@ impl LeaseStore for Db {
     }
 }
 
-const STATS_COUNTRY: &str = "SELECT country AS value, sum(clicks)::bigint AS clicks FROM click_daily \
+pub(crate) const STATS_COUNTRY: &str = "SELECT country AS value, sum(clicks)::bigint AS clicks FROM click_daily \
      WHERE link_id = $1 AND day BETWEEN $2 AND $3 GROUP BY country ORDER BY clicks DESC, value LIMIT $4";
-const STATS_DEVICE: &str = "SELECT device AS value, sum(clicks)::bigint AS clicks FROM click_daily \
+pub(crate) const STATS_DEVICE: &str = "SELECT device AS value, sum(clicks)::bigint AS clicks FROM click_daily \
      WHERE link_id = $1 AND day BETWEEN $2 AND $3 GROUP BY device ORDER BY clicks DESC, value LIMIT $4";
-const STATS_REFERRER: &str = "SELECT referrer_host AS value, sum(clicks)::bigint AS clicks FROM click_daily \
+pub(crate) const STATS_REFERRER: &str = "SELECT referrer_host AS value, sum(clicks)::bigint AS clicks FROM click_daily \
      WHERE link_id = $1 AND day BETWEEN $2 AND $3 GROUP BY referrer_host ORDER BY clicks DESC, value LIMIT $4";
 
 #[cfg(test)]

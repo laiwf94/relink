@@ -51,8 +51,7 @@ async fn lease_grants_follow_the_rule_and_never_exceed_the_limit() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let link = store
-        .insert_link(&new_link(None, Some(1000)), 7)
+    let link = common::insert_link(&store, &new_link(None, Some(1000)), 7)
         .await
         .unwrap();
     // Sequential grants match the reference rule exactly.
@@ -88,7 +87,9 @@ async fn lease_grants_follow_the_rule_and_never_exceed_the_limit() {
     store.release_clicks(link.id, 10).await.unwrap();
     assert_eq!(store.reserve_clicks(link.id, 100).await.unwrap(), 1);
     // A link without a limit grants nothing.
-    let unlimited = store.insert_link(&new_link(None, None), 7).await.unwrap();
+    let unlimited = common::insert_link(&store, &new_link(None, None), 7)
+        .await
+        .unwrap();
     assert_eq!(store.reserve_clicks(unlimited.id, 100).await.unwrap(), 0);
 }
 
@@ -97,21 +98,24 @@ async fn aliases_conflict_and_codes_are_unique() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    store
-        .insert_link(&new_link(Some("taken"), None), 7)
+    common::insert_link(&store, &new_link(Some("taken"), None), 7)
         .await
         .unwrap();
     assert_eq!(
-        store.insert_link(&new_link(Some("taken"), None), 7).await,
+        common::insert_link(&store, &new_link(Some("taken"), None), 7).await,
         Err(DbError::Conflict)
     );
     let mut codes = HashSet::new();
     for _ in 0..200 {
-        let l = store.insert_link(&new_link(None, None), 4).await.unwrap();
+        let l = common::insert_link(&store, &new_link(None, None), 4)
+            .await
+            .unwrap();
         assert!(codes.insert(l.code.clone()));
     }
+    // Codes are global, but another workspace cannot see the link.
+    let bob = store.personal_workspace("bob").await.unwrap();
     assert_eq!(
-        store.owned_link("bob", "taken").await,
+        store.tenant(bob).link("taken").await,
         Err(DbError::NotFound)
     );
     assert!(store.link_by_code("missing").await.unwrap().is_none());
@@ -122,7 +126,9 @@ async fn visitor_hashes_roll_up_and_salts_are_destroyed() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let link = store.insert_link(&new_link(None, None), 7).await.unwrap();
+    let link = common::insert_link(&store, &new_link(None, None), 7)
+        .await
+        .unwrap();
     let today = relink_server::util::utc_day(relink_server::util::now_ms());
     let salt_today = store.salt_for_day(today, today).await.unwrap();
     assert!(salt_today.is_some());
@@ -188,14 +194,15 @@ async fn visitor_hashes_roll_up_and_salts_are_destroyed() {
     );
     let from = relink_server::store::day_to_date(old_day);
     let to = relink_server::store::day_to_date(today);
-    let stats = store.stats("alice", &link.code, from, to).await.unwrap();
+    let alice = store.tenant(link.workspace_id);
+    let stats = alice.stats(&link.code, from, to).await.unwrap();
     assert_eq!(stats.total_clicks, 8);
     assert_eq!(stats.days.len(), 2);
     assert_eq!(stats.days[0].unique_visitors, 2, "rolled up");
     assert_eq!(stats.days[1].unique_visitors, 1);
     assert_eq!(stats.referrers[0].value, "(direct)");
     // Clicks for a deleted link are skipped, not an error.
-    store.delete_link("alice", &link.code).await.unwrap();
+    alice.delete_link(&link.code).await.unwrap();
     store
         .flush_clicks(&[(row(today), 1)], &[(link.id, today, [9; 16])])
         .await
@@ -208,7 +215,9 @@ async fn health_targets_are_claimed_once_and_updates_are_guarded() {
         return;
     };
     for _ in 0..10 {
-        store.insert_link(&new_link(None, None), 7).await.unwrap();
+        common::insert_link(&store, &new_link(None, None), 7)
+            .await
+            .unwrap();
     }
     let interval = std::time::Duration::from_secs(60);
     let (a, b) = tokio::join!(
@@ -231,9 +240,9 @@ async fn health_targets_are_claimed_once_and_updates_are_guarded() {
     assert!(store.record_health(&target, &[1]).await.unwrap());
     // Destinations changed after the claim: the stale result is dropped.
     let code = target.code.clone();
-    store
+    let alice = store.tenant(store.personal_workspace("alice").await.unwrap());
+    alice
         .update_link(
-            "alice",
             &code,
             &relink_server::store::LinkPatch {
                 destinations: Some(vec![Destination {
@@ -246,7 +255,7 @@ async fn health_targets_are_claimed_once_and_updates_are_guarded() {
         .await
         .unwrap();
     assert!(!store.record_health(&target, &[5]).await.unwrap());
-    let link = store.owned_link("alice", &code).await.unwrap();
+    let link = alice.link(&code).await.unwrap();
     assert_eq!(
         link.unhealthy,
         vec![false],
@@ -262,10 +271,14 @@ async fn api_keys_hash_lookup_and_revocation() {
     let key = relink_server::auth::generate_key();
     let hash = relink_server::auth::hash_key(&key);
     let id = store.insert_api_key("alice", "ci", &hash).await.unwrap();
-    let (found_id, owner, stored) = store.api_key_by_hash(&hash).await.unwrap().unwrap();
+    let found = store.api_key_by_hash(&hash).await.unwrap().unwrap();
     assert_eq!(
-        (found_id, owner.as_str(), stored.as_slice()),
+        (found.id, found.owner.as_str(), found.hash.as_slice()),
         (id, "alice", &hash[..])
+    );
+    assert_eq!(
+        found.workspace_id,
+        store.personal_workspace("alice").await.unwrap()
     );
     assert!(store.revoke_api_key(id).await.unwrap());
     assert!(store.api_key_by_hash(&hash).await.unwrap().is_none());
@@ -281,8 +294,7 @@ async fn malformed_rows_are_errors_not_panics() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let link = store
-        .insert_link(&new_link(Some("bad-weight"), None), 7)
+    let link = common::insert_link(&store, &new_link(Some("bad-weight"), None), 7)
         .await
         .unwrap();
     // The schema refuses an empty destination list outright.
@@ -343,7 +355,9 @@ async fn a_large_backlog_flushes_in_chunks() {
     migrate_with_retry(&store, Duration::from_secs(10))
         .await
         .unwrap();
-    let link = store.insert_link(&new_link(None, None), 7).await.unwrap();
+    let link = common::insert_link(&store, &new_link(None, None), 7)
+        .await
+        .unwrap();
     let today = utc_day(now_ms());
     let metrics = Arc::new(Metrics::default());
     let mut f = Flusher::new(Arc::new(store.clone()), metrics.clone(), flush_cfg());
@@ -380,7 +394,9 @@ async fn late_clicks_and_lookalike_referrers_against_postgres() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let link = store.insert_link(&new_link(None, None), 7).await.unwrap();
+    let link = common::insert_link(&store, &new_link(None, None), 7)
+        .await
+        .unwrap();
     let today = utc_day(now_ms());
     let metrics = Arc::new(Metrics::default());
     let mut f = Flusher::new(Arc::new(store.clone()), metrics.clone(), flush_cfg());
@@ -415,8 +431,7 @@ async fn claims_and_leases_are_not_blocked_by_a_click_flush() {
     let Some((_db, store)) = fresh().await else {
         return;
     };
-    let link = store
-        .insert_link(&new_link(None, Some(100)), 7)
+    let link = common::insert_link(&store, &new_link(None, Some(100)), 7)
         .await
         .unwrap();
     let today = utc_day(now_ms());

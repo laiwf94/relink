@@ -88,6 +88,8 @@ pub struct Config {
     /// The same, per client address.
     pub auth_lookup_rate_per_ip: f64,
     pub db_max_connections: u32,
+    /// Connections for redirect lookups by code, separate from the main pool.
+    pub db_lookup_connections: u32,
     pub db_timeout: Duration,
     pub redirect_max_age: u32,
     /// Shared secret the edge worker uses to post clicks; `None` disables
@@ -123,6 +125,7 @@ impl fmt::Debug for Config {
             .field("auth_lookup_rate", &self.auth_lookup_rate)
             .field("auth_lookup_rate_per_ip", &self.auth_lookup_rate_per_ip)
             .field("db_max_connections", &self.db_max_connections)
+            .field("db_lookup_connections", &self.db_lookup_connections)
             .field("db_timeout", &self.db_timeout)
             .field("redirect_max_age", &self.redirect_max_age)
             .field(
@@ -350,6 +353,7 @@ impl Config {
                 1_000_000.0,
             )?,
             db_max_connections: v.parse("RELINK_DB_MAX_CONNECTIONS", 16, 1, 1_000)?,
+            db_lookup_connections: v.parse("RELINK_DB_LOOKUP_CONNECTIONS", 8, 1, 1_000)?,
             db_timeout: v.millis("RELINK_DB_TIMEOUT_MS", 2_000, 50, 60_000)?,
             edge_token,
             kv,
