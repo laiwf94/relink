@@ -268,6 +268,12 @@ pub struct Metrics {
     /// Requests refused because the key lacks the scope or its owner's role
     /// does not grant it.
     pub permission_denied: Counter,
+    /// Session-cookie requests refused for a missing or wrong CSRF token.
+    pub csrf_rejected: Counter,
+    /// Completed OpenID Connect sign-ins.
+    pub sign_ins: Counter,
+    /// Sign-in callbacks that did not end in a session.
+    pub sign_in_failures: Counter,
     pub invalidations: Counter,
     pub kv_writes: Counter,
     pub kv_deletes: Counter,
@@ -300,6 +306,9 @@ impl Default for Metrics {
             api_errors: Counter::default(),
             rate_limited: Counter::default(),
             permission_denied: Counter::default(),
+            csrf_rejected: Counter::default(),
+            sign_ins: Counter::default(),
+            sign_in_failures: Counter::default(),
             invalidations: Counter::default(),
             kv_writes: Counter::default(),
             kv_deletes: Counter::default(),
@@ -402,7 +411,7 @@ impl Metrics {
                 .iter()
                 .map(|r| (r.label(), self.probe_count(*r))),
         );
-        let counters: [(&str, &str, u64); 18] = [
+        let counters: [(&str, &str, u64); 21] = [
             (
                 "relink_kv_writes_total",
                 "Link records written to Workers KV.",
@@ -482,6 +491,21 @@ impl Metrics {
                 "relink_api_permission_denied_total",
                 "Management API requests refused for a missing scope or role right.",
                 self.permission_denied.get(),
+            ),
+            (
+                "relink_api_csrf_rejected_total",
+                "Session-cookie requests refused for a missing or wrong CSRF token.",
+                self.csrf_rejected.get(),
+            ),
+            (
+                "relink_sign_ins_total",
+                "Completed OpenID Connect sign-ins.",
+                self.sign_ins.get(),
+            ),
+            (
+                "relink_sign_in_failures_total",
+                "OpenID Connect sign-in callbacks that did not start a session.",
+                self.sign_in_failures.get(),
             ),
             (
                 "relink_cache_invalidations_total",

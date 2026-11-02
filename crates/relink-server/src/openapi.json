@@ -3,7 +3,7 @@
   "info": {
     "title": "relink",
     "version": "0.1.0",
-    "description": "URL shortener. Redirects are served at /{code}; links are managed under /v1 with an API key (Authorization: Bearer rlk_...). Errors are {\"error\":{\"code\",\"message\",\"request_id\"}}.",
+    "description": "URL shortener. Redirects are served at /{code}; links are managed under /v1 with an API key (Authorization: Bearer rlk_...) or, for people, a session from OpenID Connect sign-in. Errors are {\"error\":{\"code\",\"message\",\"request_id\"}}.",
     "license": { "name": "MIT", "identifier": "MIT" }
   },
   "servers": [{ "url": "/" }],
@@ -60,7 +60,8 @@
       "post": {
         "summary": "Create a link",
         "operationId": "createLink",
-        "security": [{ "apiKey": ["links:write"] }],
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateLink" } } } },
         "responses": {
           "201": { "description": "Created.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
@@ -77,7 +78,7 @@
       "get": {
         "summary": "List the workspace's links, newest first",
         "operationId": "listLinks",
-        "security": [{ "apiKey": ["links:read"] }],
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
         "parameters": [
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
           { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "next_cursor from the previous page." }
@@ -97,7 +98,7 @@
       "get": {
         "summary": "Get a link in the workspace",
         "operationId": "getLink",
-        "security": [{ "apiKey": ["links:read"] }],
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
         "responses": {
           "200": { "description": "The link.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
           "401": { "$ref": "#/components/responses/Error" },
@@ -110,7 +111,8 @@
       "patch": {
         "summary": "Update a link",
         "operationId": "updateLink",
-        "security": [{ "apiKey": ["links:write"] }],
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
         "description": "Only the fields present change. null clears expires_at, max_clicks, geo and fallback_url. Changing destinations resets their health and invalidates A/B assignments.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchLink" } } } },
         "responses": {
@@ -128,12 +130,80 @@
       "delete": {
         "summary": "Delete a link and its statistics",
         "operationId": "deleteLink",
-        "security": [{ "apiKey": ["links:write"] }],
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
         "responses": {
           "204": { "description": "Deleted." },
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/login": {
+      "get": {
+        "summary": "Start signing in with the OpenID Connect provider",
+        "operationId": "login",
+        "description": "Only when RELINK_OIDC_ISSUER is set; 404 otherwise. Stores a pending sign-in, sets the relink_login cookie (10 minutes) and redirects to the provider with an authorization code request using PKCE (S256).",
+        "security": [],
+        "parameters": [
+          { "name": "return_to", "in": "query", "schema": { "type": "string", "pattern": "^/([^/\\\\]|$)", "maxLength": 512 }, "description": "A path on this server to return to after signing in. Default /v1/auth/session." }
+        ],
+        "responses": {
+          "302": { "description": "Redirect to the provider.", "headers": { "Location": { "schema": { "type": "string" } }, "Set-Cookie": { "schema": { "type": "string" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/callback": {
+      "get": {
+        "summary": "Finish signing in",
+        "operationId": "callback",
+        "description": "The provider's redirect back. Requires the relink_login cookie to match state, takes the pending sign-in (each completes at most once), exchanges the code and checks the ID token (RS256 or ES256 signature by a provider key, issuer, audience, authorized party, expiry, issue time, nonce). The first sign-in of a person creates them with a member name of their own and a personal workspace they own. Sets the relink_session cookie and redirects to return_to.",
+        "security": [],
+        "parameters": [
+          { "name": "code", "in": "query", "schema": { "type": "string" } },
+          { "name": "state", "in": "query", "schema": { "type": "string" } },
+          { "name": "error", "in": "query", "schema": { "type": "string" }, "description": "Set by the provider when the person declined or the request failed." }
+        ],
+        "responses": {
+          "302": { "description": "Signed in; redirect to return_to.", "headers": { "Location": { "schema": { "type": "string" } }, "Set-Cookie": { "schema": { "type": "string" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/session": {
+      "get": {
+        "summary": "Who is signed in",
+        "operationId": "getSession",
+        "description": "The signed-in person, the session's CSRF token and the workspaces they belong to with their role in each. Not cacheable.",
+        "security": [{ "session": [] }],
+        "responses": {
+          "200": { "description": "The session.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Session" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "summary": "Sign out",
+        "operationId": "logout",
+        "description": "Ends the session and deletes the cookie. Requires X-CSRF-Token.",
+        "security": [{ "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "204": { "description": "Signed out.", "headers": { "Set-Cookie": { "schema": { "type": "string" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
         }
@@ -161,7 +231,7 @@
       "get": {
         "summary": "Click statistics",
         "operationId": "linkStats",
-        "security": [{ "apiKey": ["stats:read"] }],
+        "security": [{ "apiKey": ["stats:read"] }, { "session": [] }],
         "description": "Totals per UTC day and breakdowns by country, device class and referrer host (top 50 each). Unique visitors are per day only: visitor hashes are keyed with a salt that changes daily, so visitors cannot be linked across days.",
         "parameters": [
           { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Default: 29 days before to." },
@@ -182,11 +252,13 @@
   "components": {
     "securitySchemes": {
       "edgeToken": { "type": "http", "scheme": "bearer", "description": "The shared secret in RELINK_EDGE_TOKEN, held by the edge worker." },
+      "session": { "type": "apiKey", "in": "cookie", "name": "relink_session", "description": "Set by signing in (GET /v1/auth/login). Acts with the rights of the person's role in the workspace named by Relink-Workspace, or in their personal workspace. Every request other than GET, HEAD and OPTIONS must also send the session's CSRF token (from GET /v1/auth/session) in X-CSRF-Token, or it is refused with permission_denied. When Authorization is present, the API key is used and the cookie ignored." },
       "apiKey": { "type": "http", "scheme": "bearer", "description": "rlk_ followed by 64 hex characters, created with `relink create-key OWNER`. A key carries scopes (links:read, links:write, stats:read); each operation lists the one it needs. A key can use a scope only if its owner's role in the workspace grants it: viewers get links:read and stats:read, editors, admins and owners all three. A missing scope or right is 403 permission_denied; an expired key is 401." }
     },
     "parameters": {
       "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } },
-      "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied." }
+      "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied. A session acts in the named workspace if the person is a member, else in their personal workspace." },
+      "Csrf": { "name": "X-CSRF-Token", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "description": "The session's CSRF token; required on every state-changing request authenticated by the session cookie." }
     },
     "responses": {
       "Redirect": {
@@ -203,6 +275,36 @@
       }
     },
     "schemas": {
+      "Session": {
+        "type": "object",
+        "required": ["user", "csrf_token", "expires_at", "workspaces"],
+        "properties": {
+          "user": {
+            "type": "object",
+            "required": ["id", "member", "email", "name"],
+            "properties": {
+              "id": { "type": "integer" },
+              "member": { "type": "string", "description": "The person's name in workspace memberships." },
+              "email": { "type": ["string", "null"] },
+              "name": { "type": ["string", "null"] }
+            }
+          },
+          "csrf_token": { "type": "string" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "workspaces": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "name", "role"],
+              "properties": {
+                "id": { "type": "integer" },
+                "name": { "type": "string" },
+                "role": { "enum": ["owner", "admin", "editor", "viewer"] }
+              }
+            }
+          }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],

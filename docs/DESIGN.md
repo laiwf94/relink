@@ -49,6 +49,9 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `visitor_rollup` | Unique visitor counts for older days. |
 | `visitor_salts` | One random salt per UTC day. |
 | `kv_outbox` | Codes whose KV copy must be rewritten or deleted. |
+| `users` | People who signed in: issuer and subject at the provider, their member name, email address and display name. |
+| `oidc_logins` | Sign-ins between the redirect to the provider and its return: SHA-256 of `state`, nonce, PKCE verifier, return path, expiry. |
+| `sessions` | SHA-256 of each session cookie, its person, CSRF token and expiry. |
 
 `code` uses the `C` collation (bytewise and case-sensitive, as base62 needs)
 and a `CHECK` repeats the API's character rules. The destination list is
@@ -67,6 +70,9 @@ read, so a hand-edited row produces an error instead of a panic.
 | `links (workspace_id, id DESC)` | Workspace listing with keyset pagination, and the row-level security predicate. |
 | `workspace_members (member)` | The workspaces one person belongs to. |
 | `workspaces (personal_owner)` unique | Finding an owner's personal workspace; concurrent first uses create one. |
+| `users (issuer, subject)` unique, `users (member)` unique | Finding a person at sign-in; two people can never get the same member name. |
+| `oidc_logins (state_hash)` primary key, `(expires_at)` | Taking a sign-in on return; clearing abandoned ones. |
+| `sessions (token_hash)` primary key, `(expires_at)`, `(user_id)` | One probe per uncached session; clearing expired ones. |
 
 ### Tenancy
 
@@ -170,6 +176,80 @@ is refused and names the successor, so a chain of keys never forks. The
 overlap is capped at 30 days and a lifetime at ten years. An instance that
 cached the old key before the rotation honours the new end within the cache
 TTL, the same bound as revocation.
+
+### Console sign-in
+
+People sign in with any OpenID Connect provider (`RELINK_OIDC_ISSUER`,
+`RELINK_OIDC_CLIENT_ID`, optionally `RELINK_OIDC_CLIENT_SECRET`), using the
+authorization code flow with PKCE (`src/oidc.rs`). Programs keep using API
+keys; the two never mix in one request, and an `Authorization` header wins
+over a cookie.
+
+`GET /v1/auth/login` stores the pending sign-in in Postgres (`oidc_logins`:
+the SHA-256 of a random `state`, a random `nonce`, the PKCE verifier and the
+return path, for ten minutes), puts `state` in a `relink_login` cookie, and
+redirects to the provider's authorization endpoint with the S256 challenge.
+`GET /v1/auth/callback` then requires, in order: the cookie equals `state`
+(compared in constant time), which stops anyone completing their own sign-in
+in another person's browser; the pending sign-in exists and has not expired,
+taken with `DELETE ... RETURNING` so each completes at most once, even if the
+provider said no; the code exchanges at the token endpoint with the verifier
+(client secret in HTTP basic authentication, or a public client); and the ID
+token passes every check of OpenID Connect Core 3.1.3.7 that applies to a
+token from the token endpoint. The signature must be RS256 or ES256 by a key
+in the provider's published key set, verified with `ring`; `none`, the HMAC
+algorithms (which would let a key set's public key act as a shared secret)
+and anything with `crit` are refused before the payload is read. Then `iss`
+must equal the configured issuer exactly, `aud` must include our client ID,
+`azp` must be our client ID when present (and is required with several
+audiences), `exp`, `iat` and `nbf` are checked with 60 s of clock skew, and
+`nonce` must equal the stored one. Because state, verifier and nonce live in
+Postgres, the callback can land on any instance. Both endpoints write to
+Postgres before anyone is authenticated, so they draw on the same
+per-address (5 per second) and global (200 per second) budget as lookups of
+unknown API keys, and beyond it get 429.
+
+Provider metadata and keys are fetched on first use and cached for an hour.
+A token signed by a key we do not have refetches the key set, at most once
+every 30 s, which is how a provider's key rotation is followed without
+letting a stream of bogus key IDs turn into a stream of fetches. Discovery
+must name the configured issuer, and the endpoints it lists must be https
+(http is accepted only when the issuer itself is on loopback, for tests).
+
+The first sign-in of an identity (issuer and subject) creates a `users` row
+and a personal workspace the person owns. Their member name comes from the
+preferred username, the email local part or the display name, reduced to the
+member-name alphabet, and is chosen so that it matches no existing member,
+API key owner, link creator or personal workspace, adding `-2`, `-3`... and
+then a random suffix. Taking an existing name would hand whoever registers
+`alice` at the provider all of alice's memberships. The name never changes
+afterwards; the email address and display name are refreshed at each
+sign-in. `RELINK_OIDC_ALLOWED_DOMAINS` limits sign-in to verified email
+addresses at the listed domains.
+
+A session is a `relink_session` cookie: `rls_` and 256 random bits,
+`HttpOnly`, `SameSite=Lax`, `Secure` unless `RELINK_COOKIE_SECURE=false`, and
+`Path=/v1` so redirects never carry it. Only its SHA-256 is stored, like an
+API key's, and it ends at a fixed time (`RELINK_SESSION_TTL_S`, 12 hours).
+Each session has its own CSRF token, returned by `GET /v1/auth/session`
+together with the person's workspaces and roles. Every request
+authenticated by the cookie whose method is not GET, HEAD or OPTIONS must
+carry it in `X-CSRF-Token`, so another site cannot make a signed-in browser
+create, change or delete anything, sign-out included. `SameSite=Lax` alone
+would not do: it still sends the cookie on top-level navigations, and
+browsers differ on what counts as same-site.
+
+A session acts in the workspace named by `Relink-Workspace`, or in the
+person's personal workspace, with the rights of their role there and nothing
+else: the same `Allowed<S>` check as keys, with every scope present so the
+role alone decides. Session lookups share the key path's defences: unknown
+tokens are cached for 5 s and their lookups limited per address and
+globally; known sessions are cached for 10 s and roles for 30 s. Sign-out
+deletes the row and the cached copy, so it is immediate on the instance that
+served it and takes at most 10 s elsewhere. A per-person token bucket (all
+of a person's sessions share one) limits requests like the per-key one.
+Expired sessions and abandoned sign-ins are deleted by the minute-by-minute
+maintenance task.
 
 ## The redirect path on the origin
 
@@ -448,6 +528,8 @@ evict real ones. Lookups of uncached keys are limited per client address
 (5 per second) and globally (200 per second), so guessing keys costs a bounded
 number of index probes and cannot lock out clients already authenticated.
 Per-key request limits (10 per second, burst 20) apply after authentication.
+Session cookies get the same treatment, plus a CSRF token on every
+state-changing request ("Console sign-in" above).
 
 Requests must be `application/json` with at most 64 KiB (256 KiB for edge
 click batches), unknown fields and duplicate keys are refused, and every value
@@ -533,6 +615,7 @@ audit` known advisories.
 | `reqwest` | HTTP client for health probes and the KV API. It accepts a custom DNS resolver, which the SSRF defence depends on. |
 | `serde`, `serde_json` | JSON for the API, the KV record and the edge wire format. |
 | `url` | WHATWG URL parsing and IDNA; not something to hand-roll when the result decides where a server sends requests. |
+| `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens. RSA and ECDSA verification is not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
 | `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys, constant-time comparison. |
 | `getrandom` | The OS CSPRNG for codes, keys and salts. |
 | `chrono` | Timestamps and UTC dates; the core uses it without its clock so it stays wasm-friendly. |
@@ -540,8 +623,8 @@ audit` known advisories.
 | `worker` | The workers-rs binding to the Cloudflare Workers runtime; wasm32 only. |
 | `proptest`, `criterion`, `tower` (dev) | Property tests, benchmarks, and driving the router in-process in benchmarks. |
 
-Metrics, the cache, single flight, token buckets, CIDR parsing and hex are
-each a few dozen lines and written here instead of pulled in.
+Metrics, the cache, single flight, token buckets, CIDR parsing, hex and
+base64url are each a few dozen lines and written here instead of pulled in.
 
 ## At a larger scale
 

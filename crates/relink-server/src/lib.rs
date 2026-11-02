@@ -3,7 +3,8 @@
 //! [`redirect`] is `GET /{code}`, on top of [`resolver`], [`cache`] and
 //! [`singleflight`]; [`limiter`] holds click leases; [`clicks`] is the
 //! analytics pipeline; [`api`], [`auth`] and [`ratelimit`] are the management
-//! API, and [`tenant`] scopes each of its requests to one workspace; [`trust`]
+//! API, and [`tenant`] scopes each of its requests to one workspace;
+//! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
 //! decides which forwarding headers to believe; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
 //! Postgres and [`server`] wires it together; [`cli`] parses the key
@@ -21,10 +22,12 @@ pub mod health;
 pub mod kvsync;
 pub mod limiter;
 pub mod metrics;
+pub mod oidc;
 pub mod ratelimit;
 pub mod redirect;
 pub mod resolver;
 pub mod server;
+pub mod session;
 pub mod singleflight;
 pub mod store;
 pub mod tenant;

@@ -83,6 +83,15 @@ their owner's role in the workspace: viewers read links and statistics,
 editors, admins and owners also write. Keys can expire, and rotation keeps the
 old key working for an overlap window so deployments switch without downtime:
 
+People sign in with any OpenID Connect provider instead of holding keys:
+set `RELINK_OIDC_ISSUER` and `RELINK_OIDC_CLIENT_ID` (and
+`RELINK_OIDC_CLIENT_SECRET` for a confidential client), register
+`<RELINK_PUBLIC_BASE_URL>/v1/auth/callback` with the provider, and open
+`/v1/auth/login`. The session cookie then works on every `/v1/links` endpoint
+with the rights of the person's role in the workspace named by
+`Relink-Workspace` (their own by default); requests that change anything also
+send the session's CSRF token in `X-CSRF-Token`.
+
 ```console
 $ relink create-key alice dashboard --scopes stats:read --expires-in 90d
 $ relink create-key carol ci --workspace 3 --scopes links:read,links:write
@@ -98,6 +107,10 @@ $ relink rotate-key 7 --overlap 1h   # prints the new key and when key 7 stops w
 | `PATCH /v1/links/{code}` | Change fields; `null` clears optional ones. |
 | `DELETE /v1/links/{code}` | Delete the link and its statistics. |
 | `GET /v1/links/{code}/stats?from=&to=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
+| `GET /v1/auth/login?return_to=` | Sign in with the OpenID Connect provider (authorization code with PKCE). Absent unless `RELINK_OIDC_ISSUER` is set. |
+| `GET /v1/auth/callback` | The provider's redirect back; starts a session cookie. |
+| `GET /v1/auth/session` | Who is signed in, the session's CSRF token, and their workspaces and roles. |
+| `POST /v1/auth/logout` | Sign out (with `X-CSRF-Token`). |
 | `POST /v1/edge/clicks` | Click batches from the Worker, authenticated with `RELINK_EDGE_TOKEN`. Absent unless that is set. |
 | `GET /healthz`, `/readyz`, `/openapi.json` | Liveness, readiness (stays ready with the database down, and says so), the API document. |
 | `GET /metrics` (admin listener) | Prometheus metrics. |

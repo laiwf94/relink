@@ -28,7 +28,7 @@
 //! | `RELINK_PUBLIC_BASE_URL` | `http://localhost:8080` | Prefix for `short_url` in responses |
 //! | `RELINK_CODE_LENGTH` | `7` | Generated code length, 4 to 32 |
 //! | `RELINK_COOKIE_KEY` | random | 64+ hex chars; HMAC key for A/B cookies. Set it so assignments survive restarts and match across instances |
-//! | `RELINK_COOKIE_SECURE` | `true` | Add `Secure` to A/B cookies |
+//! | `RELINK_COOKIE_SECURE` | `true` | Add `Secure` to A/B and session cookies |
 //! | `RELINK_TRUSTED_PROXIES` | unset | Comma-separated addresses or CIDR blocks of your CDN or load balancer; the two headers below are read only from these peers |
 //! | `RELINK_COUNTRY_HEADER` | unset | Header with the visitor's country set by the CDN, e.g. `cf-ipcountry` |
 //! | `RELINK_CLIENT_IP_HEADER` | unset | Header with the client address chain, e.g. `x-forwarded-for`; the rightmost untrusted hop is used. Unset uses the socket peer |
@@ -64,6 +64,12 @@
 //! | `RELINK_KV_ACCOUNT_ID`, `RELINK_KV_NAMESPACE_ID`, `RELINK_KV_API_TOKEN` | unset | Publish link records to Workers KV for the edge; all three or none |
 //! | `RELINK_KV_API_BASE` | `https://api.cloudflare.com/client/v4` | KV API endpoint; must be https |
 //! | `RELINK_KV_POLL_MS` / `RELINK_KV_RECONCILE_S` | `1000` / `3600` | Outbox poll interval when no change notification arrives / full KV reconciliation interval |
+//! | `RELINK_OIDC_ISSUER`, `RELINK_OIDC_CLIENT_ID` | unset | Sign people in with this OpenID Connect provider; both or neither. The issuer must be https |
+//! | `RELINK_OIDC_CLIENT_SECRET` | unset | Client secret, sent with HTTP basic authentication; unset for a public client (PKCE only) |
+//! | `RELINK_OIDC_REDIRECT_URL` | `<RELINK_PUBLIC_BASE_URL>/v1/auth/callback` | The callback registered with the provider |
+//! | `RELINK_OIDC_SCOPES` | `openid email profile` | Scopes requested; must include `openid` |
+//! | `RELINK_OIDC_ALLOWED_DOMAINS` | unset | Comma-separated email domains; when set, only verified addresses there may sign in |
+//! | `RELINK_SESSION_TTL_S` | `43200` | Lifetime of a sign-in session, 300 to 2592000 seconds |
 //! | `RELINK_LOG` | `info,sqlx::postgres::notice=warn` | Log filter (`tracing` env-filter syntax) |
 
 use std::process::ExitCode;

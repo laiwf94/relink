@@ -669,7 +669,23 @@ async fn openapi_matches_the_router_and_responses() {
             };
             req = req.header("content-type", "application/json").body(body);
         }
-        let status = req.send().await.unwrap().status().as_u16();
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        if path.starts_with("/v1/auth/") {
+            // Sign-in is not configured here and an API key is not a
+            // session, so these answer with their own errors rather than
+            // the router's; tests/oidc.rs drives them end to end.
+            let body = resp.json_value().await;
+            assert!(
+                matches!(status, 401 | 404),
+                "{method} {path} returned {status}"
+            );
+            assert_ne!(
+                body["error"]["message"], "no such resource",
+                "{method} {path}"
+            );
+            continue;
+        }
         assert!(
             matches!(status, 200 | 201 | 202 | 204 | 302),
             "{method} {path} returned {status}"

@@ -49,3 +49,10 @@ path = "fuzz_targets/api_input.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "id_token"
+path = "fuzz_targets/id_token.rs"
+test = false
+doc = false
+bench = false

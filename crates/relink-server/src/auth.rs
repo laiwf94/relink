@@ -23,8 +23,9 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::cache::{Cache, Config as CacheConfig, Lookup};
+use crate::cache::{Cache, Config as CacheConfig, Freshness, Lookup};
 use crate::ratelimit::{KeyedLimiter, Rate};
+use crate::session::{SessionRow, hash_session, is_well_formed_session};
 use crate::store::{Db, DbError};
 use crate::util::{hex_encode, secure_random};
 
@@ -215,18 +216,30 @@ impl fmt::Display for Role {
     }
 }
 
-/// The caller behind a valid key.
+/// What a caller authenticated with: the rate limit is kept per credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Credential {
+    /// An API key, by ID.
+    ApiKey(i64),
+    /// A signed-in person's session, by user ID: all of a person's sessions
+    /// share one budget.
+    Session(i64),
+}
+
+/// The caller behind a valid key or session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal {
-    pub key_id: i64,
+    pub credential: Credential,
+    /// The key's owner, or the signed-in person's member name.
     pub owner: String,
     /// The workspace the key belongs to; it acts only there.
     pub workspace_id: i64,
     /// The key owner's role in that workspace, read with the key.
     pub role: Role,
-    /// The scopes the key carries.
+    /// The scopes the key carries; every scope for a session, which acts
+    /// with exactly the rights of the person's role.
     pub scopes: Scopes,
-    /// When the key stops working, if ever.
+    /// When the key or session stops working, if ever.
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -352,6 +365,10 @@ pub fn is_valid_owner(owner: &str) -> bool {
 /// this window on every instance.
 pub const AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// How long a session check is remembered. Signing out takes effect at
+/// once on the instance that served it and within this window elsewhere.
+pub const SESSION_CACHE_TTL: Duration = Duration::from_secs(10);
+
 /// How long "no such key" is remembered. Short, so a key created on another
 /// instance works here within seconds.
 pub const UNKNOWN_KEY_TTL: Duration = Duration::from_secs(5);
@@ -364,6 +381,10 @@ pub struct Authenticator {
     /// Hashes the database said are unknown or revoked. Separate from
     /// `known` so a flood of made-up keys cannot evict real ones.
     unknown: Cache<()>,
+    /// Sessions by token hash.
+    sessions: Cache<Arc<SessionRow>>,
+    /// A person's role by member name and workspace, for sessions.
+    roles: Cache<(i64, Role)>,
     per_ip: KeyedLimiter<IpAddr>,
     global: KeyedLimiter<()>,
 }
@@ -390,6 +411,8 @@ impl Authenticator {
             db,
             known: Cache::new(cache(AUTH_CACHE_TTL)),
             unknown: Cache::new(cache(UNKNOWN_KEY_TTL)),
+            sessions: Cache::new(cache(SESSION_CACHE_TTL)),
+            roles: Cache::new(cache(AUTH_CACHE_TTL)),
             per_ip: KeyedLimiter::new(limits.per_ip, 100_000),
             global: KeyedLimiter::new(
                 Rate {
@@ -449,7 +472,7 @@ impl Authenticator {
             // No role: the owner left the workspace, so the key is dead.
             let role = k.role?;
             (matches && !k.is_expired_at(Utc::now())).then_some(Principal {
-                key_id: k.id,
+                credential: Credential::ApiKey(k.id),
                 owner: k.owner,
                 workspace_id: k.workspace_id,
                 role,
@@ -469,6 +492,110 @@ impl Authenticator {
             }
         }
         principal.ok_or(AuthError::Unauthenticated)
+    }
+
+    /// Checks a session cookie value sent by `client`. Unknown tokens are
+    /// remembered and rate limited like unknown API keys.
+    pub async fn session(&self, token: &str, client: IpAddr) -> Result<Arc<SessionRow>, AuthError> {
+        if !is_well_formed_session(token) {
+            return Err(AuthError::Unauthenticated);
+        }
+        let hash = hash_session(token);
+        let cache_key = hex_encode(&hash);
+        let now = Instant::now();
+        // A suspect entry raced with a sign-out on this instance.
+        if let Lookup::Found(Some(s), f) = self.sessions.get(&cache_key, now)
+            && f != Freshness::Suspect
+        {
+            if s.expires_at <= Utc::now() {
+                return Err(AuthError::Unauthenticated);
+            }
+            return Ok(s);
+        }
+        if let Lookup::Found(..) = self.unknown.get(&cache_key, now) {
+            return Err(AuthError::Unauthenticated);
+        }
+        if self.per_ip.check(&client, now).is_err() || self.global.check(&(), now).is_err() {
+            return Err(AuthError::Busy);
+        }
+        let token = self.sessions.begin_load();
+        let found = match self.db.session_by_hash(&hash).await {
+            Ok(found) => found,
+            Err(DbError::Unavailable(_)) => return Err(AuthError::Unavailable),
+            Err(e) => {
+                tracing::error!(error = %e, "session lookup failed");
+                return Err(AuthError::Unavailable);
+            }
+        };
+        match found {
+            Some(s) => {
+                let s = Arc::new(s);
+                self.sessions
+                    .insert(&cache_key, Some(s.clone()), Instant::now(), token);
+                Ok(s)
+            }
+            None => {
+                let token = self.unknown.begin_load();
+                self.unknown
+                    .insert(&cache_key, Some(()), Instant::now(), token);
+                Err(AuthError::Unauthenticated)
+            }
+        }
+    }
+
+    /// Admits one unauthenticated request that costs a database write (the
+    /// sign-in endpoints), against the same per-address and global budget
+    /// as lookups of unknown keys, or refuses it with [`AuthError::Busy`].
+    pub fn admit_anonymous(&self, client: IpAddr) -> Result<(), AuthError> {
+        let now = Instant::now();
+        if self.per_ip.check(&client, now).is_err() || self.global.check(&(), now).is_err() {
+            return Err(AuthError::Busy);
+        }
+        Ok(())
+    }
+
+    /// Forgets a session that has just been ended here.
+    pub fn forget_session(&self, hash: &[u8; 32]) {
+        self.sessions.invalidate(&hex_encode(hash));
+    }
+
+    /// The principal for a session acting in `workspace_id` (their personal
+    /// workspace when `None`), or `None` if the person is not a member
+    /// there. The role is cached for [`AUTH_CACHE_TTL`], like a key's.
+    pub async fn session_principal(
+        &self,
+        session: &SessionRow,
+        workspace_id: Option<i64>,
+    ) -> Result<Option<Principal>, AuthError> {
+        let cache_key = match workspace_id {
+            Some(id) => format!("{}/{id}", session.member),
+            None => format!("{}/", session.member),
+        };
+        let now = Instant::now();
+        let found = match self.roles.get(&cache_key, now) {
+            Lookup::Found(found, _) => found,
+            Lookup::Miss => {
+                let token = self.roles.begin_load();
+                let found = match self.db.member_role(&session.member, workspace_id).await {
+                    Ok(found) => found,
+                    Err(DbError::Unavailable(_)) => return Err(AuthError::Unavailable),
+                    Err(e) => {
+                        tracing::error!(error = %e, "membership lookup failed");
+                        return Err(AuthError::Unavailable);
+                    }
+                };
+                self.roles.insert(&cache_key, found, Instant::now(), token);
+                found
+            }
+        };
+        Ok(found.map(|(workspace_id, role)| Principal {
+            credential: Credential::Session(session.user_id),
+            owner: session.member.clone(),
+            workspace_id,
+            role,
+            scopes: Scopes::ALL,
+            expires_at: Some(session.expires_at),
+        }))
     }
 
     /// Drops idle per-address buckets.
@@ -495,7 +622,7 @@ mod tests {
 
     fn principal(role: Role, scopes: Scopes) -> Principal {
         Principal {
-            key_id: 1,
+            credential: Credential::ApiKey(1),
             owner: "alice".into(),
             workspace_id: 1,
             role,

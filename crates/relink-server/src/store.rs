@@ -1201,7 +1201,7 @@ pub async fn scope_to_workspace(
 /// transaction. The common case is one indexed read. A concurrent creator
 /// makes our insert do nothing and its row invisible to that statement's
 /// snapshot, so the read is repeated as a new statement, which sees it.
-async fn personal_workspace(
+pub(crate) async fn personal_workspace(
     tx: &mut Transaction<'_, Postgres>,
     owner: &str,
 ) -> Result<i64, sqlx::Error> {

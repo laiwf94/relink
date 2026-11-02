@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::abtest::Signer;
 use crate::api;
-use crate::auth::{Authenticator, LookupLimits};
+use crate::auth::{Authenticator, Credential, LookupLimits};
 use crate::cache::Cache;
 use crate::clicks::{ClickEvent, ClickQueue, ClickSink, Flusher};
 use crate::config::Config;
@@ -26,9 +26,11 @@ use crate::health::HealthWorker;
 use crate::kvsync::{CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
 use crate::metrics::{DbOp, Gauges, Metrics};
+use crate::oidc::{self, Oidc};
 use crate::ratelimit::{KeyedLimiter, Rate};
 use crate::redirect;
 use crate::resolver::{LinkSource, Resolver};
+use crate::session;
 use crate::store::{CHANGES_CHANNEL, Db, DbConfig, parse_change};
 use crate::util::{now_ms, secure_random, stopped, utc_day};
 
@@ -42,7 +44,7 @@ pub struct App {
     pub signer: Signer,
     pub metrics: Arc<Metrics>,
     pub auth: Authenticator,
-    pub api_limiter: KeyedLimiter<i64>,
+    pub api_limiter: KeyedLimiter<Credential>,
     pub shutting_down: AtomicBool,
     /// Whether the change notification connection is up.
     pub change_feed: AtomicBool,
@@ -50,9 +52,11 @@ pub struct App {
     pub kv_wake: Arc<Notify>,
     /// `Cache-Control` for redirects whose answer never varies.
     pub cache_control: HeaderValue,
+    /// OpenID Connect sign-in, when configured.
+    pub oidc: Option<Arc<Oidc>>,
 }
 
-/// Keys tracked by the per-API-key rate limiter (one bucket per key).
+/// Credentials tracked by the API rate limiter (one bucket per key or person).
 const MAX_RATE_LIMITED_KEYS: usize = 100_000;
 
 impl App {
@@ -96,6 +100,9 @@ impl App {
                 },
             ),
             api_limiter: KeyedLimiter::new(cfg.api_rate, MAX_RATE_LIMITED_KEYS),
+            oidc: cfg.oidc.clone().map(|c| {
+                Arc::new(Oidc::new(c).expect("OIDC settings are validated with the configuration"))
+            }),
             shutting_down: AtomicBool::new(false),
             change_feed: AtomicBool::new(false),
             kv_wake: Arc::new(Notify::new()),
@@ -139,6 +146,10 @@ pub fn public_router(app: Arc<App>) -> Router {
                 .delete(api::delete_link),
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
+        .route("/v1/auth/login", get(oidc::login))
+        .route("/v1/auth/callback", get(oidc::callback))
+        .route("/v1/auth/session", get(session::get_session))
+        .route("/v1/auth/logout", post(session::logout))
         .layer(DefaultBodyLimit::max(api::MAX_BODY));
     let edge = Router::new()
         .route("/v1/edge/clicks", post(api::edge_clicks))
@@ -428,8 +439,8 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     }
 }
 
-/// Periodic housekeeping: visitor-hash roll-up and salt deletion, idle
-/// lease return, rate limiter cleanup.
+/// Periodic housekeeping: visitor-hash roll-up and salt deletion, expired
+/// sessions and sign-ins, idle lease return, rate limiter cleanup.
 async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -441,6 +452,10 @@ async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         if let Err(e) = app.db.maintain_visitors(utc_day(now_ms())).await {
             app.metrics.db_error(DbOp::Maintenance);
             tracing::warn!(error = %e, "visitor maintenance failed");
+        }
+        if let Err(e) = app.db.purge_expired_sessions().await {
+            app.metrics.db_error(DbOp::Maintenance);
+            tracing::warn!(error = %e, "session clean-up failed");
         }
         app.limiter.sweep(Instant::now()).await;
         app.api_limiter.sweep(Instant::now());

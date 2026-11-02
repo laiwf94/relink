@@ -25,13 +25,14 @@ use relink_core::wire::{ClickBatch, MAX_BATCH, WireClick};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::auth::{AuthError, Principal};
+use crate::auth::Principal;
 use crate::classify::{self, Device, UNKNOWN_COUNTRY};
 use crate::clicks::ClickEvent;
 use crate::code::validate_alias;
 use crate::destination::normalize;
 use crate::model::{Destination, GeoMode, GeoRule};
 use crate::server::App;
+use crate::session;
 use crate::store::{DbError, LinkPatch, NewLink, Stats, StoredLink};
 use crate::tenant::{Allowed, LinksRead, LinksWrite, StatsRead};
 use crate::util::{fast_random, hex_decode, hex_encode, now_ms, utc_day};
@@ -82,11 +83,17 @@ impl ApiError {
             "a valid API key is required: Authorization: Bearer rlk_...",
         )
     }
+    pub fn unauthenticated_msg(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::UNAUTHORIZED, "unauthenticated", message)
+    }
     pub fn permission_denied(message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::FORBIDDEN, "permission_denied", message)
     }
     pub fn not_found() -> ApiError {
         ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such resource")
+    }
+    pub fn not_found_msg(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::NOT_FOUND, "not_found", message)
     }
     pub fn method_not_allowed() -> ApiError {
         ApiError::new(
@@ -130,6 +137,12 @@ impl ApiError {
                 "unavailable",
                 "the database is unavailable; retry later",
             )
+        }
+    }
+    pub fn unavailable_msg(message: impl Into<String>) -> ApiError {
+        ApiError {
+            message: message.into(),
+            ..ApiError::unavailable()
         }
     }
     pub fn internal() -> ApiError {
@@ -333,7 +346,18 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for StrictJson<T> {
     }
 }
 
-/// An authenticated, rate-limited caller.
+/// The client's address: the socket peer, or the forwarded address when the
+/// peer is a trusted proxy.
+pub fn client_addr(app: &App, parts: &Parts) -> IpAddr {
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| c.0.ip());
+    crate::redirect::client_ip(app, &parts.headers, peer)
+}
+
+/// An authenticated, rate-limited caller: an API key in `Authorization`,
+/// or else a session cookie (see [`crate::session`]).
 pub struct Authed(pub Principal);
 
 impl FromRequestParts<Arc<App>> for Authed {
@@ -344,27 +368,56 @@ impl FromRequestParts<Arc<App>> for Authed {
             .headers
             .get(header::AUTHORIZATION)
             .map(HeaderValue::as_bytes);
-        let peer = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| c.0.ip());
-        let client = crate::redirect::client_ip(app, &parts.headers, peer);
+        if header.is_none()
+            && let Some(token) = session::read_cookie(&parts.headers, session::SESSION_COOKIE)
+        {
+            return session_principal(parts, app, token).await.map(Authed);
+        }
+        let client = client_addr(app, parts);
         let principal = app
             .auth
             .authenticate(header, client)
             .await
-            .map_err(|e| match e {
-                AuthError::Unauthenticated => ApiError::unauthenticated(),
-                AuthError::Unavailable => ApiError::unavailable(),
-                AuthError::Busy => ApiError::rate_limited(1),
-            })?;
-        if let Err(wait) = app.api_limiter.check(&principal.key_id, Instant::now()) {
+            .map_err(session::auth_error)?;
+        if let Err(wait) = app.api_limiter.check(&principal.credential, Instant::now()) {
             app.metrics.rate_limited.inc();
             return Err(ApiError::rate_limited(
                 wait.as_secs_f64().ceil().max(1.0) as u64
             ));
         }
         Ok(Authed(principal))
+    }
+}
+
+/// A signed-in person acting in the workspace named by `Relink-Workspace`,
+/// or their personal workspace, with their role there.
+async fn session_principal(
+    parts: &Parts,
+    app: &Arc<App>,
+    token: &str,
+) -> Result<Principal, ApiError> {
+    let s = session::authenticate_session(app, parts, token).await?;
+    session::check_csrf(app, parts, &s)?;
+    let workspace = parts
+        .headers
+        .get(crate::tenant::WORKSPACE_HEADER)
+        .map(|v| crate::tenant::parse_workspace_header(v.as_bytes()))
+        .transpose()
+        .map_err(|_| crate::tenant::malformed_workspace())?;
+    match app
+        .auth
+        .session_principal(&s, workspace)
+        .await
+        .map_err(session::auth_error)?
+    {
+        Some(p) => Ok(p),
+        None => {
+            app.metrics.permission_denied.inc();
+            Err(ApiError::permission_denied(match workspace {
+                Some(id) => format!("you are not a member of workspace {id}"),
+                None => "you have no personal workspace; name one in Relink-Workspace".into(),
+            }))
+        }
     }
 }
 
@@ -973,6 +1026,10 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/links/{code}"),
     ("delete", "/v1/links/{code}"),
     ("get", "/v1/links/{code}/stats"),
+    ("get", "/v1/auth/login"),
+    ("get", "/v1/auth/callback"),
+    ("get", "/v1/auth/session"),
+    ("post", "/v1/auth/logout"),
     ("post", "/v1/edge/clicks"),
 ];
 

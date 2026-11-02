@@ -12,6 +12,7 @@ use crate::cache;
 use crate::clicks::FlushConfig;
 use crate::code::{MAX_CODE_LEN, MIN_CODE_LEN};
 use crate::destination::Policy;
+use crate::oidc::OidcConfig;
 use crate::ratelimit::Rate;
 use crate::trust::TrustedProxies;
 use crate::util::hex_decode;
@@ -97,6 +98,10 @@ pub struct Config {
     pub edge_token: Option<String>,
     /// Publishing link records to Workers KV; `None` when not configured.
     pub kv: Option<KvConfig>,
+    /// OpenID Connect sign-in; `None` when not configured.
+    pub oidc: Option<OidcConfig>,
+    /// How long a sign-in session lasts.
+    pub session_ttl: Duration,
     pub shutdown_timeout: Duration,
 }
 
@@ -133,6 +138,8 @@ impl fmt::Debug for Config {
                 &self.edge_token.as_ref().map(|_| "<redacted>"),
             )
             .field("kv", &self.kv)
+            .field("oidc", &self.oidc)
+            .field("session_ttl", &self.session_ttl)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
     }
@@ -287,6 +294,42 @@ impl Config {
                 return Err("set all of RELINK_KV_ACCOUNT_ID, RELINK_KV_NAMESPACE_ID and RELINK_KV_API_TOKEN, or none".into());
             }
         };
+        let oidc = match (v.raw("RELINK_OIDC_ISSUER"), v.raw("RELINK_OIDC_CLIENT_ID")) {
+            (None, None) => None,
+            (Some(issuer), Some(client_id)) => {
+                let oidc = OidcConfig {
+                    issuer: issuer.trim().to_owned(),
+                    client_id: client_id.trim().to_owned(),
+                    client_secret: v
+                        .raw("RELINK_OIDC_CLIENT_SECRET")
+                        .map(|s| s.trim().to_owned()),
+                    redirect_url: v
+                        .raw("RELINK_OIDC_REDIRECT_URL")
+                        .map(|u| u.trim().to_owned())
+                        .unwrap_or_else(|| format!("{public_base_url}/v1/auth/callback")),
+                    scopes: v
+                        .raw("RELINK_OIDC_SCOPES")
+                        .unwrap_or_else(|| "openid email profile".into())
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    allowed_domains: v
+                        .raw("RELINK_OIDC_ALLOWED_DOMAINS")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|d| d.trim().to_ascii_lowercase())
+                        .filter(|d| !d.is_empty())
+                        .collect(),
+                };
+                oidc.validate()?;
+                Some(oidc)
+            }
+            _ => {
+                return Err(
+                    "set both RELINK_OIDC_ISSUER and RELINK_OIDC_CLIENT_ID, or neither".into(),
+                );
+            }
+        };
         let ttl = v.millis("RELINK_CACHE_TTL_MS", 30_000, 0, 86_400_000)?;
         let cfg = Config {
             database_url,
@@ -357,6 +400,13 @@ impl Config {
             db_timeout: v.millis("RELINK_DB_TIMEOUT_MS", 2_000, 50, 60_000)?,
             edge_token,
             kv,
+            oidc,
+            session_ttl: Duration::from_secs(v.parse(
+                "RELINK_SESSION_TTL_S",
+                43_200,
+                300,
+                30 * 86_400,
+            )?),
             redirect_max_age: v.parse("RELINK_REDIRECT_MAX_AGE_S", 0, 0, 31_536_000)?,
             shutdown_timeout: Duration::from_secs(v.parse(
                 "RELINK_SHUTDOWN_TIMEOUT_S",
@@ -409,6 +459,66 @@ mod tests {
         assert!(!c.destination_policy.allow_private);
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("postgres://"), "secrets must not be printed");
+        assert!(c.oidc.is_none());
+        assert_eq!(c.session_ttl, Duration::from_secs(43_200));
+    }
+
+    #[test]
+    fn oidc_settings() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let c = from(&[
+            base,
+            ("RELINK_PUBLIC_BASE_URL", "https://s.example.com/"),
+            ("RELINK_OIDC_ISSUER", " https://id.example.com "),
+            ("RELINK_OIDC_CLIENT_ID", "relink"),
+            ("RELINK_OIDC_CLIENT_SECRET", "hunter2"),
+            ("RELINK_OIDC_SCOPES", "openid  email"),
+            ("RELINK_OIDC_ALLOWED_DOMAINS", "Example.com, ,example.org"),
+            ("RELINK_SESSION_TTL_S", "3600"),
+        ])
+        .unwrap();
+        let o = c.oidc.as_ref().unwrap();
+        assert_eq!(o.issuer, "https://id.example.com");
+        assert_eq!(o.redirect_url, "https://s.example.com/v1/auth/callback");
+        assert_eq!(o.scopes, "openid email");
+        assert_eq!(o.allowed_domains, ["example.com", "example.org"]);
+        assert_eq!(c.session_ttl, Duration::from_secs(3600));
+        assert!(!format!("{c:?}").contains("hunter2"));
+        let explicit = from(&[
+            base,
+            ("RELINK_OIDC_ISSUER", "https://id.example.com"),
+            ("RELINK_OIDC_CLIENT_ID", "relink"),
+            (
+                "RELINK_OIDC_REDIRECT_URL",
+                "https://console.example.com/v1/auth/callback",
+            ),
+        ])
+        .unwrap();
+        let o = explicit.oidc.unwrap();
+        assert_eq!(
+            o.redirect_url,
+            "https://console.example.com/v1/auth/callback"
+        );
+        assert_eq!(o.client_secret, None);
+        assert_eq!(o.scopes, "openid email profile");
+        for bad in [
+            vec![base, ("RELINK_OIDC_ISSUER", "https://id.example.com")],
+            vec![base, ("RELINK_OIDC_CLIENT_ID", "relink")],
+            vec![
+                base,
+                ("RELINK_OIDC_ISSUER", "http://id.example.com"),
+                ("RELINK_OIDC_CLIENT_ID", "relink"),
+            ],
+            vec![
+                base,
+                ("RELINK_OIDC_ISSUER", "https://id.example.com"),
+                ("RELINK_OIDC_CLIENT_ID", "relink"),
+                ("RELINK_OIDC_SCOPES", "email"),
+            ],
+            vec![base, ("RELINK_SESSION_TTL_S", "10")],
+        ] {
+            assert!(from(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

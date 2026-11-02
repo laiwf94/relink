@@ -56,7 +56,23 @@ pub enum WorkspaceError {
     Mismatch,
 }
 
-/// Settles the workspace for `principal` given the header, if any.
+/// Parses a `Relink-Workspace` value: a positive decimal integer.
+pub fn parse_workspace_header(raw: &[u8]) -> Result<i64, WorkspaceError> {
+    std::str::from_utf8(raw)
+        .ok()
+        .filter(|s| !s.is_empty() && s.len() <= 19 && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&id| id > 0)
+        .ok_or(WorkspaceError::Malformed)
+}
+
+/// The error for a malformed `Relink-Workspace` header.
+pub fn malformed_workspace() -> ApiError {
+    ApiError::invalid("Relink-Workspace must be a workspace ID (a positive integer)")
+}
+
+/// Settles the workspace for `principal` given the header, if any. A
+/// session principal already acts in the workspace its header named.
 pub fn select_workspace(
     principal: &Principal,
     header: Option<&[u8]>,
@@ -64,12 +80,7 @@ pub fn select_workspace(
     let Some(raw) = header else {
         return Ok(principal.workspace_id);
     };
-    let id = std::str::from_utf8(raw)
-        .ok()
-        .filter(|s| !s.is_empty() && s.len() <= 19 && s.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|&id| id > 0)
-        .ok_or(WorkspaceError::Malformed)?;
+    let id = parse_workspace_header(raw)?;
     if id == principal.workspace_id {
         Ok(id)
     } else {
@@ -85,9 +96,7 @@ impl FromRequestParts<Arc<App>> for Workspace {
         let header = parts.headers.get(WORKSPACE_HEADER).map(|v| v.as_bytes());
         match select_workspace(&principal, header) {
             Ok(id) => Ok(Workspace { id, principal }),
-            Err(WorkspaceError::Malformed) => Err(ApiError::invalid(
-                "Relink-Workspace must be a workspace ID (a positive integer)",
-            )),
+            Err(WorkspaceError::Malformed) => Err(malformed_workspace()),
             Err(WorkspaceError::Mismatch) => Err(ApiError::permission_denied(
                 "this API key does not belong to the workspace named in Relink-Workspace",
             )),
@@ -458,7 +467,7 @@ mod tests {
 
     fn alice() -> Principal {
         Principal {
-            key_id: 1,
+            credential: crate::auth::Credential::ApiKey(1),
             owner: "alice".into(),
             workspace_id: 42,
             role: crate::auth::Role::Owner,
