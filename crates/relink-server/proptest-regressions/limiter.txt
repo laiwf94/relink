@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 1c1f431238cb988621f815241ecf1a3657b05a3108169cf13eb086956b1cdf96 # shrinks to instances = 2, tasks = 4, attempts = 29, max_clicks = 1, max_lease = 1, fail_every = 0, invalidate_every = 0, seed = 0
 cc d449be417cf7ddb906455417dcf55a1ebc8578a575925fab8208c76b617ac37d # shrinks to instances = 1, tasks = 2, attempts = 7, max_clicks = 80, max_lease = 4, fail_every = 0, invalidate_every = 5, seed = 87744520514095362
+cc b0cf4d6dd902419c79ccdfbc37e2ba137c127494ea318dff9d0b75eb922c4744 # shrinks to instances = 4, tasks = 2, attempts = 32, max_clicks = 257, max_lease = 6, fail_every = 0, invalidate_every = 0, seed = 12330158628412724408

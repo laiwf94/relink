@@ -620,10 +620,18 @@ mod tests {
                 let held: i64 = limiters.iter().map(|l| l.local_remaining(1)).sum();
                 prop_assert_eq!(store.reserved(1), out.admitted + held);
                 if fail_every == 0 && invalidate_every == 0 {
-                    if out.attempts >= max_clicks {
+                    // Without failures every attempt is answered, and a
+                    // refusal means the store has granted every click. With
+                    // several instances some of those may still sit unspent
+                    // in another instance's lease: the undershoot escrow
+                    // trades for zero overshoot. With one there is no other
+                    // lease, so a refusal means every click was served.
+                    prop_assert_eq!(out.admitted + out.refused, out.attempts);
+                    if out.refused > 0 || out.attempts >= max_clicks {
                         prop_assert_eq!(store.reserved(1), max_clicks);
-                    } else {
-                        prop_assert_eq!(out.admitted, out.attempts);
+                    }
+                    if instances == 1 && out.refused > 0 {
+                        prop_assert_eq!(out.admitted, max_clicks);
                     }
                 }
                 // Shutdown returns everything unspent.
