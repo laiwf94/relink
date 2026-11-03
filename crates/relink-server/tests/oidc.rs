@@ -22,6 +22,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 const CLIENT_ID: &str = "relink-console";
 const CLIENT_SECRET: &str = "s3cret:with/odd chars";
@@ -601,8 +602,51 @@ async fn signs_in_acts_with_csrf_and_signs_out() {
         .await
         .unwrap();
     assert_eq!(gone, 0);
+
+    // The sign-in and the sign-out are in the person's audit chain, as them.
+    let ws = h.store.personal_workspace("ada").await.unwrap();
+    let log = sqlx::query(
+        "SELECT action, actor, via, before, after FROM audit_log \
+          WHERE workspace_id = $1 ORDER BY seq",
+    )
+    .bind(ws)
+    .fetch_all(h.store.pool())
+    .await
+    .unwrap();
+    let actions: Vec<String> = log.iter().map(|r| r.get("action")).collect();
+    assert_eq!(
+        actions,
+        [
+            "workspace.create",
+            "user.create",
+            "link.create",
+            "session.end"
+        ],
+        "the link made with the session is ada's too"
+    );
+    let user_id = logged_user_id(&h, &log).await;
+    for r in &log[1..] {
+        assert_eq!(r.get::<Option<String>, _>("actor").as_deref(), Some("ada"));
+        assert_eq!(r.get::<String, _>("via"), format!("session:{user_id}"));
+    }
+    let created: Value = log[1].get("after");
+    assert_eq!(created["member"], "ada");
+    assert_eq!(created["issuer"], idp.issuer);
+    assert_eq!(created["subject"], "ada-1");
+    assert!(log[3].get::<Option<Value>, _>("after").is_none());
+    assert!(h.store.verify_audit(None, &[]).await.is_ok());
     second.shutdown().await;
     h.shutdown().await;
+}
+
+async fn logged_user_id(h: &Harness, log: &[sqlx::postgres::PgRow]) -> i64 {
+    let id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE member = 'ada'")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    let after: Value = log[1].get("after");
+    assert_eq!(after["id"], id);
+    id
 }
 
 /// Standard base64 with padding, as HTTP basic authentication uses.
@@ -630,6 +674,13 @@ async fn people_keep_their_identity_and_never_inherit_a_name() {
     assert_eq!(a["user"]["id"], b["user"]["id"]);
     assert_eq!(b["user"]["member"], "ada", "the name is chosen once");
     assert_eq!(b["user"]["email"], "ada@new.example.com");
+    let (before, after): (Value, Value) =
+        sqlx::query_as("SELECT before, after FROM audit_log WHERE action = 'user.sign_in'")
+            .fetch_one(h.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(before["email"], ada()["email"], "the address it replaced");
+    assert_eq!(after["email"], "ada@new.example.com");
 
     // Someone calling themselves alice at the provider does not become the
     // alice who owns API keys and links here.

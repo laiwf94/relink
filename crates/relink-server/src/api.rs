@@ -719,9 +719,8 @@ pub async fn create_link(
         enabled: req.enabled.unwrap_or(true),
         health_check: req.health_check.unwrap_or(false),
     };
-    let link = app
-        .db
-        .tenant(ws.id)
+    let link = ws
+        .tenant(&app.db)
         .insert_link(&new, app.cfg.code_length)
         .await?;
     // The code may be cached as "not found" here; other instances hear
@@ -824,7 +823,7 @@ pub async fn update_link(
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }
-    let link = app.db.tenant(ws.id).update_link(&code, &patch).await?;
+    let link = ws.tenant(&app.db).update_link(&code, &patch).await?;
     app.resolver.invalidate(&link.code);
     app.limiter.invalidate(link.id).await;
     tracing::info!(code = %link.code, "link updated");
@@ -839,7 +838,7 @@ pub async fn delete_link(
     ws: Allowed<LinksWrite>,
     Path(code): Path<String>,
 ) -> Result<Response, ApiError> {
-    let id = app.db.tenant(ws.id).delete_link(&code).await?;
+    let id = ws.tenant(&app.db).delete_link(&code).await?;
     app.resolver.invalidate(&code);
     app.limiter.invalidate(id).await;
     tracing::info!(code = %code, "link deleted");

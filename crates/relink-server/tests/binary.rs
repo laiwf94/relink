@@ -63,6 +63,8 @@ fn usage_and_configuration_errors() {
         &["create-key", "alice", "--workspace"],
         &["rotate-key"],
         &["rotate-key", "1", "--overlap", "31d"],
+        &["audit-verify", "--anchors", "1:2"],
+        &["audit-verify", "extra"],
     ] {
         let out = relink("postgres://x@127.0.0.1:1/x", bad);
         assert!(!out.status.success(), "{bad:?}");
@@ -214,6 +216,40 @@ async fn admin_commands_and_graceful_sigterm() {
     let out = relink(&db.url, &["create-key", "alice", "--workspace", "999999"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a member"));
+
+    // Every change above is in alice's chain, and the chain verifies.
+    let out = relink(&db.url, &["audit-verify"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("verified 1 audit chain(s)"), "{text}");
+    let head = text.lines().next().unwrap().to_owned();
+    let parts: Vec<&str> = head.split(':').collect();
+    // workspace.create, two key.create, link.create, key.revoke,
+    // key.create, key.rotate.
+    assert_eq!(parts[1], "7", "{head}");
+    let out = relink(&db.url, &["audit-verify", "--anchors", &head]);
+    assert!(out.status.success());
+
+    // Rewriting history is found, and the command fails.
+    let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect(&db.url)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE audit_log DISABLE TRIGGER audit_append_only; \
+         UPDATE audit_log SET actor = 'mallory' WHERE seq = 4; \
+         ALTER TABLE audit_log ENABLE TRIGGER audit_append_only",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let out = relink(&db.url, &["audit-verify", "--workspace", parts[0]]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("entry 4 was altered"), "{err}");
 }
 
 fn free_port() -> u16 {

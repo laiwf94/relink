@@ -16,7 +16,9 @@
 //! role with the workspace set and row-level security (migration 0003) keeps
 //! it inside that workspace. The queries carry no `owner` or `workspace_id`
 //! filter of their own: a link in another workspace is invisible, so it is
-//! "not found" exactly like a code that does not exist.
+//! "not found" exactly like a code that does not exist. Each change also
+//! appends to the workspace's audit chain in the same transaction, as the
+//! [`Actor`] the `Tenant` was made for.
 
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -29,6 +31,7 @@ use sqlx::types::Json;
 use sqlx::{Postgres, Row, Transaction};
 
 use crate::api::{ApiError, Authed};
+use crate::audit::{self, Action, Actor, Change};
 use crate::auth::{Principal, Scope};
 use crate::server::App;
 use crate::store::{
@@ -45,6 +48,13 @@ pub const WORKSPACE_HEADER: &str = "relink-workspace";
 pub struct Workspace {
     pub id: i64,
     pub principal: Principal,
+}
+
+impl Workspace {
+    /// The queries for this workspace, acting as this request's caller.
+    pub fn tenant<'a>(&self, db: &'a Db) -> Tenant<'a> {
+        Tenant::new(db, self.id).acting_as(Actor::from(&self.principal))
+    }
 }
 
 /// Why a `Relink-Workspace` header was refused.
@@ -151,16 +161,39 @@ impl<S: RequiredScope> FromRequestParts<Arc<App>> for Allowed<S> {
     }
 }
 
-/// The queries for one workspace. Cheap to make: [`Db::tenant`].
-#[derive(Clone, Copy)]
+/// The queries for one workspace, and who runs them. Cheap to make:
+/// [`Db::tenant`] or [`Workspace::tenant`].
+#[derive(Clone)]
 pub struct Tenant<'a> {
     db: &'a Db,
     workspace_id: i64,
+    actor: Actor,
 }
 
 impl<'a> Tenant<'a> {
+    /// Changes are recorded as made by the server ([`Actor::system`]) until
+    /// [`Tenant::acting_as`] names someone.
     pub fn new(db: &'a Db, workspace_id: i64) -> Tenant<'a> {
-        Tenant { db, workspace_id }
+        Tenant {
+            db,
+            workspace_id,
+            actor: Actor::system(),
+        }
+    }
+
+    /// The same queries, with changes recorded as made by `actor`.
+    pub fn acting_as(self, actor: Actor) -> Tenant<'a> {
+        Tenant { actor, ..self }
+    }
+
+    fn change(&self, action: Action, link_id: i64) -> Change {
+        Change {
+            workspace_id: self.workspace_id,
+            action,
+            target: format!("link:{link_id}"),
+            before: None,
+            after: None,
+        }
     }
 
     pub fn workspace_id(&self) -> i64 {
@@ -229,15 +262,20 @@ impl<'a> Tenant<'a> {
                     .bind(new.health_check)
                     .fetch_one(&mut *tx)
                     .await?;
-                    let id: i64 = row.try_get("id")?;
+                    let link = self.db.row_to_link(&row)?;
                     // Instances may hold a negative cache entry for this code.
-                    self.db.changed(&mut tx, id, &code).await?;
+                    self.db.changed(&mut tx, link.id, &code).await?;
+                    let change = Change {
+                        after: Some(audit::link_state(&link)),
+                        ..self.change(Action::LinkCreate, link.id)
+                    };
+                    audit::record(&mut tx, &self.actor, change).await?;
                     tx.commit().await?;
-                    Ok(row)
+                    Ok(link)
                 })
                 .await;
             match res {
-                Ok(row) => return self.db.row_to_link(&row).map_err(DbError::from),
+                Ok(link) => return Ok(link),
                 Err(DbError::Conflict) if new.alias.is_none() => continue,
                 Err(e) => return Err(e),
             }
@@ -294,6 +332,7 @@ impl<'a> Tenant<'a> {
                 .await?
                 .ok_or(sqlx::Error::RowNotFound)?;
                 let mut link = self.db.row_to_link(&row)?;
+                let before = audit::link_state(&link);
                 let destinations_changed = match &patch.destinations {
                     Some(d) if *d != link.destinations => {
                         link.destinations = d.clone();
@@ -347,6 +386,12 @@ impl<'a> Tenant<'a> {
                 .await?;
                 let updated = self.db.row_to_link(&row)?;
                 self.db.changed(&mut tx, updated.id, &updated.code).await?;
+                let change = Change {
+                    before: Some(before),
+                    after: Some(audit::link_state(&updated)),
+                    ..self.change(Action::LinkUpdate, updated.id)
+                };
+                audit::record(&mut tx, &self.actor, change).await?;
                 tx.commit().await?;
                 Ok(updated)
             })
@@ -359,12 +404,22 @@ impl<'a> Tenant<'a> {
         self.db
             .timed(async {
                 let mut tx = self.begin().await?;
-                let id: i64 = sqlx::query_scalar("DELETE FROM links WHERE code = $1 RETURNING id")
-                    .bind(code)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .ok_or(sqlx::Error::RowNotFound)?;
+                let row = sqlx::query(concat!(
+                    "DELETE FROM links WHERE code = $1 RETURNING ",
+                    columns!()
+                ))
+                .bind(code)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
+                let deleted = self.db.row_to_link(&row)?;
+                let id = deleted.id;
                 self.db.changed(&mut tx, id, code).await?;
+                let change = Change {
+                    before: Some(audit::link_state(&deleted)),
+                    ..self.change(Action::LinkDelete, id)
+                };
+                audit::record(&mut tx, &self.actor, change).await?;
                 tx.commit().await?;
                 Ok(id)
             })

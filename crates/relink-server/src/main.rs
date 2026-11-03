@@ -15,6 +15,12 @@
 //!                             scopes and lifetime); the old key keeps working
 //!                             for the overlap (default 1d, at most 30d)
 //! relink revoke-key ID        revoke an API key by its ID
+//! relink audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...]
+//!                             recompute every audit chain (or one) and
+//!                             print each head as WORKSPACE:SEQ:HASH; with
+//!                             anchors (heads printed earlier and kept
+//!                             elsewhere), also check those entries are
+//!                             unchanged. Exits non-zero at the first break
 //! relink kv-record CODE       print the JSON the edge would get for CODE
 //! ```
 //!
@@ -76,14 +82,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use relink_server::auth::{generate_key, hash_key};
-use relink_server::cli::{CreateKey, RotateKey};
+use relink_server::cli::{AuditVerify, CreateKey, RotateKey};
 use relink_server::config::Config;
 use relink_server::server::{migrate_with_retry, open_db, start};
 use relink_server::store::{KeyInfo, NewApiKey};
 
 const USAGE: &str = "usage: relink [serve | migrate | create-key OWNER [NAME] [--workspace ID] \
                      [--scopes LIST] [--expires-in DURATION] | rotate-key ID [--overlap DURATION] \
-                     | revoke-key ID | kv-record CODE]";
+                     | revoke-key ID | kv-record CODE \
+                     | audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...]]";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -97,6 +104,7 @@ async fn main() -> ExitCode {
         ["rotate-key", rest @ ..] => rotate_key(rest).await,
         ["revoke-key", id] => revoke_key(id).await,
         ["kv-record", code] => kv_record(code).await,
+        ["audit-verify", rest @ ..] => audit_verify(rest).await,
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())
@@ -234,5 +242,19 @@ async fn kv_record(code: &str) -> Result<(), String> {
         .ok_or_else(|| format!("no link with code {code:?}"))?;
     let json = serde_json::to_string(&stored.link).map_err(|e| e.to_string())?;
     println!("{json}");
+    Ok(())
+}
+
+async fn audit_verify(args: &[&str]) -> Result<(), String> {
+    let args = AuditVerify::parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let (_, db) = prepare().await?;
+    let heads = db
+        .verify_audit(args.workspace_id, &args.anchors)
+        .await
+        .map_err(|e| e.to_string())?;
+    for head in &heads {
+        println!("{head}");
+    }
+    println!("verified {} audit chain(s)", heads.len());
     Ok(())
 }

@@ -399,3 +399,31 @@ pub async fn insert_link(
     let ws = store.personal_workspace(&new.owner).await?;
     store.tenant(ws).insert_link(new, code_len).await
 }
+
+/// A migrated store on `url`, with the test configuration.
+pub async fn open_store(url: &str) -> Db {
+    let store = open_db(&config(url, &[])).unwrap();
+    migrate_with_retry(&store, Duration::from_secs(10))
+        .await
+        .unwrap();
+    store
+}
+
+/// An enabled link to one destination, with an alias, for `owner`.
+pub fn new_link_for(owner: &str, alias: &str) -> relink_server::store::NewLink {
+    relink_server::store::NewLink {
+        owner: owner.to_owned(),
+        alias: Some(alias.to_owned()),
+        destinations: vec![relink_server::model::Destination {
+            url: "https://example.com/".into(),
+            weight: 1,
+        }],
+        redirect_status: 302,
+        expires_at: None,
+        max_clicks: None,
+        geo: None,
+        fallback_url: None,
+        enabled: true,
+        health_check: false,
+    }
+}

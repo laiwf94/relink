@@ -29,6 +29,7 @@ use sqlx::Row;
 use subtle::ConstantTimeEq;
 
 use crate::api::{ApiError, json};
+use crate::audit::{self, Action, Actor, Change};
 use crate::auth::{AuthError, Credential, Role, is_valid_owner};
 use crate::oidc::IdClaims;
 use crate::server::App;
@@ -242,9 +243,14 @@ impl Db {
         let c = new.claims;
         self.timed(async {
             let mut tx = self.pool().begin().await?;
+            // The profile as it was, for the audit log, from the row the
+            // update locked.
             let existing = sqlx::query(
-                "UPDATE users SET email = $3, display_name = $4, last_login_at = now() \
-                  WHERE issuer = $1 AND subject = $2 RETURNING id, member",
+                "UPDATE users u SET email = $3, display_name = $4, last_login_at = now() \
+                   FROM (SELECT id, email, display_name FROM users \
+                          WHERE issuer = $1 AND subject = $2 FOR UPDATE) old \
+                  WHERE u.id = old.id \
+                  RETURNING u.id, u.member, old.email AS old_email, old.display_name AS old_name",
             )
             .bind(new.issuer)
             .bind(&c.subject)
@@ -252,12 +258,22 @@ impl Db {
             .bind(&c.name)
             .fetch_optional(&mut *tx)
             .await?;
+            let profile = |email: Option<&str>, name: Option<&str>| {
+                serde_json::json!({ "email": email, "name": name })
+            };
+            let mut before = None;
             let user = match existing {
-                Some(r) => SignedInUser {
-                    id: r.try_get("id")?,
-                    member: r.try_get("member")?,
-                    created: false,
-                },
+                Some(r) => {
+                    before = Some(profile(
+                        r.try_get::<Option<String>, _>("old_email")?.as_deref(),
+                        r.try_get::<Option<String>, _>("old_name")?.as_deref(),
+                    ));
+                    SignedInUser {
+                        id: r.try_get("id")?,
+                        member: r.try_get("member")?,
+                        created: false,
+                    }
+                }
                 None => {
                     let base = member_base(c);
                     let mut user = None;
@@ -321,7 +337,25 @@ impl Db {
                     })?
                 }
             };
-            crate::store::personal_workspace(&mut tx, &user.member).await?;
+            let workspace_id = crate::store::personal_workspace(&mut tx, &user.member).await?;
+            let mut after = profile(c.email.as_deref(), c.name.as_deref());
+            let action = if user.created {
+                after["id"] = user.id.into();
+                after["member"] = user.member.clone().into();
+                after["issuer"] = new.issuer.into();
+                after["subject"] = c.subject.clone().into();
+                Action::UserCreate
+            } else {
+                Action::UserSignIn
+            };
+            let change = Change {
+                workspace_id,
+                action,
+                target: format!("user:{}", user.id),
+                before,
+                after: Some(after),
+            };
+            audit::record(&mut tx, &Actor::session(&user.member, user.id), change).await?;
             tx.commit().await?;
             Ok(user)
         })
@@ -381,15 +415,39 @@ impl Db {
         .map_err(|e: sqlx::Error| DbError::from(e))
     }
 
-    /// Ends a session. Returns false if there was none.
+    /// Ends a session, recorded in the person's personal workspace. Returns
+    /// false if there was none.
     pub async fn delete_session(&self, hash: &[u8; 32]) -> Result<bool, DbError> {
-        self.timed(
-            sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
-                .bind(&hash[..])
-                .execute(self.pool()),
-        )
+        self.timed(async {
+            let mut tx = self.pool().begin().await?;
+            let Some(row) = sqlx::query(
+                "DELETE FROM sessions s USING users u \
+                  WHERE s.token_hash = $1 AND u.id = s.user_id \
+                  RETURNING s.user_id, u.member, s.created_at, s.expires_at",
+            )
+            .bind(&hash[..])
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                return Ok(false);
+            };
+            let user_id: i64 = row.try_get("user_id")?;
+            let member: String = row.try_get("member")?;
+            let workspace_id = crate::store::personal_workspace(&mut tx, &member).await?;
+            let started: DateTime<Utc> = row.try_get("created_at")?;
+            let expires: DateTime<Utc> = row.try_get("expires_at")?;
+            let change = Change {
+                workspace_id,
+                action: Action::SessionEnd,
+                target: format!("user:{user_id}"),
+                before: Some(serde_json::json!({ "created_at": started, "expires_at": expires })),
+                after: None,
+            };
+            audit::record(&mut tx, &Actor::session(&member, user_id), change).await?;
+            tx.commit().await?;
+            Ok(true)
+        })
         .await
-        .map(|r| r.rows_affected() == 1)
     }
 
     /// `member`'s role in `workspace_id`, or in their personal workspace

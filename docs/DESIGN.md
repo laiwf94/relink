@@ -52,6 +52,8 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `users` | People who signed in: issuer and subject at the provider, their member name, email address and display name. |
 | `oidc_logins` | Sign-ins between the redirect to the provider and its return: SHA-256 of `state`, nonce, PKCE verifier, return path, expiry. |
 | `sessions` | SHA-256 of each session cookie, its person, CSRF token and expiry. |
+| `audit_log` | Every change made by a person or an operator: workspace, sequence number, time, actor, how they acted, action, target, the state before and after, and the hash chain. |
+| `audit_heads` | The last sequence number and hash of each workspace's audit chain. |
 
 `code` uses the `C` collation (bytewise and case-sensitive, as base62 needs)
 and a `CHECK` repeats the API's character rules. The destination list is
@@ -73,6 +75,8 @@ read, so a hand-edited row produces an error instead of a panic.
 | `users (issuer, subject)` unique, `users (member)` unique | Finding a person at sign-in; two people can never get the same member name. |
 | `oidc_logins (state_hash)` primary key, `(expires_at)` | Taking a sign-in on return; clearing abandoned ones. |
 | `sessions (token_hash)` primary key, `(expires_at)`, `(user_id)` | One probe per uncached session; clearing expired ones. |
+| `audit_log (workspace_id, seq)` primary key | Reading a chain in order for verification, in batches by keyset. |
+| `audit_heads (workspace_id)` primary key | Taking the next sequence number; the row lock orders a workspace's entries. |
 
 ### Tenancy
 
@@ -250,6 +254,60 @@ served it and takes at most 10 s elsewhere. A per-person token bucket (all
 of a person's sessions share one) limits requests like the per-key one.
 Expired sessions and abandoned sign-ins are deleted by the minute-by-minute
 maintenance task.
+
+### Audit log
+
+Every change made by a person or an operator is appended to an audit log
+(`src/audit.rs`, migration 0007) in the same transaction as the change, so
+an entry exists exactly when its change committed: a refused or rolled-back
+change leaves neither. That covers creating, changing and deleting links;
+creating, rotating and revoking keys; creating workspaces; signing in (the
+first sign-in creates the person) and signing out. Bookkeeping the server
+does on its own (click counts, leases, health results, the KV outbox) is
+not logged: nobody decided it, and it would bury the log.
+
+An entry names the actor (a member, or none for an operator at the command
+line or the server itself), how they acted (`key:<id>`, `session:<user id>`,
+`cli` or `system`), the action (`link.update` and so on), the target
+(`link:<id>`, `key:<id>`, `workspace:<id>`, `user:<id>`) and the state
+before and after as JSON. A link's state is its redirect record plus its
+creator; a key's is its ID, owner, name, scopes and expiry, never its hash.
+Sign-ins and sign-outs land in the person's personal workspace.
+
+Each workspace has its own hash chain. Entry *n* stores the hash of entry
+*n − 1* and its own hash, SHA-256 over a version tag, that previous hash,
+the workspace, the sequence number, the time in microseconds and every other
+field, each length-prefixed so text cannot move from one field to the next
+unnoticed. `before` and `after` are hashed in jsonb's text form, which
+Postgres produces deterministically, so a dump and restore keeps the chain
+valid. The hashes are computed by a `BEFORE INSERT` trigger, not by the
+writer: whatever sequence number or hash a writer supplies is replaced, so
+no code path can break or skip the chain. The trigger takes the next number
+with one `INSERT ... ON CONFLICT DO UPDATE` on `audit_heads`, which locks
+that workspace's head row until the transaction ends. Entries of one
+workspace are therefore numbered in commit order with no gaps (a rolled-back
+change returns its number), and workspaces never wait for each other. Each
+change costs one more statement in its transaction; two changes in the same
+workspace serialise on the head for the rest of their transactions, which
+for API changes is one statement plus `COMMIT`.
+
+The log is append-only: triggers refuse `UPDATE`, `DELETE` and `TRUNCATE`
+even from the table owner, and `relink_tenant` holds only `SELECT` and
+`INSERT`, under a row-level security policy that keeps it inside its own
+workspace's chain and away from `audit_heads` entirely. Someone who owns the
+tables can still drop the triggers; that is what the chain is for.
+
+`relink audit-verify [--workspace ID]` reads each chain in batches of 1,000
+(so memory stays flat), recomputes every hash in Rust, independently of the
+trigger, and stops at the first break, naming the workspace, the entry and
+whether it was altered, is missing, does not follow from its predecessor, or
+disagrees with the chain's head. An edit anywhere breaks that entry; an
+entry removed from the middle leaves a gap; one removed from the end leaves
+the head ahead of the chain. On success it prints each head as
+`WORKSPACE:SEQ:HASH`. A chain can only be rewritten without detection by
+someone who also recomputes every later hash and the head; keeping printed
+heads somewhere the database's owner cannot write, and passing them back
+with `--anchors`, detects that too, back to the oldest anchor.
 
 ## The redirect path on the origin
 
@@ -616,7 +674,7 @@ audit` known advisories.
 | `serde`, `serde_json` | JSON for the API, the KV record and the edge wire format. |
 | `url` | WHATWG URL parsing and IDNA; not something to hand-roll when the result decides where a server sends requests. |
 | `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens. RSA and ECDSA verification is not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
-| `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys, constant-time comparison. |
+| `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys and the audit chain, constant-time comparison. |
 | `getrandom` | The OS CSPRNG for codes, keys and salts. |
 | `chrono` | Timestamps and UTC dates; the core uses it without its clock so it stays wasm-friendly. |
 | `tracing`, `tracing-subscriber` | Structured JSON logs with request-scoped spans. |

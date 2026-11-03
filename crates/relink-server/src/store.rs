@@ -19,6 +19,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
+use crate::audit::{self, Action, Actor, Change};
 use crate::auth::{Role, Scopes};
 use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
@@ -984,6 +985,14 @@ impl Db {
                 scopes: key.scopes,
                 expires_at: row.try_get("expires_at")?,
             };
+            let change = Change {
+                workspace_id,
+                action: Action::KeyCreate,
+                target: format!("key:{}", info.id),
+                before: None,
+                after: Some(audit::key_info_state(&info, key.name)),
+            };
+            audit::record(&mut tx, &Actor::cli(), change).await?;
             tx.commit().await?;
             Ok(info)
         };
@@ -1008,7 +1017,7 @@ impl Db {
             let mut tx = self.pool.begin().await?;
             let row = sqlx::query(
                 "SELECT k.owner, k.name, k.workspace_id, k.scopes, k.rotated_to, m.role,
-                        k.expires_at - k.created_at AS lifetime
+                        k.expires_at, k.expires_at - k.created_at AS lifetime
                    FROM api_keys k
                    LEFT JOIN workspace_members m
                           ON m.workspace_id = k.workspace_id AND m.member = k.owner
@@ -1079,6 +1088,21 @@ impl Db {
                 old_id: id,
                 old_expires_at,
             };
+            let old_state = |expires_at| {
+                audit::key_state(id, &rotation.new.owner, &name, old_scopes, expires_at)
+            };
+            let mut before = old_state(row.try_get("expires_at")?);
+            before["rotated_to"] = serde_json::Value::Null;
+            let mut after = old_state(Some(old_expires_at));
+            after["rotated_to"] = audit::key_info_state(&rotation.new, &name);
+            let change = Change {
+                workspace_id,
+                action: Action::KeyRotate,
+                target: format!("key:{id}"),
+                before: Some(before),
+                after: Some(after),
+            };
+            audit::record(&mut tx, &Actor::cli(), change).await?;
             tx.commit().await?;
             Ok(rotation)
         };
@@ -1169,15 +1193,44 @@ impl Db {
 
     /// Revokes a key. Returns false if no active key has that ID.
     pub async fn revoke_api_key(&self, id: i64) -> Result<bool, DbError> {
-        self.timed(
-            sqlx::query(
-                "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        self.timed(async {
+            let mut tx = self.pool.begin().await?;
+            let Some(row) = sqlx::query(
+                "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL \
+                 RETURNING owner, name, workspace_id, scopes, expires_at, revoked_at",
             )
             .bind(id)
-            .execute(&self.pool),
-        )
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                return Ok(false);
+            };
+            let workspace_id: i64 = row.try_get("workspace_id")?;
+            let name: String = row.try_get("name")?;
+            let owner: String = row.try_get("owner")?;
+            let before = audit::key_state(
+                id,
+                &owner,
+                &name,
+                row_scopes(&row)?,
+                row.try_get("expires_at")?,
+            );
+            let mut after = before.clone();
+            after["revoked_at"] =
+                serde_json::to_value(row.try_get::<DateTime<Utc>, _>("revoked_at")?)
+                    .unwrap_or_default();
+            let change = Change {
+                workspace_id,
+                action: Action::KeyRevoke,
+                target: format!("key:{id}"),
+                before: Some(before),
+                after: Some(after),
+            };
+            audit::record(&mut tx, &Actor::cli(), change).await?;
+            tx.commit().await?;
+            Ok(true)
+        })
         .await
-        .map(|r| r.rows_affected() == 1)
     }
 }
 
@@ -1224,7 +1277,22 @@ pub(crate) async fn personal_workspace(
     .fetch_optional(&mut **tx)
     .await?;
     match created {
-        Some(id) => Ok(id),
+        Some(id) => {
+            let change = Change {
+                workspace_id: id,
+                action: Action::WorkspaceCreate,
+                target: format!("workspace:{id}"),
+                before: None,
+                after: Some(serde_json::json!({
+                    "id": id,
+                    "name": owner,
+                    "personal_owner": owner,
+                    "members": [{"member": owner, "role": "owner"}],
+                })),
+            };
+            audit::record(tx, &Actor::system(), change).await?;
+            Ok(id)
+        }
         None => {
             sqlx::query_scalar(FIND)
                 .bind(owner)

@@ -98,6 +98,20 @@ $ relink create-key carol ci --workspace 3 --scopes links:read,links:write
 $ relink rotate-key 7 --overlap 1h   # prints the new key and when key 7 stops working
 ```
 
+Every change (links, keys, workspaces, sign-ins and sign-outs) is appended to
+the workspace's audit log in the same transaction, with who made it, how,
+and the state before and after. Each workspace's log is a hash chain that
+the database keeps append-only; `relink audit-verify` recomputes every hash,
+stops at the first altered, missing or reordered entry, and prints each
+chain's head so it can be kept elsewhere and checked later with `--anchors`:
+
+```console
+$ relink audit-verify
+3:418:5c0e...a91f
+verified 1 audit chain(s)
+$ relink audit-verify --anchors 3:418:5c0e...a91f
+```
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /{code}` | Redirect. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |

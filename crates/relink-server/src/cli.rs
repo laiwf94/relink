@@ -1,13 +1,15 @@
-//! Argument parsing for the key administration commands of the binary
+//! Argument parsing for the key and audit administration commands of the binary
 //! (`src/main.rs`), kept in the library so it is unit tested.
 //!
 //! ```text
 //! relink create-key OWNER [NAME] [--workspace ID] [--scopes LIST] [--expires-in DURATION]
 //! relink rotate-key ID [--overlap DURATION]
+//! relink audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...]
 //! ```
 
 use std::time::Duration;
 
+use crate::audit::Anchor;
 use crate::auth::{
     DEFAULT_ROTATION_OVERLAP, MAX_KEY_LIFETIME, MAX_ROTATION_OVERLAP, Scopes, is_valid_owner,
     parse_duration,
@@ -29,6 +31,14 @@ pub struct CreateKey {
 pub struct RotateKey {
     pub id: i64,
     pub overlap: Duration,
+}
+
+/// `audit-verify` arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditVerify {
+    /// None: every workspace with a chain.
+    pub workspace_id: Option<i64>,
+    pub anchors: Vec<Anchor>,
 }
 
 fn positive_id(what: &str, s: &str) -> Result<i64, String> {
@@ -128,6 +138,40 @@ impl RotateKey {
     }
 }
 
+impl AuditVerify {
+    /// Parses the words after `audit-verify`.
+    pub fn parse(args: &[&str]) -> Result<AuditVerify, String> {
+        let (pos, flags) = split(args, &["workspace", "anchors"])?;
+        if !pos.is_empty() {
+            return Err("audit-verify takes only --workspace and --anchors".into());
+        }
+        let mut verify = AuditVerify {
+            workspace_id: None,
+            anchors: Vec::new(),
+        };
+        for (flag, value) in flags {
+            match flag {
+                "workspace" => verify.workspace_id = Some(positive_id("--workspace", value)?),
+                _ => {
+                    verify.anchors = value
+                        .split(',')
+                        .map(Anchor::parse)
+                        .collect::<Result<_, _>>()?;
+                }
+            }
+        }
+        if let Some(ws) = verify.workspace_id
+            && let Some(a) = verify.anchors.iter().find(|a| a.workspace_id != ws)
+        {
+            return Err(format!(
+                "anchor for workspace {} given with --workspace {ws}",
+                a.workspace_id
+            ));
+        }
+        Ok(verify)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +263,30 @@ mod tests {
         assert!(err(&["1", "--overlap", "31d"]).contains("at most 30d"));
         assert!(err(&["1", "--overlap", "1w"]).contains("duration"));
         assert!(err(&["1", "--scopes", "links:read"]).contains("unknown option"));
+    }
+
+    #[test]
+    fn audit_verify() {
+        assert_eq!(
+            AuditVerify::parse(&[]),
+            Ok(AuditVerify {
+                workspace_id: None,
+                anchors: Vec::new()
+            })
+        );
+        let a = format!("3:7:{}", "0f".repeat(32));
+        let b = format!("4:1:{}", "a0".repeat(32));
+        let v = AuditVerify::parse(&["--anchors", &format!("{a},{b}")]).unwrap();
+        assert_eq!(v.anchors.len(), 2);
+        assert_eq!((v.anchors[1].workspace_id, v.anchors[1].seq), (4, 1));
+        let v = AuditVerify::parse(&["--workspace", "3", "--anchors", &a]).unwrap();
+        assert_eq!(v.workspace_id, Some(3));
+        let err = |args: &[&str]| AuditVerify::parse(args).unwrap_err();
+        assert!(err(&["3"]).contains("takes only"));
+        assert!(err(&["--workspace", "0"]).contains("positive"));
+        assert!(err(&["--anchors", "3:7"]).contains("WORKSPACE:SEQ:HASH"));
+        assert!(err(&["--anchors", &format!("{a},")]).contains("WORKSPACE:SEQ:HASH"));
+        assert!(err(&["--workspace", "4", "--anchors", &a]).contains("workspace 3"));
+        assert!(err(&["--since", "1"]).contains("unknown option"));
     }
 }
