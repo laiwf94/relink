@@ -15,7 +15,7 @@ The five core platform themes, each delivered as one week: workspaces and access
 | Week | Dates | Deliverable | Why |
 |---|---|---|---|
 | 1 | 2026-11-02 to 2026-11-08 | Workspaces, roles, console sign-in, audit and quotas | Every later feature needs a tenant boundary enforced in the database and real users, not only API key owners. Closes matrix rows E1, E2 and E5 (partial). |
-| 2 | 2026-11-09 to 2026-11-15 | Custom domains with verification, automatic TLS and per-domain behaviour | Branded domains are the first thing every commercial shortener sells. Closes matrix rows D1, D2 and D3. |
+| 2 | 2026-11-09 to 2026-11-15 | Custom domains with verification, automatic TLS and per-domain behaviour | Branded domains are the first thing every commercial shortener sells; each plan's domain limit is enforced here, where domains first exist. Closes matrix rows D1, D2 and D3. |
 | 3 | 2026-11-16 to 2026-11-22 | Targeting rules, deep links, scheduled changes and protected links | Leaders route by device, country and language and open native apps. Closes matrix rows L4, L6 (extends), L7, L8 and L9. |
 | 4 | 2026-11-23 to 2026-11-29 | Analytics engine: raw events, HyperLogLog, query API, bots and live stream | Today's daily aggregates answer one question; leaders slice by every dimension in real time. Closes matrix rows A2, A3 and A4, and extends A1. |
 | 5 | 2026-11-30 to 2026-12-06 | Webhooks, conversions, bulk jobs, QR codes, templates and search | Teams wire links into their stack and run campaigns in bulk. Closes matrix rows P3, P4, Q1, A5 (first step), A6 and L11. |
