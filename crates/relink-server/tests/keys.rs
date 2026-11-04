@@ -110,7 +110,7 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 6);
+    assert_eq!(routes.len(), 7);
     // Deletion last, so the other routes still find the link.
     routes.sort_by_key(|(m, _, _)| *m == "delete");
 
@@ -151,7 +151,7 @@ async fn every_route_requires_its_documented_scope() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
-    assert!(metric(&h.metrics().await, "relink_api_permission_denied_total") >= 7.0);
+    assert!(metric(&h.metrics().await, "relink_api_permission_denied_total") >= 8.0);
     h.shutdown().await;
 }
 

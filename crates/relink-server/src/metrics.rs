@@ -7,6 +7,8 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
+use crate::quota::QuotaKind;
+
 /// A monotonically increasing counter.
 #[derive(Default)]
 pub struct Counter(AtomicU64);
@@ -256,6 +258,8 @@ pub struct Metrics {
     db_errors: [Counter; 8],
     drops: [Counter; 4],
     probes: [Counter; 4],
+    /// Link creations refused for quota, by limit: links, monthly clicks.
+    quotas: [Counter; 2],
     pub coalesced: Counter,
     pub lookups_shed: Counter,
     pub clicks_enqueued: Counter,
@@ -296,6 +300,7 @@ impl Default for Metrics {
             db_errors: Default::default(),
             drops: Default::default(),
             probes: Default::default(),
+            quotas: Default::default(),
             coalesced: Counter::default(),
             lookups_shed: Counter::default(),
             clicks_enqueued: Counter::default(),
@@ -322,6 +327,13 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Counts a request refused because the workspace is at a plan limit.
+    pub fn quota_exceeded(&self, kind: QuotaKind) {
+        self.quotas[kind as usize].inc();
+    }
+    pub fn quota_exceeded_count(&self, kind: QuotaKind) -> u64 {
+        self.quotas[kind as usize].get()
+    }
     pub fn outcome(&self, o: Outcome) {
         self.outcomes[o as usize].inc();
     }
@@ -410,6 +422,15 @@ impl Metrics {
             ProbeResult::ALL
                 .iter()
                 .map(|r| (r.label(), self.probe_count(*r))),
+        );
+        family(
+            &mut out,
+            "relink_quota_exceeded_total",
+            "Link creations refused because the workspace is at a plan limit, by limit.",
+            "limit",
+            [QuotaKind::Links, QuotaKind::MonthlyClicks]
+                .iter()
+                .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
         let counters: [(&str, &str, u64); 21] = [
             (

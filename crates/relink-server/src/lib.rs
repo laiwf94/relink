@@ -4,7 +4,8 @@
 //! [`singleflight`]; [`limiter`] holds click leases; [`clicks`] is the
 //! analytics pipeline; [`api`], [`auth`] and [`ratelimit`] are the management
 //! API, and [`tenant`] scopes each of its requests to one workspace;
-//! [`audit`] records every change in a hash chain per workspace;
+//! [`audit`] records every change in a hash chain per workspace, and
+//! [`quota`] holds plans, limits and usage;
 //! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
 //! decides which forwarding headers to believe; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
@@ -25,6 +26,7 @@ pub mod kvsync;
 pub mod limiter;
 pub mod metrics;
 pub mod oidc;
+pub mod quota;
 pub mod ratelimit;
 pub mod redirect;
 pub mod resolver;

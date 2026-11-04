@@ -717,6 +717,13 @@ async fn openapi_matches_the_router_and_responses() {
     let (_, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
     let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("LinkList"));
+    let (_, usage) = h.api(Method::GET, "/v1/usage", &h.alice, None).await;
+    let keys: BTreeSet<String> = usage.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("Usage"));
+    for meter in ["links", "clicks"] {
+        let keys: BTreeSet<String> = usage[meter].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, schema_keys("Meter"));
+    }
     let (_, err) = h.api(Method::GET, "/v1/links/nope", &h.alice, None).await;
     let keys: BTreeSet<String> = err["error"].as_object().unwrap().keys().cloned().collect();
     assert_eq!(

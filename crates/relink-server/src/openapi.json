@@ -60,6 +60,7 @@
       "post": {
         "summary": "Create a link",
         "operationId": "createLink",
+        "description": "Refused with quota_exceeded (403) when the workspace holds as many links as its plan allows or has used its plan's clicks for the current UTC month; see GET /v1/usage.",
         "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
         "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateLink" } } } },
@@ -137,6 +138,23 @@
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/usage": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "Plan, limits and usage",
+        "operationId": "usage",
+        "security": [{ "apiKey": ["stats:read"] }, { "session": [] }],
+        "description": "The workspace's plan, how many links it holds and how many clicks it has had in the current UTC month, each with the plan's limit (null for none). Clicks are counted when the click pipeline writes them, so they trail redirects by up to the flush interval. Over a limit, creating links is refused with quota_exceeded; redirects are never refused.",
+        "responses": {
+          "200": { "description": "Usage.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Usage" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
         }
@@ -270,7 +288,7 @@
         }
       },
       "Error": {
-        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, permission_denied 403, not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
+        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, permission_denied 403, quota_exceeded 403 (the workspace is at a plan limit), not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       }
     },
@@ -313,7 +331,7 @@
             "type": "object",
             "required": ["code", "message", "request_id"],
             "properties": {
-              "code": { "enum": ["invalid_argument", "unauthenticated", "permission_denied", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "internal", "unavailable"] },
+              "code": { "enum": ["invalid_argument", "unauthenticated", "permission_denied", "quota_exceeded", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "internal", "unavailable"] },
               "message": { "type": "string" },
               "request_id": { "type": "string" }
             }
@@ -437,6 +455,23 @@
         "type": "object",
         "required": ["value", "clicks"],
         "properties": { "value": { "type": "string" }, "clicks": { "type": "integer" } }
+      },
+      "Meter": {
+        "type": "object",
+        "required": ["used", "limit"],
+        "properties": { "used": { "type": "integer" }, "limit": { "type": ["integer", "null"], "description": "null: the plan sets no limit." } }
+      },
+      "Usage": {
+        "type": "object",
+        "required": ["workspace_id", "plan", "period_start", "period_end", "links", "clicks"],
+        "properties": {
+          "workspace_id": { "type": "integer" },
+          "plan": { "type": "string" },
+          "period_start": { "type": "string", "format": "date", "description": "First day of the current UTC month." },
+          "period_end": { "type": "string", "format": "date", "description": "First day of the next month, when the click meter starts again." },
+          "links": { "$ref": "#/components/schemas/Meter" },
+          "clicks": { "$ref": "#/components/schemas/Meter" }
+        }
       },
       "Stats": {
         "type": "object",

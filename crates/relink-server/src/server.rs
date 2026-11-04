@@ -146,6 +146,7 @@ pub fn public_router(app: Arc<App>) -> Router {
                 .delete(api::delete_link),
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
+        .route("/v1/usage", get(api::usage))
         .route("/v1/auth/login", get(oidc::login))
         .route("/v1/auth/callback", get(oidc::callback))
         .route("/v1/auth/session", get(session::get_session))

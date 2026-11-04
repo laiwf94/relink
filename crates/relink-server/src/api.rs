@@ -89,6 +89,10 @@ impl ApiError {
     pub fn permission_denied(message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::FORBIDDEN, "permission_denied", message)
     }
+    /// The workspace is at one of its plan's limits (src/quota.rs).
+    pub fn quota_exceeded(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::FORBIDDEN, "quota_exceeded", message)
+    }
     pub fn not_found() -> ApiError {
         ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such resource")
     }
@@ -167,6 +171,7 @@ impl From<DbError> for ApiError {
                 tracing::error!(error = %detail, "database error");
                 ApiError::internal()
             }
+            DbError::Quota(q) => ApiError::quota_exceeded(q.to_string()),
         }
     }
 }
@@ -722,7 +727,12 @@ pub async fn create_link(
     let link = ws
         .tenant(&app.db)
         .insert_link(&new, app.cfg.code_length)
-        .await?;
+        .await
+        .inspect_err(|e| {
+            if let DbError::Quota(q) = e {
+                app.metrics.quota_exceeded(q.kind);
+            }
+        })?;
     // The code may be cached as "not found" here; other instances hear
     // about it through the change notification sent with the insert.
     app.resolver.invalidate(&link.code);
@@ -871,6 +881,16 @@ pub async fn link_stats(
             stats,
         },
     ))
+}
+
+/// `GET /v1/usage`: the workspace's plan, its limits and what it has used
+/// this month (src/quota.rs).
+pub async fn usage(
+    State(app): State<Arc<App>>,
+    ws: Allowed<StatsRead>,
+) -> Result<Response, ApiError> {
+    let usage = ws.tenant(&app.db).usage(Utc::now().date_naive()).await?;
+    Ok(json(StatusCode::OK, &usage))
 }
 
 /// Largest `POST /v1/edge/clicks` body (1,000 clicks of about 200 bytes).
@@ -1025,6 +1045,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/links/{code}"),
     ("delete", "/v1/links/{code}"),
     ("get", "/v1/links/{code}/stats"),
+    ("get", "/v1/usage"),
     ("get", "/v1/auth/login"),
     ("get", "/v1/auth/callback"),
     ("get", "/v1/auth/session"),

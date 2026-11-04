@@ -26,13 +26,14 @@ use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use sqlx::types::Json;
 use sqlx::{Postgres, Row, Transaction};
 
 use crate::api::{ApiError, Authed};
 use crate::audit::{self, Action, Actor, Change};
 use crate::auth::{Principal, Scope};
+use crate::quota::{self, Usage};
 use crate::server::App;
 use crate::store::{
     Bucket, DayStats, Db, DbError, LinkPatch, NewLink, STATS_COUNTRY, STATS_DEVICE, STATS_REFERRER,
@@ -227,7 +228,8 @@ impl<'a> Tenant<'a> {
     }
 
     /// Inserts a link into this workspace, with `new.owner` recorded as its
-    /// creator. With an alias, a taken code (in any workspace: codes are
+    /// creator, if the workspace's plan admits one more (`DbError::Quota`
+    /// otherwise; see src/quota.rs). With an alias, a taken code (in any workspace: codes are
     /// global) is `Conflict`; with a random code, collisions are retried with
     /// a fresh code up to five times.
     pub async fn insert_link(&self, new: &NewLink, code_len: usize) -> Result<StoredLink, DbError> {
@@ -242,6 +244,9 @@ impl<'a> Tenant<'a> {
                 .db
                 .timed(async {
                     let mut tx = self.begin().await?;
+                    if let Err(q) = quota::admit_new_link(&mut tx, Utc::now().date_naive()).await? {
+                        return Ok(Err(q));
+                    }
                     // workspace_id defaults to the transaction's workspace.
                     let row = sqlx::query(concat!(
                         "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
@@ -271,11 +276,12 @@ impl<'a> Tenant<'a> {
                     };
                     audit::record(&mut tx, &self.actor, change).await?;
                     tx.commit().await?;
-                    Ok(link)
+                    Ok(Ok(link))
                 })
                 .await;
             match res {
-                Ok(link) => return Ok(link),
+                Ok(Ok(link)) => return Ok(link),
+                Ok(Err(q)) => return Err(DbError::Quota(q)),
                 Err(DbError::Conflict) if new.alias.is_none() => continue,
                 Err(e) => return Err(e),
             }
@@ -422,6 +428,19 @@ impl<'a> Tenant<'a> {
                 audit::record(&mut tx, &self.actor, change).await?;
                 tx.commit().await?;
                 Ok(id)
+            })
+            .await
+    }
+
+    /// The workspace's plan, link count and clicks in the month of the UTC
+    /// day `today`.
+    pub async fn usage(&self, today: NaiveDate) -> Result<Usage, DbError> {
+        self.db
+            .timed(async {
+                let mut tx = self.begin().await?;
+                let usage = quota::read_usage(&mut tx, today).await?;
+                tx.commit().await?;
+                Ok(usage)
             })
             .await
     }

@@ -22,6 +22,13 @@
 //!                             elsewhere), also check those entries are
 //!                             unchanged. Exits non-zero at the first break
 //! relink kv-record CODE       print the JSON the edge would get for CODE
+//! relink plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited]
+//!                             create a plan or change its limits (omitted
+//!                             limits stay as they are; a new plan starts
+//!                             without limits)
+//! relink plan-assign WORKSPACE PLAN
+//!                             move a workspace to a plan; audited
+//! relink plan-list            print every plan and its limits
 //! ```
 //!
 //! Configuration is read from the environment:
@@ -81,16 +88,20 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use relink_server::audit::Actor;
 use relink_server::auth::{generate_key, hash_key};
-use relink_server::cli::{AuditVerify, CreateKey, RotateKey};
+use relink_server::cli::{AuditVerify, CreateKey, PlanAssign, PlanSet, RotateKey};
 use relink_server::config::Config;
+use relink_server::quota::Plan;
 use relink_server::server::{migrate_with_retry, open_db, start};
 use relink_server::store::{KeyInfo, NewApiKey};
 
 const USAGE: &str = "usage: relink [serve | migrate | create-key OWNER [NAME] [--workspace ID] \
                      [--scopes LIST] [--expires-in DURATION] | rotate-key ID [--overlap DURATION] \
                      | revoke-key ID | kv-record CODE \
-                     | audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...]]";
+                     | audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...] \
+                     | plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited] \
+                     | plan-assign WORKSPACE PLAN | plan-list]";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -105,6 +116,9 @@ async fn main() -> ExitCode {
         ["revoke-key", id] => revoke_key(id).await,
         ["kv-record", code] => kv_record(code).await,
         ["audit-verify", rest @ ..] => audit_verify(rest).await,
+        ["plan-set", rest @ ..] => plan_set(rest).await,
+        ["plan-assign", rest @ ..] => plan_assign(rest).await,
+        ["plan-list"] => plan_list().await,
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())
@@ -256,5 +270,52 @@ async fn audit_verify(args: &[&str]) -> Result<(), String> {
         println!("{head}");
     }
     println!("verified {} audit chain(s)", heads.len());
+    Ok(())
+}
+
+/// One line per plan: `plan=NAME links=N monthly_clicks=N`, with
+/// `unlimited` for a limit the plan does not set.
+fn describe_plan(plan: &Plan) -> String {
+    let limit = |l: Option<i64>| l.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
+    format!(
+        "plan={} links={} monthly_clicks={}",
+        plan.name,
+        limit(plan.limits.max_links),
+        limit(plan.limits.monthly_clicks)
+    )
+}
+
+async fn plan_set(args: &[&str]) -> Result<(), String> {
+    let args = PlanSet::parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let (_, db) = prepare().await?;
+    let plan = db
+        .set_plan(&args.name, args.change)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("{}", describe_plan(&plan));
+    Ok(())
+}
+
+async fn plan_assign(args: &[&str]) -> Result<(), String> {
+    let args = PlanAssign::parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let (_, db) = prepare().await?;
+    let (old, new) = db
+        .assign_plan(args.workspace_id, &args.plan, &Actor::cli())
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "workspace={} {} previous={}",
+        args.workspace_id,
+        describe_plan(&new),
+        old.name
+    );
+    Ok(())
+}
+
+async fn plan_list() -> Result<(), String> {
+    let (_, db) = prepare().await?;
+    for plan in db.plans().await.map_err(|e| e.to_string())? {
+        println!("{}", describe_plan(&plan));
+    }
     Ok(())
 }

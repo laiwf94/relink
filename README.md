@@ -112,6 +112,23 @@ verified 1 audit chain(s)
 $ relink audit-verify --anchors 3:418:5c0e...a91f
 ```
 
+Each workspace is on a plan that can limit how many links it holds and how
+many clicks it receives per calendar month (UTC). The default plan,
+`unlimited`, has no limits; operators define others and move workspaces
+between them. Clicks are metered as the click pipeline writes them. A
+workspace at a limit gets `quota_exceeded` when it creates a link; its
+existing links keep redirecting and counting:
+
+```console
+$ relink plan-set free --links 1000 --monthly-clicks 50000
+plan=free links=1000 monthly_clicks=50000
+$ relink plan-assign 3 free
+workspace=3 plan=free links=1000 monthly_clicks=50000 previous=unlimited
+$ curl -s localhost:8080/v1/usage -H "Authorization: Bearer $KEY"
+{"workspace_id":3,"plan":"free","period_start":"2026-11-01","period_end":"2026-12-01",
+ "links":{"used":12,"limit":1000},"clicks":{"used":4210,"limit":50000}}
+```
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /{code}` | Redirect. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
@@ -121,6 +138,7 @@ $ relink audit-verify --anchors 3:418:5c0e...a91f
 | `PATCH /v1/links/{code}` | Change fields; `null` clears optional ones. |
 | `DELETE /v1/links/{code}` | Delete the link and its statistics. |
 | `GET /v1/links/{code}/stats?from=&to=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
+| `GET /v1/usage` | The workspace's plan, link count and clicks this month, with their limits. |
 | `GET /v1/auth/login?return_to=` | Sign in with the OpenID Connect provider (authorization code with PKCE). Absent unless `RELINK_OIDC_ISSUER` is set. |
 | `GET /v1/auth/callback` | The provider's redirect back; starts a session cookie. |
 | `GET /v1/auth/session` | Who is signed in, the session's CSRF token, and their workspaces and roles. |
@@ -130,7 +148,8 @@ $ relink audit-verify --anchors 3:418:5c0e...a91f
 | `GET /metrics` (admin listener) | Prometheus metrics. |
 
 Errors are `{"error":{"code":"invalid_argument","message":"...","request_id":"..."}}`.
-The codes are `invalid_argument` 400, `unauthenticated` 401, `not_found` 404,
+The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
+403, `quota_exceeded` 403, `not_found` 404,
 `method_not_allowed` 405, `already_exists` 409, `payload_too_large` 413,
 `unsupported_media_type` 415, `resource_exhausted` 429, `internal` 500 and
 `unavailable` 503. Another owner's link answers `not_found`.
@@ -146,6 +165,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `not_found` 404,
 | Analytics | Against real Postgres: 100,000 count rows plus 100,000 visitor rows drain in 5,000-row transactions; a referrer spelled like the "no referrer" marker does not collide with it; clicks for a day whose salt is gone keep their counts and drop their visitor hashes. |
 | API | Every endpoint and error code over real HTTP: 26 invalid bodies, auth and revocation, per-address throttling of key guessing, owner isolation, pagination, rate and body limits, and the OpenAPI document compared with the router and real responses. |
 | Roles and keys | Each route's documented scope is enforced (403 without it, success with only it, before the body is read); viewers cannot write even with an old all-scopes key; removed members' keys stop working; expiry is exact for cached keys; rotation keeps both keys for the overlap and no longer, cannot fork, and narrows scopes to the current role. |
+| Quotas | Against real Postgres: 20 concurrent creations racing for a workspace's last 3 link slots create exactly 3 (and 4 or 5 without the row lock); clicks are metered into the month of their own day and equal the statistics month by month; at the click allowance creation is refused while redirects continue; tenants cannot change their plan or read another workspace's usage; plan moves are audited. |
 | Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |

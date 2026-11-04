@@ -66,6 +66,8 @@ pub enum DbError {
     Unavailable(String),
     /// Anything else: a bug or a constraint the API should have caught.
     Other(String),
+    /// Refused because the workspace is at one of its plan's limits.
+    Quota(crate::quota::QuotaExceeded),
 }
 
 impl fmt::Display for DbError {
@@ -75,6 +77,7 @@ impl fmt::Display for DbError {
             DbError::Conflict => f.write_str("conflict"),
             DbError::Unavailable(m) => write!(f, "database unavailable: {m}"),
             DbError::Other(m) => write!(f, "database error: {m}"),
+            DbError::Quota(q) => q.fmt(f),
         }
     }
 }
@@ -775,6 +778,26 @@ impl Db {
                 .bind(&countries)
                 .bind(&devices)
                 .bind(&referrers)
+                .bind(&counts)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if !ids.is_empty() {
+                // The quota meter (src/quota.rs): the same clicks, summed per
+                // workspace and month of the click's day. Rows in a fixed
+                // order, so concurrent flushers lock them in the same order.
+                sqlx::query(
+                    "INSERT INTO workspace_usage (workspace_id, month, clicks)
+                     SELECT l.workspace_id, u.day - (extract(day FROM u.day)::int - 1), sum(u.clicks)::bigint
+                       FROM UNNEST($1::bigint[], $2::date[], $3::bigint[]) AS u(link_id, day, clicks)
+                       JOIN links l ON l.id = u.link_id
+                      GROUP BY 1, 2
+                      ORDER BY 1, 2
+                     ON CONFLICT (workspace_id, month)
+                     DO UPDATE SET clicks = workspace_usage.clicks + EXCLUDED.clicks",
+                )
+                .bind(&ids)
+                .bind(&days)
                 .bind(&counts)
                 .execute(&mut *tx)
                 .await?;

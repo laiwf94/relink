@@ -5,6 +5,9 @@
 //! relink create-key OWNER [NAME] [--workspace ID] [--scopes LIST] [--expires-in DURATION]
 //! relink rotate-key ID [--overlap DURATION]
 //! relink audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...]
+//! relink plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited]
+//! relink plan-assign WORKSPACE PLAN
+//! relink plan-list
 //! ```
 
 use std::time::Duration;
@@ -14,6 +17,7 @@ use crate::auth::{
     DEFAULT_ROTATION_OVERLAP, MAX_KEY_LIFETIME, MAX_ROTATION_OVERLAP, Scopes, is_valid_owner,
     parse_duration,
 };
+use crate::quota::PlanChange;
 
 /// `create-key` arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +43,46 @@ pub struct AuditVerify {
     /// None: every workspace with a chain.
     pub workspace_id: Option<i64>,
     pub anchors: Vec<Anchor>,
+}
+
+/// `plan-set` arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanSet {
+    pub name: String,
+    pub change: PlanChange,
+}
+
+/// `plan-assign` arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanAssign {
+    pub workspace_id: i64,
+    pub plan: String,
+}
+
+/// Largest limit a plan may set: far beyond any real workspace, small
+/// enough that sums of clicks never approach `i64::MAX`.
+pub const MAX_PLAN_LIMIT: i64 = 1_000_000_000_000_000;
+
+/// A plan limit: a non-negative integer, or `unlimited` for none.
+fn plan_limit(flag: &str, s: &str) -> Result<Option<i64>, String> {
+    if s == "unlimited" {
+        return Ok(None);
+    }
+    s.parse::<i64>()
+        .ok()
+        .filter(|n| (0..=MAX_PLAN_LIMIT).contains(n) && s.bytes().all(|b| b.is_ascii_digit()))
+        .map(Some)
+        .ok_or_else(|| {
+            format!("--{flag} must be an integer from 0 to {MAX_PLAN_LIMIT}, or unlimited")
+        })
+}
+
+fn plan_name(s: &str) -> Result<String, String> {
+    if is_valid_owner(s) {
+        Ok(s.to_owned())
+    } else {
+        Err("a plan name must be 1-63 characters of a-z, 0-9, '.', '_' or '-', starting with a letter or digit".into())
+    }
 }
 
 fn positive_id(what: &str, s: &str) -> Result<i64, String> {
@@ -172,6 +216,42 @@ impl AuditVerify {
     }
 }
 
+impl PlanSet {
+    /// Parses the words after `plan-set`.
+    pub fn parse(args: &[&str]) -> Result<PlanSet, String> {
+        let (pos, flags) = split(args, &["links", "monthly-clicks"])?;
+        let [name] = pos.as_slice() else {
+            return Err("plan-set takes one plan NAME".into());
+        };
+        let mut set = PlanSet {
+            name: plan_name(name)?,
+            change: PlanChange::default(),
+        };
+        for (flag, value) in flags {
+            let limit = plan_limit(flag, value)?;
+            match flag {
+                "links" => set.change.max_links = Some(limit),
+                _ => set.change.monthly_clicks = Some(limit),
+            }
+        }
+        Ok(set)
+    }
+}
+
+impl PlanAssign {
+    /// Parses the words after `plan-assign`.
+    pub fn parse(args: &[&str]) -> Result<PlanAssign, String> {
+        let (pos, _) = split(args, &[])?;
+        let [workspace, plan] = pos.as_slice() else {
+            return Err("plan-assign takes a WORKSPACE ID and a PLAN name".into());
+        };
+        Ok(PlanAssign {
+            workspace_id: positive_id("WORKSPACE", workspace)?,
+            plan: plan_name(plan)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +368,51 @@ mod tests {
         assert!(err(&["--anchors", &format!("{a},")]).contains("WORKSPACE:SEQ:HASH"));
         assert!(err(&["--workspace", "4", "--anchors", &a]).contains("workspace 3"));
         assert!(err(&["--since", "1"]).contains("unknown option"));
+    }
+
+    #[test]
+    fn plan_set() {
+        assert_eq!(
+            PlanSet::parse(&["free"]),
+            Ok(PlanSet {
+                name: "free".into(),
+                change: PlanChange::default()
+            })
+        );
+        let p = PlanSet::parse(&["--monthly-clicks", "10000", "free", "--links", "100"]).unwrap();
+        assert_eq!(p.change.max_links, Some(Some(100)));
+        assert_eq!(p.change.monthly_clicks, Some(Some(10_000)));
+        let p = PlanSet::parse(&["pro", "--links", "unlimited", "--monthly-clicks", "0"]).unwrap();
+        assert_eq!(p.change.max_links, Some(None));
+        assert_eq!(p.change.monthly_clicks, Some(Some(0)));
+        let max = MAX_PLAN_LIMIT.to_string();
+        assert!(PlanSet::parse(&["pro", "--links", &max]).is_ok());
+        let err = |args: &[&str]| PlanSet::parse(args).unwrap_err();
+        assert!(err(&[]).contains("one plan NAME"));
+        assert!(err(&["a", "b"]).contains("one plan NAME"));
+        assert!(err(&["Free"]).contains("plan name"));
+        assert!(err(&["free", "--links", "-1"]).contains("--links must be"));
+        assert!(err(&["free", "--links", "+5"]).contains("--links must be"));
+        assert!(err(&["free", "--links", "lots"]).contains("--links must be"));
+        let over = (MAX_PLAN_LIMIT + 1).to_string();
+        assert!(err(&["free", "--monthly-clicks", &over]).contains("--monthly-clicks must be"));
+        assert!(err(&["free", "--domains", "3"]).contains("unknown option"));
+    }
+
+    #[test]
+    fn plan_assign() {
+        assert_eq!(
+            PlanAssign::parse(&["3", "free"]),
+            Ok(PlanAssign {
+                workspace_id: 3,
+                plan: "free".into()
+            })
+        );
+        let err = |args: &[&str]| PlanAssign::parse(args).unwrap_err();
+        assert!(err(&["3"]).contains("WORKSPACE ID and a PLAN"));
+        assert!(err(&["3", "free", "x"]).contains("WORKSPACE ID and a PLAN"));
+        assert!(err(&["0", "free"]).contains("positive"));
+        assert!(err(&["3", "Free!"]).contains("plan name"));
+        assert!(err(&["3", "free", "--force", "1"]).contains("unknown option"));
     }
 }

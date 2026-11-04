@@ -65,6 +65,11 @@ fn usage_and_configuration_errors() {
         &["rotate-key", "1", "--overlap", "31d"],
         &["audit-verify", "--anchors", "1:2"],
         &["audit-verify", "extra"],
+        &["plan-set"],
+        &["plan-set", "free", "--links", "-1"],
+        &["plan-assign", "1"],
+        &["plan-assign", "x", "free"],
+        &["plan-list", "extra"],
     ] {
         let out = relink("postgres://x@127.0.0.1:1/x", bad);
         assert!(!out.status.success(), "{bad:?}");
@@ -250,6 +255,57 @@ async fn admin_commands_and_graceful_sigterm() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("entry 4 was altered"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_commands() {
+    let Some(admin) = admin_url() else { return };
+    let db = TestDb::create(&admin).await;
+    let out = relink(&db.url, &["create-key", "alice"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect(&db.url)
+        .await
+        .unwrap();
+    let ws: i64 = sqlx::query_scalar("SELECT id FROM workspaces WHERE personal_owner = 'alice'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let stdout = |args: &[&str]| {
+        let out = relink(&db.url, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(
+        stdout(&["plan-set", "free", "--links", "100"]),
+        "plan=free links=100 monthly_clicks=unlimited\n"
+    );
+    assert_eq!(
+        stdout(&["plan-set", "free", "--monthly-clicks", "5000"]),
+        "plan=free links=100 monthly_clicks=5000\n"
+    );
+    assert_eq!(
+        stdout(&["plan-assign", &ws.to_string(), "free"]),
+        format!("workspace={ws} plan=free links=100 monthly_clicks=5000 previous=unlimited\n")
+    );
+    assert_eq!(
+        stdout(&["plan-list"]),
+        "plan=free links=100 monthly_clicks=5000\n\
+         plan=unlimited links=unlimited monthly_clicks=unlimited\n"
+    );
+    let out = relink(&db.url, &["plan-assign", &ws.to_string(), "gold"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("plan \\\"gold\\\" does not exist"));
+    let out = relink(&db.url, &["plan-assign", "999999", "free"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("workspace 999999 does not exist"));
 }
 
 fn free_port() -> u16 {

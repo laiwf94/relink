@@ -309,6 +309,48 @@ someone who also recomputes every later hash and the head; keeping printed
 heads somewhere the database's owner cannot write, and passing them back
 with `--anchors`, detects that too, back to the oldest anchor.
 
+### Plans and quotas
+
+A plan (`src/quota.rs`, migration 0008) is a named row of limits: how many
+links a workspace may hold and how many clicks it may receive in a calendar
+month, UTC. A missing limit is no limit. Every workspace is on one plan; the
+seeded `unlimited` plan is the default, so a self-hosted install behaves as
+before until an operator defines plans with `relink plan-set` and moves
+workspaces with `relink plan-assign`, which is recorded in the workspace's
+audit chain as `workspace.plan` with the limits before and after.
+`relink_tenant` may read every plan and its own workspace's usage but holds
+`UPDATE` on `workspaces` only for the `name` column, so no tenant query can
+move a workspace to another plan.
+
+Clicks are metered from the click pipeline, not the redirect: the flusher's
+transaction that adds a batch to `click_daily` also adds it to
+`workspace_usage (workspace_id, month)`, grouped by the month of each
+click's own day, so a late flush after an outage lands in the month the
+clicks happened and the meter always equals the statistics. It costs one
+more statement per flushed chunk and nothing per redirect. Concurrent
+flushers on several instances touch usage rows in sorted order, so they
+queue rather than deadlock. Clicks trail redirects by the flush interval
+(one second by default), which is the meter's only inaccuracy.
+
+Limits are checked when a link is created, inside the creating
+transaction, and a refusal is `quota_exceeded` (403) naming the limit and,
+for clicks, the day it resets. Under a link limit the transaction first
+locks the workspace row (`FOR NO KEY UPDATE`, which foreign-key checks from
+other inserts do not wait for) and then counts with a fresh snapshot, so
+concurrent requests cannot both take the last slot: 20 racing for 3 slots
+create exactly 3. The count stops at the limit (`SELECT count(*) FROM
+(SELECT 1 FROM links LIMIT n)`), so a check reads at most `n` index entries
+however large the workspace, and workspaces without a link limit take no
+lock and count nothing. Lowering a limit below what a workspace holds keeps
+every link; only new ones are refused.
+
+Quotas never refuse a redirect. A printed QR code or a link in a sent email
+must keep working when its workspace runs out of clicks, so over the
+monthly allowance links keep redirecting and keep being counted, and only
+creating new links stops until the month turns. `GET /v1/usage` (scope
+`stats:read`) returns the plan, the link count and the month's clicks, each
+with its limit.
+
 ## The redirect path on the origin
 
 ### The cache
@@ -644,6 +686,7 @@ and counts the clicks it could not write.
 | API rate | 10/s, burst 20, per key and instance |
 | KV outbox retry | 1 s doubling to 10 min |
 | Edge click batch | 50 clicks or 5 s |
+| Plan limits | 0 to 10¹⁵ links and monthly clicks, or unlimited (the default plan) |
 
 ## Observability
 
@@ -653,8 +696,8 @@ the admin listener cover redirect latency, redirects by outcome, cache results
 (`hit`, `negative_hit`, `stale`, `stale_on_error`, `miss`), coalesced and shed
 lookups, click queue depth, backlog, drops by reason, late visitor hashes,
 database errors by operation, lease grants, health probes, KV writes, deletes,
-errors and reconciled drift, edge clicks, API requests and refusals, and pool
-usage.
+errors and reconciled drift, edge clicks, API requests and refusals, link creations refused per plan
+limit, and pool usage.
 
 ## Dependencies
 
