@@ -59,13 +59,21 @@ pub struct Plan {
 pub enum QuotaKind {
     Links,
     MonthlyClicks,
+    /// Open invitations: the same bound for every plan
+    /// ([`MAX_PENDING_INVITATIONS`]), so the table cannot be filled.
+    PendingInvitations,
 }
+
+/// Most invitations a workspace may have waiting at once (neither
+/// accepted, revoked nor expired), whatever its plan.
+pub const MAX_PENDING_INVITATIONS: i64 = 100;
 
 impl QuotaKind {
     pub fn as_str(self) -> &'static str {
         match self {
             QuotaKind::Links => "links",
             QuotaKind::MonthlyClicks => "monthly_clicks",
+            QuotaKind::PendingInvitations => "pending_invitations",
         }
     }
 }
@@ -97,6 +105,12 @@ impl fmt::Display for QuotaExceeded {
                 f,
                 "the workspace holds the {} links its plan allows; delete links or move \
                  the workspace to a larger plan",
+                self.limit
+            ),
+            (QuotaKind::PendingInvitations, _) => write!(
+                f,
+                "the workspace has {} invitations waiting, the most it may have; revoke \
+                 some or wait for them to be accepted or expire",
                 self.limit
             ),
         }
@@ -456,6 +470,16 @@ mod tests {
     fn messages_name_the_limit() {
         assert_eq!(QuotaKind::Links.as_str(), "links");
         assert_eq!(QuotaKind::MonthlyClicks.as_str(), "monthly_clicks");
+        assert_eq!(
+            QuotaKind::PendingInvitations.as_str(),
+            "pending_invitations"
+        );
+        let e = QuotaExceeded {
+            kind: QuotaKind::PendingInvitations,
+            limit: MAX_PENDING_INVITATIONS,
+            resets_on: None,
+        };
+        assert!(e.to_string().contains("100 invitations waiting"), "{e}");
         let e = QuotaExceeded {
             kind: QuotaKind::MonthlyClicks,
             limit: 5,

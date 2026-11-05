@@ -23,6 +23,7 @@ use crate::cache::Cache;
 use crate::clicks::{ClickEvent, ClickQueue, ClickSink, Flusher};
 use crate::config::Config;
 use crate::health::HealthWorker;
+use crate::invite;
 use crate::kvsync::{CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
 use crate::metrics::{DbOp, Gauges, Metrics};
@@ -151,6 +152,16 @@ pub fn public_router(app: Arc<App>) -> Router {
         .route("/v1/auth/callback", get(oidc::callback))
         .route("/v1/auth/session", get(session::get_session))
         .route("/v1/auth/logout", post(session::logout))
+        .route(
+            "/v1/invitations",
+            get(invite::list_invitations).post(invite::create_invitation),
+        )
+        .route(
+            "/v1/invitations/{id}",
+            axum::routing::delete(invite::revoke_invitation),
+        )
+        .route("/v1/invites/{token}", get(invite::preview_invite))
+        .route("/v1/invites/{token}/accept", post(invite::accept_invite))
         .layer(DefaultBodyLimit::max(api::MAX_BODY));
     let edge = Router::new()
         .route("/v1/edge/clicks", post(api::edge_clicks))

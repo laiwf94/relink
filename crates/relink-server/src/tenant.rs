@@ -201,7 +201,16 @@ impl<'a> Tenant<'a> {
         self.workspace_id
     }
 
-    async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+    pub(crate) fn db(&self) -> &'a Db {
+        self.db
+    }
+
+    /// Who changes made through this `Tenant` are recorded as made by.
+    pub(crate) fn actor(&self) -> &Actor {
+        &self.actor
+    }
+
+    pub(crate) async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
         self.db.begin_tenant_untimed(self.workspace_id).await
     }
 

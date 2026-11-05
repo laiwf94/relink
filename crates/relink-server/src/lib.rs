@@ -22,6 +22,7 @@ pub mod clicks;
 pub mod code;
 pub mod config;
 pub mod health;
+pub mod invite;
 pub mod kvsync;
 pub mod limiter;
 pub mod metrics;

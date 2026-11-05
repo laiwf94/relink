@@ -98,7 +98,22 @@ $ relink create-key carol ci --workspace 3 --scopes links:read,links:write
 $ relink rotate-key 7 --overlap 1h   # prints the new key and when key 7 stops working
 ```
 
-Every change (links, keys, workspaces, sign-ins and sign-outs) is appended to
+A signed-in admin or owner brings people into a workspace with a one-time
+invitation link, by email address or member name and with a role (admins
+invite editors and viewers, owners anyone). Only the person invited can use
+it: someone signed in with that verified address, or with that member name.
+It works once, until it expires (7 days by default, at most 30), and can be
+revoked before then:
+
+```console
+$ curl -s localhost:8080/v1/invitations -H "Cookie: relink_session=$S" \
+    -H "X-CSRF-Token: $CSRF" -H "Relink-Workspace: 3" -H "Content-Type: application/json" \
+    -d '{"email": "carol@example.com", "role": "editor"}'
+{"id":5,"workspace_id":3,"email":"carol@example.com","role":"editor","status":"pending",
+ ...,"url":"http://localhost:8080/v1/invites/rli_6f1c...e2"}
+```
+
+Every change (links, keys, workspaces, invitations, sign-ins and sign-outs) is appended to
 the workspace's audit log in the same transaction, with who made it, how,
 and the state before and after. Each workspace's log is a hash chain that
 the database keeps append-only; `relink audit-verify` recomputes every hash,
@@ -143,6 +158,11 @@ $ curl -s localhost:8080/v1/usage -H "Authorization: Bearer $KEY"
 | `GET /v1/auth/callback` | The provider's redirect back; starts a session cookie. |
 | `GET /v1/auth/session` | Who is signed in, the session's CSRF token, and their workspaces and roles. |
 | `POST /v1/auth/logout` | Sign out (with `X-CSRF-Token`). |
+| `POST /v1/invitations` | Invite by `email` or `member` with a `role` and optional `expires_in`; answers with the one-time `url`, shown only then. Signed-in admins and owners only. |
+| `GET /v1/invitations` | The workspace's invitations, pending first. |
+| `DELETE /v1/invitations/{id}` | Revoke a pending invitation. |
+| `GET /v1/invites/{token}` | The invitation link: what accepting would give, for a signed-in person. |
+| `POST /v1/invites/{token}/accept` | Join the workspace, if you are the person invited. |
 | `POST /v1/edge/clicks` | Click batches from the Worker, authenticated with `RELINK_EDGE_TOKEN`. Absent unless that is set. |
 | `GET /healthz`, `/readyz`, `/openapi.json` | Liveness, readiness (stays ready with the database down, and says so), the API document. |
 | `GET /metrics` (admin listener) | Prometheus metrics. |
@@ -166,6 +186,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 | API | Every endpoint and error code over real HTTP: 26 invalid bodies, auth and revocation, per-address throttling of key guessing, owner isolation, pagination, rate and body limits, and the OpenAPI document compared with the router and real responses. |
 | Roles and keys | Each route's documented scope is enforced (403 without it, success with only it, before the body is read); viewers cannot write even with an old all-scopes key; removed members' keys stop working; expiry is exact for cached keys; rotation keeps both keys for the overlap and no longer, cannot fork, and narrows scopes to the current role. |
 | Quotas | Against real Postgres: 20 concurrent creations racing for a workspace's last 3 link slots create exactly 3 (and 4 or 5 without the row lock); clicks are metered into the month of their own day and equal the statistics month by month; at the click allowance creation is refused while redirects continue; tenants cannot change their plan or read another workspace's usage; plan moves are audited. |
+| Invitations | Against real Postgres over HTTP: only the person invited joins (a verified address, or the member name); an unverified address, another person or an API key is refused; 20 concurrent acceptances of one link make one member; revoked, expired and used links are refused; admins cannot invite or revoke above their own role; 5 requests racing for the last 2 of 100 pending slots create exactly 2; tenants see only their own invitations and cannot delete any; each step is in the audit chain, which still verifies, and tokens are in neither the log nor the chain. |
 | Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |

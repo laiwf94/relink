@@ -227,6 +227,99 @@
         }
       }
     },
+    "/v1/invitations": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Invite someone to the workspace",
+        "operationId": "createInvitation",
+        "security": [{ "session": [] }],
+        "description": "Signed-in admins and owners only; API keys are refused with permission_denied. Admins invite editors and viewers, owners any role. Invite by email (accepted by whoever signs in with that address, verified by the provider) or by member name (someone who has signed in before). The answer carries the one-time link (url) and its token, shown only now. At most 100 invitations may be pending at once (quota_exceeded). Audited as invitation.create. Requires X-CSRF-Token.",
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InvitationRequest" } } } },
+        "responses": {
+          "201": { "description": "Invited.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NewInvitation" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List invitations",
+        "operationId": "listInvitations",
+        "security": [{ "session": [] }],
+        "description": "Signed-in admins and owners only. Every pending invitation, then the others, newest first, at most 200. Tokens are never shown again.",
+        "responses": {
+          "200": { "description": "Invitations.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InvitationList" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/invitations/{id}": {
+      "parameters": [
+        { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } },
+        { "$ref": "#/components/parameters/Workspace" }
+      ],
+      "delete": {
+        "summary": "Revoke an invitation",
+        "operationId": "revokeInvitation",
+        "security": [{ "session": [] }],
+        "description": "Signed-in admins (for editor and viewer invitations) and owners. Only a pending invitation can be revoked; one already accepted, revoked or expired is already_exists (409). Audited as invitation.revoke. Requires X-CSRF-Token.",
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "204": { "description": "Revoked." },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/invites/{token}": {
+      "parameters": [{ "$ref": "#/components/parameters/InviteToken" }],
+      "get": {
+        "summary": "Look at an invitation before accepting it",
+        "operationId": "previewInvite",
+        "security": [{ "session": [] }],
+        "description": "The invitation link. Requires a signed-in person (any). Answers with the workspace and role on offer while the invitation is pending, and not_found saying why otherwise (unknown, expired, accepted or revoked). Changes nothing. Not cacheable.",
+        "responses": {
+          "200": { "description": "The invitation.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InvitePreview" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/invites/{token}/accept": {
+      "parameters": [{ "$ref": "#/components/parameters/InviteToken" }],
+      "post": {
+        "summary": "Accept an invitation",
+        "operationId": "acceptInvite",
+        "security": [{ "session": [] }],
+        "description": "Joins the workspace with the invited role. Only the person invited may accept: a verified email address equal to the invited one, or the invited member name; anyone else gets permission_denied. Each invitation is accepted at most once, before it expires and unless revoked (not_found otherwise); someone already a member gets already_exists and the invitation stays usable. Audited as invitation.accept. Requires X-CSRF-Token.",
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "200": { "description": "Joined.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Joined" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/edge/clicks": {
       "post": {
         "summary": "Clicks served by the edge worker",
@@ -276,6 +369,7 @@
     "parameters": {
       "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } },
       "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied. A session acts in the named workspace if the person is a member, else in their personal workspace." },
+      "InviteToken": { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^rli_[0-9a-f]{64}$" }, "description": "The token from the invitation link. It is a credential: relink never logs it." },
       "Csrf": { "name": "X-CSRF-Token", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "description": "The session's CSRF token; required on every state-changing request authenticated by the session cookie." }
     },
     "responses": {
@@ -288,7 +382,7 @@
         }
       },
       "Error": {
-        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, permission_denied 403, quota_exceeded 403 (the workspace is at a plan limit), not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
+        "description": "An error. Codes: invalid_argument 400, unauthenticated 401, permission_denied 403, quota_exceeded 403 (the workspace is at a plan limit, or has the most pending invitations it may have), not_found 404, method_not_allowed 405, already_exists 409, payload_too_large 413, unsupported_media_type 415, resource_exhausted 429 (with Retry-After), internal 500, unavailable 503 (with Retry-After).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       }
     },
@@ -460,6 +554,85 @@
         "type": "object",
         "required": ["used", "limit"],
         "properties": { "used": { "type": "integer" }, "limit": { "type": ["integer", "null"], "description": "null: the plan sets no limit." } }
+      },
+      "InvitationRequest": {
+        "type": "object",
+        "required": ["role"],
+        "additionalProperties": false,
+        "description": "Exactly one of email and member.",
+        "properties": {
+          "email": { "type": "string", "maxLength": 320 },
+          "member": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$" },
+          "role": { "enum": ["owner", "admin", "editor", "viewer"] },
+          "expires_in": { "type": "string", "pattern": "^[0-9]{1,10}[smhd]$", "description": "Between 5m and 30d. Default 7d." }
+        }
+      },
+      "Invitation": {
+        "type": "object",
+        "required": ["id", "workspace_id", "email", "member", "role", "invited_by", "status", "created_at", "expires_at", "accepted_at", "accepted_member", "revoked_at", "revoked_by"],
+        "properties": {
+            "id": { "type": "integer" },
+            "workspace_id": { "type": "integer" },
+            "email": { "type": ["string", "null"], "description": "Set when invited by email address (lower case)." },
+            "member": { "type": ["string", "null"], "description": "Set when invited by member name." },
+            "role": { "enum": ["owner", "admin", "editor", "viewer"] },
+            "invited_by": { "type": "string" },
+            "status": { "enum": ["pending", "accepted", "revoked", "expired"] },
+            "created_at": { "type": "string", "format": "date-time" },
+            "expires_at": { "type": "string", "format": "date-time" },
+            "accepted_at": { "type": ["string", "null"], "format": "date-time" },
+            "accepted_member": { "type": ["string", "null"] },
+            "revoked_at": { "type": ["string", "null"], "format": "date-time" },
+            "revoked_by": { "type": ["string", "null"] }
+        }
+      },
+      "NewInvitation": {
+        "type": "object",
+        "required": ["id", "workspace_id", "email", "member", "role", "invited_by", "status", "created_at", "expires_at", "accepted_at", "accepted_member", "revoked_at", "revoked_by", "token", "url"],
+        "properties": {
+            "id": { "type": "integer" },
+            "workspace_id": { "type": "integer" },
+            "email": { "type": ["string", "null"], "description": "Set when invited by email address (lower case)." },
+            "member": { "type": ["string", "null"], "description": "Set when invited by member name." },
+            "role": { "enum": ["owner", "admin", "editor", "viewer"] },
+            "invited_by": { "type": "string" },
+            "status": { "enum": ["pending", "accepted", "revoked", "expired"] },
+            "created_at": { "type": "string", "format": "date-time" },
+            "expires_at": { "type": "string", "format": "date-time" },
+            "accepted_at": { "type": ["string", "null"], "format": "date-time" },
+            "accepted_member": { "type": ["string", "null"] },
+            "revoked_at": { "type": ["string", "null"], "format": "date-time" },
+            "revoked_by": { "type": ["string", "null"] },
+            "token": { "type": "string", "pattern": "^rli_[0-9a-f]{64}$", "description": "Shown only in this answer; only its SHA-256 is stored." },
+            "url": { "type": "string", "description": "The one-time link to send to the person invited." }
+        }
+      },
+      "InvitationList": {
+        "type": "object",
+        "required": ["invitations"],
+        "properties": { "invitations": { "type": "array", "items": { "$ref": "#/components/schemas/Invitation" } } }
+      },
+      "InvitePreview": {
+        "type": "object",
+        "required": ["workspace_id", "workspace_name", "role", "invited_by", "email", "member", "expires_at"],
+        "properties": {
+          "workspace_id": { "type": "integer" },
+          "workspace_name": { "type": "string" },
+          "role": { "enum": ["owner", "admin", "editor", "viewer"] },
+          "invited_by": { "type": "string" },
+          "email": { "type": ["string", "null"] },
+          "member": { "type": ["string", "null"] },
+          "expires_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Joined": {
+        "type": "object",
+        "required": ["workspace_id", "workspace_name", "role"],
+        "properties": {
+          "workspace_id": { "type": "integer" },
+          "workspace_name": { "type": "string" },
+          "role": { "enum": ["owner", "admin", "editor", "viewer"] }
+        }
       },
       "Usage": {
         "type": "object",

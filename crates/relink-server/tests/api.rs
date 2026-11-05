@@ -671,13 +671,23 @@ async fn openapi_matches_the_router_and_responses() {
         }
         let resp = req.send().await.unwrap();
         let status = resp.status().as_u16();
-        if path.starts_with("/v1/auth/") {
+        let session_only =
+            doc["paths"][path.as_str()][method.as_str()]["security"] == json!([{ "session": [] }]);
+        if path.starts_with("/v1/auth/") || session_only {
             // Sign-in is not configured here and an API key is not a
             // session, so these answer with their own errors rather than
-            // the router's; tests/oidc.rs drives them end to end.
+            // the router's; tests/oidc.rs and tests/invitations.rs drive
+            // them end to end.
             let body = resp.json_value().await;
+            // Invitations refuse API keys outright (403); everything else
+            // here wants a session cookie (401) or is not configured (404).
+            let expected: &[u16] = if path.starts_with("/v1/invitations") {
+                &[403]
+            } else {
+                &[401, 404]
+            };
             assert!(
-                matches!(status, 401 | 404),
+                expected.contains(&status),
                 "{method} {path} returned {status}"
             );
             assert_ne!(

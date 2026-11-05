@@ -241,12 +241,16 @@ impl Db {
     /// `alice` at the provider would inherit alice's memberships.
     pub async fn sign_in_user(&self, new: &NewUser<'_>) -> Result<SignedInUser, DbError> {
         let c = new.claims;
+        // Whether the stored address is one the provider vouches for; an
+        // invitation by email is accepted only with a verified address.
+        let email_verified = c.email.is_some() && c.email_verified;
         self.timed(async {
             let mut tx = self.pool().begin().await?;
             // The profile as it was, for the audit log, from the row the
             // update locked.
             let existing = sqlx::query(
-                "UPDATE users u SET email = $3, display_name = $4, last_login_at = now() \
+                "UPDATE users u SET email = $3, display_name = $4, email_verified = $5, \
+                        last_login_at = now() \
                    FROM (SELECT id, email, display_name FROM users \
                           WHERE issuer = $1 AND subject = $2 FOR UPDATE) old \
                   WHERE u.id = old.id \
@@ -256,6 +260,7 @@ impl Db {
             .bind(&c.subject)
             .bind(&c.email)
             .bind(&c.name)
+            .bind(email_verified)
             .fetch_optional(&mut *tx)
             .await?;
             let profile = |email: Option<&str>, name: Option<&str>| {
@@ -293,8 +298,9 @@ impl Db {
                         // same person's first sign-in in another tab just
                         // committed; the latter is picked up below.
                         let id: Option<i64> = sqlx::query_scalar(
-                            "INSERT INTO users (issuer, subject, member, email, display_name) \
-                             SELECT $1, $2, $3, $4, $5 \
+                            "INSERT INTO users (issuer, subject, member, email, display_name, \
+                                                email_verified) \
+                             SELECT $1, $2, $3, $4, $5, $6 \
                               WHERE NOT EXISTS (SELECT 1 FROM workspace_members WHERE member = $3) \
                                 AND NOT EXISTS (SELECT 1 FROM api_keys WHERE owner = $3) \
                                 AND NOT EXISTS (SELECT 1 FROM links WHERE owner = $3) \
@@ -306,6 +312,7 @@ impl Db {
                         .bind(&member)
                         .bind(&c.email)
                         .bind(&c.name)
+                        .bind(email_verified)
                         .fetch_optional(&mut *tx)
                         .await?;
                         if let Some(id) = id {

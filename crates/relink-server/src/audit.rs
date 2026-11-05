@@ -14,7 +14,7 @@
 //! table, with [`Anchor`].
 //!
 //! The log covers changes made by people and operators: links, API keys,
-//! workspaces, sign-ins and sign-outs. Bookkeeping the server does by itself
+//! workspaces, sign-ins and sign-outs, and invitations. Bookkeeping the server does by itself
 //! (click counts, click leases, health results, the KV outbox) is not
 //! logged; it is not anyone's decision and would drown the log.
 
@@ -124,6 +124,9 @@ pub enum Action {
     UserCreate,
     UserSignIn,
     SessionEnd,
+    InvitationCreate,
+    InvitationAccept,
+    InvitationRevoke,
 }
 
 impl Action {
@@ -140,6 +143,9 @@ impl Action {
             Action::UserCreate => "user.create",
             Action::UserSignIn => "user.sign_in",
             Action::SessionEnd => "session.end",
+            Action::InvitationCreate => "invitation.create",
+            Action::InvitationAccept => "invitation.accept",
+            Action::InvitationRevoke => "invitation.revoke",
         }
     }
 }
@@ -799,6 +805,9 @@ mod tests {
             Action::UserCreate,
             Action::UserSignIn,
             Action::SessionEnd,
+            Action::InvitationCreate,
+            Action::InvitationAccept,
+            Action::InvitationRevoke,
         ] {
             let s = a.as_str();
             let (noun, verb) = s.split_once('.').unwrap();

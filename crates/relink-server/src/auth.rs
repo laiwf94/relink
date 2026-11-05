@@ -210,6 +210,12 @@ impl Role {
     }
 }
 
+impl serde::Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -552,6 +558,14 @@ impl Authenticator {
             return Err(AuthError::Busy);
         }
         Ok(())
+    }
+
+    /// Forgets what this instance cached about `member`'s role in
+    /// `workspace_id`, after it changed here (an accepted invitation), so a
+    /// "not a member" remembered from before does not outlive the change.
+    /// Other instances follow within [`AUTH_CACHE_TTL`].
+    pub fn forget_role(&self, member: &str, workspace_id: i64) {
+        self.roles.invalidate(&format!("{member}/{workspace_id}"));
     }
 
     /// Forgets a session that has just been ended here.

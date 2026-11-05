@@ -261,8 +261,9 @@ Every change made by a person or an operator is appended to an audit log
 (`src/audit.rs`, migration 0007) in the same transaction as the change, so
 an entry exists exactly when its change committed: a refused or rolled-back
 change leaves neither. That covers creating, changing and deleting links;
-creating, rotating and revoking keys; creating workspaces; signing in (the
-first sign-in creates the person) and signing out. Bookkeeping the server
+creating, rotating and revoking keys; creating workspaces; creating,
+accepting and revoking invitations; signing in (the first sign-in creates
+the person) and signing out. Bookkeeping the server
 does on its own (click counts, leases, health results, the KV outbox) is
 not logged: nobody decided it, and it would bury the log.
 
@@ -350,6 +351,57 @@ monthly allowance links keep redirecting and keep being counted, and only
 creating new links stops until the month turns. `GET /v1/usage` (scope
 `stats:read`) returns the plan, the link count and the month's clicks, each
 with its limit.
+
+### Invitations
+
+People join a workspace by invitation (`src/invite.rs`, migration 0009). A
+signed-in admin or owner invites by email address or by member name, with a
+role their own role manages (`Role::manages`: admins invite editors and
+viewers, owners anyone) and a lifetime between five minutes and 30 days,
+seven by default. The answer carries a one-time link,
+`/v1/invites/rli_<64 hex>`, shown only then: like an API key, only the
+token's SHA-256 is stored. The request path is logged with the token
+replaced by `{token}`, and neither the token nor its hash is in the audit
+log.
+
+Invitations are managed with a session, never an API key. A key's scopes
+cover links and statistics; letting a read-only dashboard key mint owner
+invitations would make every leaked key a way in. The same reasoning
+applies to acceptance, which needs the session cookie and its CSRF token.
+
+Holding the link is not enough to use it. Accepting requires a signed-in
+person who is the one invited: for an email invitation, an address equal
+(case-insensitively) to the invited one that the provider marked verified at
+their latest sign-in (`users.email_verified`, refreshed at each sign-in);
+for a member-name invitation, exactly that name. A name can only be invited
+if someone already has it, because a name nobody has yet could later be
+taken by whoever signs in first with a matching username. So a forwarded,
+logged or guessed link is useless to anyone else, and the check reads the
+person's row in the accepting transaction, not the cached session.
+
+Acceptance is one transaction as the server's own role: the person is not a
+member yet, and the token is what names the workspace, so it cannot be a
+tenant query (key lookups are the same). It locks the invitation row
+(`FOR UPDATE`), so concurrent acceptances queue and exactly one finds it
+pending; it then inserts the membership, marks the invitation accepted and
+appends `invitation.accept` to the workspace's chain. Someone who is
+already a member gets `already_exists` and the invitation stays pending, so
+a mistaken click does not burn it. The accepting instance drops its cached
+"not a member" for that person and workspace at once; other instances follow
+within the 30 s role cache, the same bound as any role change.
+
+Creating, listing and revoking are tenant queries, so row-level security
+keeps them inside the workspace and an invitation in another workspace is
+`not_found`. `relink_tenant` holds `SELECT`, `INSERT` and `UPDATE` on
+`invitations` but not `DELETE`: revoking stamps `revoked_at` and
+`revoked_by`, and the record stays listed. Only a pending invitation can be
+revoked, by someone whose role manages the invited role. A workspace may
+have at most 100 pending invitations whatever its plan, checked under the
+same workspace row lock as link quotas, so concurrent requests cannot
+overrun it; beyond that is `quota_exceeded`. `GET /v1/invitations` lists
+every pending invitation, then the newest others, 200 in all, with a
+status computed from the database clock: `pending`, `accepted`, `revoked`
+or `expired`.
 
 ## The redirect path on the origin
 

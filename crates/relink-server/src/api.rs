@@ -256,7 +256,8 @@ pub async fn request_context(
         .map_or_else(new_request_id, str::to_owned);
     req.extensions_mut().insert(RequestId(id.clone()));
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
+    // Invitation links carry their token in the path; it is never logged.
+    let path = crate::invite::loggable_path(req.uri().path()).into_owned();
     let is_api = path.starts_with("/v1/") || path == "/v1";
     let mut resp = if is_api {
         let span = tracing::info_span!("request", request_id = %id);
@@ -1050,6 +1051,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/auth/callback"),
     ("get", "/v1/auth/session"),
     ("post", "/v1/auth/logout"),
+    ("post", "/v1/invitations"),
+    ("get", "/v1/invitations"),
+    ("delete", "/v1/invitations/{id}"),
+    ("get", "/v1/invites/{token}"),
+    ("post", "/v1/invites/{token}/accept"),
     ("post", "/v1/edge/clicks"),
 ];
 

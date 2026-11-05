@@ -258,8 +258,9 @@ pub struct Metrics {
     db_errors: [Counter; 8],
     drops: [Counter; 4],
     probes: [Counter; 4],
-    /// Link creations refused for quota, by limit: links, monthly clicks.
-    quotas: [Counter; 2],
+    /// Requests refused for quota, by limit: links, monthly clicks,
+    /// pending invitations.
+    quotas: [Counter; 3],
     pub coalesced: Counter,
     pub lookups_shed: Counter,
     pub clicks_enqueued: Counter,
@@ -426,11 +427,15 @@ impl Metrics {
         family(
             &mut out,
             "relink_quota_exceeded_total",
-            "Link creations refused because the workspace is at a plan limit, by limit.",
+            "Requests refused because the workspace is at a limit, by limit.",
             "limit",
-            [QuotaKind::Links, QuotaKind::MonthlyClicks]
-                .iter()
-                .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
+            [
+                QuotaKind::Links,
+                QuotaKind::MonthlyClicks,
+                QuotaKind::PendingInvitations,
+            ]
+            .iter()
+            .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
         let counters: [(&str, &str, u64); 21] = [
             (
