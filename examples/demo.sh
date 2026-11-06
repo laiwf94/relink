@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Walks through relink end to end: starts Postgres in Docker and a release
 # build of relink, creates links of every kind, follows them with curl, shows
-# stats, then stops Postgres to show redirects still being served from memory
-# while writes fail cleanly, and finally restarts Postgres to show recovery.
+# stats, then workspace isolation, scoped and rotated API keys, a plan limit
+# and the audit chain, then stops Postgres to show redirects still being
+# served from memory while writes fail cleanly, and finally restarts Postgres
+# to show recovery.
 #
 # Needs: docker, cargo, curl, python3. Uses ports 18080, 19090 and 55432 by
 # default (RELINK_DEMO_PORT, RELINK_DEMO_ADMIN_PORT, RELINK_DEMO_PG_PORT).
@@ -108,7 +110,28 @@ print("   pricing-test total_clicks=%d unique_visitors=%d devices=%s" % (
     s["total_clicks"], s["days"][0]["unique_visitors"] if s["days"] else 0,
     {b["value"]: b["clicks"] for b in s["devices"]}))'
 
-echo "== 5. Stop Postgres"
+echo "== 5. Workspaces: scoped keys, isolation, a plan and the audit log"
+WS=$(api GET /v1/usage | field "['workspace_id']")
+echo "   alice's workspace: $WS"
+LINE=$("$BIN" create-key alice dashboard --scopes links:read,stats:read --expires-in 1h)
+RO_ID=$(echo "$LINE" | sed -n 's/^id=\([0-9]*\).*/\1/p')
+RO=$(echo "$LINE" | sed -n 's/.*key=\(rlk_[0-9a-f]*\).*/\1/p')
+ro() { curl -sS -o /dev/null -w '%{http_code}' -X "$1" "$URL$2" -H "Authorization: Bearer $RO" \
+  -H 'Content-Type: application/json' ${3:+-d "$3"}; }
+echo "   read-only key: list links -> HTTP $(ro GET /v1/links), create -> HTTP $(ro POST /v1/links '{"url":"https://example.com/x"}')"
+NEW=$("$BIN" rotate-key "$RO_ID" --overlap 1h | sed -n 's/.*key=\(rlk_[0-9a-f]*\).*/\1/p')
+echo "   rotated: old key -> HTTP $(ro GET /v1/usage), new key -> HTTP $(RO=$NEW ro GET /v1/usage) (1 h overlap)"
+BOB=$("$BIN" create-key bob demo | sed -n 's/.*key=\(rlk_[0-9a-f]*\).*/\1/p')
+echo "   bob's key sees $(curl -sS "$URL/v1/links" -H "Authorization: Bearer $BOB" | field "['links'].__len__()") of alice's links; summer-sale for bob -> HTTP $(KEY=$BOB status GET /v1/links/summer-sale)"
+"$BIN" plan-set demo --links 5 --monthly-clicks 100000 | sed 's/^/   /'
+"$BIN" plan-assign "$WS" demo | sed 's/^/   /'
+echo "   6th link on a 5-link plan -> $(api POST /v1/links '{"url":"https://example.com/six"}' | field "['error']['code']")"
+echo "   usage: $(api GET /v1/usage | python3 -c 'import sys, json; u = json.load(sys.stdin); print("links %d/%s, clicks this month %d" % (u["links"]["used"], u["links"]["limit"], u["clicks"]["used"]))')"
+"$BIN" plan-assign "$WS" unlimited >/dev/null
+echo "   back on the unlimited plan"
+"$BIN" audit-verify --workspace "$WS" | sed 's/^/   audit chain /'
+
+echo "== 6. Stop Postgres"
 docker stop "$PG_NAME" >/dev/null
 echo "   $RANDOM_CODE          -> $(follow "$RANDOM_CODE")   (served from memory)"
 echo "   summer-sale      -> $(follow summer-sale)"
@@ -117,7 +140,7 @@ echo "   create link      -> HTTP $(status POST /v1/links '{"url":"https://examp
 echo "   not cached       -> $(follow never-seen)"
 echo "   readyz           -> $(curl -sS "$URL/readyz")"
 
-echo "== 6. Start Postgres again"
+echo "== 7. Start Postgres again"
 docker start "$PG_NAME" >/dev/null
 for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 0.5; done
 for _ in $(seq 1 40); do [ "$(status POST /v1/links '{"url":"https://example.com/new"}')" = 201 ] && break; sleep 0.5; done

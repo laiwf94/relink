@@ -1,9 +1,17 @@
 # relink
 
-A URL shortener. You create short links through an API; visitors who open
-`/{code}` get redirected. The redirect is answered from memory on the origin
-and can also run as a Cloudflare Worker reading from Workers KV, and it keeps
-working while Postgres is down.
+A URL shortener for teams. You create short links through an API; visitors
+who open `/{code}` get redirected. The redirect is answered from memory on
+the origin and can also run as a Cloudflare Worker reading from Workers KV,
+and it keeps working while Postgres is down.
+
+Links, API keys and statistics belong to workspaces, kept apart by Postgres
+row-level security. People sign in with any OpenID Connect provider and act
+as owner, admin, editor or viewer; they join a workspace by a one-time
+invitation link. API keys carry scopes and an expiry and rotate with an
+overlap. Each workspace is on a plan that limits its links and monthly
+clicks, and every change is written to a hash-chained audit log that
+`relink audit-verify` checks.
 
 ```console
 $ curl -s localhost:8080/v1/links -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
@@ -52,7 +60,7 @@ $ docker run -d --name pg -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16-alpin
 $ export RELINK_DATABASE_URL=postgres://postgres:pg@localhost:5432/postgres
 $ cargo run --release -p relink-server -- create-key alice   # prints id=1 owner=alice ... key=rlk_...
 $ cargo run --release -p relink-server                       # :8080, metrics on 127.0.0.1:9090
-$ ./examples/demo.sh          # the tour, including stopping Postgres mid-way
+$ ./examples/demo.sh          # the tour: links, workspaces, keys, a plan, the audit chain, then Postgres stopped mid-way
 $ ./examples/edge-local.sh    # the Worker under wrangler dev, in front of a local origin
 ```
 
@@ -187,6 +195,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 | Roles and keys | Each route's documented scope is enforced (403 without it, success with only it, before the body is read); viewers cannot write even with an old all-scopes key; removed members' keys stop working; expiry is exact for cached keys; rotation keeps both keys for the overlap and no longer, cannot fork, and narrows scopes to the current role. |
 | Quotas | Against real Postgres: 20 concurrent creations racing for a workspace's last 3 link slots create exactly 3 (and 4 or 5 without the row lock); clicks are metered into the month of their own day and equal the statistics month by month; at the click allowance creation is refused while redirects continue; tenants cannot change their plan or read another workspace's usage; plan moves are audited. |
 | Invitations | Against real Postgres over HTTP: only the person invited joins (a verified address, or the member name); an unverified address, another person or an API key is refused; 20 concurrent acceptances of one link make one member; revoked, expired and used links are refused; admins cannot invite or revoke above their own role; 5 requests racing for the last 2 of 100 pending slots create exactly 2; tenants see only their own invitations and cannot delete any; each step is in the audit chain, which still verifies, and tokens are in neither the log nor the chain. |
+| Workspaces end to end | One test walks week 1 as a team would: three people sign in through a fake OpenID Connect provider; the owner invites one by email as an editor and one by member name as a viewer, and each accepts only their own link, once; the editor creates links in the team workspace, the viewer only reads, and a stranger is refused; scoped, rotated and expiring keys are made with the binary; a plan's link and click limits refuse new links while redirects continue; the tenant role sees no rows in any tenant table without a workspace; every change is attributed in the team's audit chain, which the binary verifies with and without an anchor; signing out ends the session. |
 | Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |
@@ -195,7 +204,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 ```console
 $ docker run -d -e POSTGRES_PASSWORD=postgres -p 5439:5432 postgres:16-alpine
 $ export RELINK_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5439/postgres
-$ cargo test                         # 193 tests; database tests skip if the variable is unset
+$ cargo test                         # 264 tests; database tests skip if the variable is unset
 $ cargo llvm-cov --summary-only      # CI requires 90% of lines
 $ cargo build -p relink-core --target wasm32-unknown-unknown
 $ cargo +nightly fuzz run destination -- -max_total_time=60

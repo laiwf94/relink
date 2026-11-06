@@ -9,7 +9,8 @@ Postgres is down. And a link with a click limit must never be followed more
 times than allowed, on any number of instances, without a database write per
 click.
 
-Out of scope for now: custom domains, a UI, and storage other than Postgres.
+Out of scope for now: custom domains, a web console, and storage other than
+Postgres.
 
 ## Three crates, and why the split is where it is
 
@@ -402,6 +403,34 @@ overrun it; beyond that is `quota_exceeded`. `GET /v1/invitations` lists
 every pending invitation, then the newest others, 200 in all, with a
 status computed from the database clock: `pending`, `accepted`, `revoked`
 or `expired`.
+
+### A management request, start to finish
+
+The pieces above meet on every management request, in this order:
+
+1. **Who.** The `Workspace` extractor authenticates an API key from
+   `Authorization`, or else a session cookie, which must also send
+   `X-CSRF-Token` on anything but a read. Unknown credentials share the
+   per-address budget for guessing.
+2. **Where.** A key acts only in its own workspace; a session acts in the
+   workspace named by `Relink-Workspace`, or the person's personal one. A
+   key that names another workspace, or a person who is not a member, gets
+   `permission_denied`.
+3. **May they.** The route's scope (`Allowed<S>`) must be both on the key
+   and granted by the member's current role, so a demotion narrows old keys
+   too. Refusals happen before the body is read.
+4. **What they see.** The query runs in a tenant transaction as
+   `relink_tenant` with `relink.workspace_id` set, so row-level security,
+   not the handler, decides which rows exist.
+5. **Whether it fits.** Creating a link checks the plan inside that same
+   transaction, under the workspace row lock when a link limit applies.
+6. **The record.** The audit entry is inserted in that transaction too, so
+   a change and its entry commit or roll back together, and a refused
+   request leaves none.
+
+`tests/workspaces.rs` drives all six steps through the real sign-in flow,
+the HTTP API and the binary. Step 5 of `examples/demo.sh` shows them from
+the command line.
 
 ## The redirect path on the origin
 
