@@ -637,9 +637,16 @@ pub(crate) mod tests {
     /// A resolver on loopback: answers over UDP (truncated when `truncate`),
     /// and over TCP in full.
     async fn fake_resolver(truncate: bool) -> SocketAddr {
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = udp.local_addr().unwrap();
-        let tcp = tokio::net::TcpListener::bind(addr).await.unwrap();
+        // The resolver answers both protocols on one port. A free UDP port
+        // may be taken for TCP (by another test's connection), so try
+        // ports until one is free for both.
+        let (udp, addr, tcp) = loop {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = udp.local_addr().unwrap();
+            if let Ok(tcp) = tokio::net::TcpListener::bind(addr).await {
+                break (udp, addr, tcp);
+            }
+        };
         let reply = |q: &[u8], flags: u16| {
             let name = "_relink-challenge.go.example.com";
             answer(q, flags, &[(name, TYPE_TXT, txt(&["over-tcp"]))])
