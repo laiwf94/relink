@@ -260,7 +260,7 @@ pub struct Metrics {
     probes: [Counter; 4],
     /// Requests refused for quota, by limit: links, monthly clicks,
     /// pending invitations.
-    quotas: [Counter; 3],
+    quotas: [Counter; 4],
     pub coalesced: Counter,
     pub lookups_shed: Counter,
     pub clicks_enqueued: Counter,
@@ -432,6 +432,7 @@ impl Metrics {
             [
                 QuotaKind::Links,
                 QuotaKind::MonthlyClicks,
+                QuotaKind::Domains,
                 QuotaKind::PendingInvitations,
             ]
             .iter()

@@ -127,6 +127,9 @@ pub enum Action {
     InvitationCreate,
     InvitationAccept,
     InvitationRevoke,
+    DomainCreate,
+    DomainVerify,
+    DomainDelete,
 }
 
 impl Action {
@@ -146,6 +149,9 @@ impl Action {
             Action::InvitationCreate => "invitation.create",
             Action::InvitationAccept => "invitation.accept",
             Action::InvitationRevoke => "invitation.revoke",
+            Action::DomainCreate => "domain.create",
+            Action::DomainVerify => "domain.verify",
+            Action::DomainDelete => "domain.delete",
         }
     }
 }
@@ -192,6 +198,10 @@ pub fn link_state(link: &StoredLink) -> Value {
     let mut v = serde_json::to_value(&link.link).unwrap_or(Value::Null);
     if let Value::Object(m) = &mut v {
         m.insert("owner".into(), Value::String(link.owner.clone()));
+        // Only links on custom domains say so; the default domain has none.
+        if let Some(d) = link.domain_id {
+            m.insert("domain_id".into(), Value::from(d));
+        }
     }
     v
 }
@@ -808,6 +818,9 @@ mod tests {
             Action::InvitationCreate,
             Action::InvitationAccept,
             Action::InvitationRevoke,
+            Action::DomainCreate,
+            Action::DomainVerify,
+            Action::DomainDelete,
         ] {
             let s = a.as_str();
             let (noun, verb) = s.split_once('.').unwrap();

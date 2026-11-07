@@ -69,6 +69,9 @@ pub struct Config {
     pub addr: SocketAddr,
     pub admin_addr: SocketAddr,
     pub public_base_url: String,
+    /// The host of `public_base_url`, lowercase and without a port: the
+    /// default domain, which no workspace can add as a custom one.
+    pub default_host: String,
     pub code_length: usize,
     pub cookie_key: Option<[u8; 32]>,
     pub cookie_secure: bool,
@@ -103,6 +106,11 @@ pub struct Config {
     /// How long a sign-in session lasts.
     pub session_ttl: Duration,
     pub shutdown_timeout: Duration,
+    /// Recursive resolvers for domain verification lookups; `None` reads
+    /// the system's from /etc/resolv.conf.
+    pub dns_servers: Option<Vec<SocketAddr>>,
+    /// Bound on each resolver's answer.
+    pub dns_timeout: Duration,
 }
 
 impl fmt::Debug for Config {
@@ -113,6 +121,7 @@ impl fmt::Debug for Config {
             .field("addr", &self.addr)
             .field("admin_addr", &self.admin_addr)
             .field("public_base_url", &self.public_base_url)
+            .field("default_host", &self.default_host)
             .field("code_length", &self.code_length)
             .field("cookie_key", &self.cookie_key.map(|_| "<redacted>"))
             .field("cookie_secure", &self.cookie_secure)
@@ -141,6 +150,8 @@ impl fmt::Debug for Config {
             .field("oidc", &self.oidc)
             .field("session_ttl", &self.session_ttl)
             .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("dns_servers", &self.dns_servers)
+            .field("dns_timeout", &self.dns_timeout)
             .finish()
     }
 }
@@ -228,6 +239,29 @@ impl Config {
         if !(public_base_url.starts_with("http://") || public_base_url.starts_with("https://")) {
             return Err("RELINK_PUBLIC_BASE_URL must start with http:// or https://".into());
         }
+        let default_host = url::Url::parse(&public_base_url)
+            .ok()
+            .and_then(|u| {
+                u.host_str()
+                    .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+            })
+            .filter(|h| !h.is_empty())
+            .ok_or("RELINK_PUBLIC_BASE_URL must name a host")?;
+        let dns_servers = match v.raw("RELINK_DNS_SERVERS") {
+            None => None,
+            Some(list) => Some(
+                list.split(',')
+                    .map(|s| {
+                        crate::dns::parse_server(s).ok_or_else(|| {
+                            format!(
+                                "RELINK_DNS_SERVERS: {:?} is not an IP address or ip:port",
+                                s.trim()
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
         let cookie_key = match v.raw("RELINK_COOKIE_KEY") {
             None => None,
             Some(hex) => {
@@ -336,6 +370,7 @@ impl Config {
             addr: v.addr("RELINK_ADDR", "0.0.0.0:8080")?,
             admin_addr: v.addr("RELINK_ADMIN_ADDR", "127.0.0.1:9090")?,
             public_base_url,
+            default_host,
             code_length: v.parse("RELINK_CODE_LENGTH", 7, MIN_CODE_LEN, MAX_CODE_LEN)?,
             cookie_key,
             cookie_secure: v.bool("RELINK_COOKIE_SECURE", true)?,
@@ -414,6 +449,8 @@ impl Config {
                 1,
                 300,
             )?),
+            dns_servers,
+            dns_timeout: v.millis("RELINK_DNS_TIMEOUT_MS", 2_000, 50, 30_000)?,
         };
         if (cfg.country_header.is_some() || cfg.client_ip_header.is_some())
             && cfg.trusted_proxies.is_empty()
@@ -461,6 +498,23 @@ mod tests {
         assert!(!dbg.contains("postgres://"), "secrets must not be printed");
         assert!(c.oidc.is_none());
         assert_eq!(c.session_ttl, Duration::from_secs(43_200));
+        assert_eq!(c.default_host, "localhost");
+        assert_eq!(c.dns_servers, None);
+        assert_eq!(c.dns_timeout, Duration::from_secs(2));
+        let c = from(&[
+            ("RELINK_DATABASE_URL", "postgres://x/y"),
+            ("RELINK_PUBLIC_BASE_URL", "https://Go.Example.com:8443"),
+            ("RELINK_DNS_SERVERS", "1.1.1.1, 127.0.0.1:5353"),
+        ])
+        .unwrap();
+        assert_eq!(c.default_host, "go.example.com");
+        assert_eq!(
+            c.dns_servers,
+            Some(vec![
+                "1.1.1.1:53".parse().unwrap(),
+                "127.0.0.1:5353".parse().unwrap()
+            ])
+        );
     }
 
     #[test]
@@ -549,6 +603,7 @@ mod tests {
         );
         assert!(c.destination_policy.allow_private);
         assert_eq!(c.public_base_url, "https://s.example.com");
+        assert_eq!(c.default_host, "s.example.com");
         assert_eq!(c.health.per_host_rps, 0.5);
     }
 
@@ -567,6 +622,9 @@ mod tests {
             vec![base, ("RELINK_TRUSTED_PROXIES", "10.0.0.0/99")],
             vec![base, ("RELINK_PUBLIC_BASE_URL", "ftp://x")],
             vec![base, ("RELINK_DB_TIMEOUT_MS", "1")],
+            vec![base, ("RELINK_DNS_SERVERS", "1.1.1.1,dns.example.com")],
+            vec![base, ("RELINK_DNS_TIMEOUT_MS", "10")],
+            vec![base, ("RELINK_PUBLIC_BASE_URL", "http://")],
         ] {
             assert!(from(&bad).is_err(), "{bad:?}");
         }

@@ -22,6 +22,8 @@ use crate::auth::{Authenticator, Credential, LookupLimits};
 use crate::cache::Cache;
 use crate::clicks::{ClickEvent, ClickQueue, ClickSink, Flusher};
 use crate::config::Config;
+use crate::dns::{DnsClient, parse_resolv_conf};
+use crate::domains::{self, DomainMap};
 use crate::health::HealthWorker;
 use crate::invite;
 use crate::kvsync::{CloudflareKv, KvSync};
@@ -32,7 +34,7 @@ use crate::ratelimit::{KeyedLimiter, Rate};
 use crate::redirect;
 use crate::resolver::{LinkSource, Resolver};
 use crate::session;
-use crate::store::{CHANGES_CHANNEL, Db, DbConfig, parse_change};
+use crate::store::{CHANGES_CHANNEL, DOMAINS_CHANGED, Db, DbConfig, parse_change};
 use crate::util::{now_ms, secure_random, stopped, utc_day};
 
 /// State shared by every request and background task.
@@ -55,6 +57,10 @@ pub struct App {
     pub cache_control: HeaderValue,
     /// OpenID Connect sign-in, when configured.
     pub oidc: Option<Arc<Oidc>>,
+    /// Verified custom domains, for routing redirects by `Host`.
+    pub domains: DomainMap,
+    /// TXT lookups for domain verification.
+    pub dns: DnsClient,
 }
 
 /// Credentials tracked by the API rate limiter (one bucket per key or person).
@@ -104,6 +110,15 @@ impl App {
             oidc: cfg.oidc.clone().map(|c| {
                 Arc::new(Oidc::new(c).expect("OIDC settings are validated with the configuration"))
             }),
+            domains: DomainMap::default(),
+            dns: DnsClient::new(
+                cfg.dns_servers.clone().unwrap_or_else(|| {
+                    parse_resolv_conf(
+                        &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
+                    )
+                }),
+                cfg.dns_timeout,
+            ),
             shutting_down: AtomicBool::new(false),
             change_feed: AtomicBool::new(false),
             kv_wake: Arc::new(Notify::new()),
@@ -128,9 +143,10 @@ impl App {
         }
     }
 
-    /// Applies a change notification (or a local change) for a link.
-    pub async fn link_changed(&self, id: i64, code: &str) {
-        self.resolver.invalidate(code);
+    /// Applies a change notification (or a local change) for a link, by
+    /// its [`crate::store::link_key`].
+    pub async fn link_changed(&self, id: i64, key: &str) {
+        self.resolver.invalidate(key);
         self.limiter.invalidate(id).await;
         self.kv_wake.notify_one();
     }
@@ -148,6 +164,18 @@ pub fn public_router(app: Arc<App>) -> Router {
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
         .route("/v1/usage", get(api::usage))
+        .route(
+            "/v1/domains",
+            get(domains::list_domains).post(domains::create_domain),
+        )
+        .route(
+            "/v1/domains/{hostname}",
+            get(domains::get_domain).delete(domains::delete_domain),
+        )
+        .route(
+            "/v1/domains/{hostname}/verify",
+            post(domains::verify_domain),
+        )
         .route("/v1/auth/login", get(oidc::login))
         .route("/v1/auth/callback", get(oidc::callback))
         .route("/v1/auth/session", get(session::get_session))
@@ -280,6 +308,18 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
     let source: Arc<dyn LinkSource> = Arc::new(db.clone());
     let leases: Arc<dyn LeaseStore> = Arc::new(db.clone());
     let (app, rx) = App::new(cfg.clone(), db.clone(), source, leases, metrics.clone());
+    if app.dns.servers().is_empty() {
+        tracing::warn!(
+            "no DNS resolver found in /etc/resolv.conf and RELINK_DNS_SERVERS is not set: \
+             custom domains cannot be verified"
+        );
+    }
+    // Route custom domains from the first request. If the database is not
+    // there yet, requests for other hosts get 503 until the change listener
+    // connects and loads them.
+    if let Err(e) = app.reload_domains().await {
+        tracing::warn!(error = %e, "could not load verified domains yet");
+    }
 
     let public = TcpListener::bind(cfg.addr)
         .await
@@ -428,14 +468,18 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         wait = Duration::from_millis(200);
         app.resolver.cache().bump_epoch();
         app.limiter.forget_exhausted();
+        // Domain changes may have been missed too.
+        domains::spawn_reload(app.clone());
         app.change_feed.store(true, Ordering::Release);
         tracing::info!("listening for link changes");
         loop {
             tokio::select! {
                 msg = listener.try_recv() => match msg {
                     Ok(Some(n)) => {
-                        if let Some((id, code)) = parse_change(n.payload()) {
-                            app.link_changed(id, code).await;
+                        if n.payload() == DOMAINS_CHANGED {
+                            domains::spawn_reload(app.clone());
+                        } else if let Some((id, key)) = parse_change(n.payload()) {
+                            app.link_changed(id, key).await;
                         }
                     }
                     Ok(None) | Err(_) => {
@@ -452,7 +496,8 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
 }
 
 /// Periodic housekeeping: visitor-hash roll-up and salt deletion, expired
-/// sessions and sign-ins, idle lease return, rate limiter cleanup.
+/// sessions and sign-ins, idle lease return, rate limiter cleanup, and a
+/// reload of the verified domains in case a notification was lost.
 async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -468,6 +513,10 @@ async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         if let Err(e) = app.db.purge_expired_sessions().await {
             app.metrics.db_error(DbOp::Maintenance);
             tracing::warn!(error = %e, "session clean-up failed");
+        }
+        if let Err(e) = app.reload_domains().await {
+            app.metrics.db_error(DbOp::Maintenance);
+            tracing::warn!(error = %e, "could not reload verified domains");
         }
         app.limiter.sweep(Instant::now()).await;
         app.api_limiter.sweep(Instant::now());

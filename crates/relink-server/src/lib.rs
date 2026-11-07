@@ -5,7 +5,8 @@
 //! analytics pipeline; [`api`], [`auth`] and [`ratelimit`] are the management
 //! API, and [`tenant`] scopes each of its requests to one workspace;
 //! [`audit`] records every change in a hash chain per workspace, and
-//! [`quota`] holds plans, limits and usage;
+//! [`quota`] holds plans, limits and usage; [`domains`] adds custom
+//! domains, verified through [`dns`], and routes redirects by `Host`;
 //! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
 //! decides which forwarding headers to believe; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
@@ -21,6 +22,8 @@ pub mod cli;
 pub mod clicks;
 pub mod code;
 pub mod config;
+pub mod dns;
+pub mod domains;
 pub mod health;
 pub mod invite;
 pub mod kvsync;

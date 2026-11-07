@@ -652,18 +652,34 @@ async fn openapi_matches_the_router_and_responses() {
     // paths 404 with a JSON body).
     let link = h.create(json!({"url": "https://example.com/"})).await;
     let code = link["code"].as_str().unwrap();
+    let (status, domain) = h
+        .api(
+            Method::POST,
+            "/v1/domains",
+            &h.alice,
+            Some(json!({"hostname": "go.relink-docs.net"})),
+        )
+        .await;
+    assert_eq!(status, 201, "{domain}");
     // Deletion last, so the other routes still find the link.
     let mut ordered: Vec<&(String, String)> = routes.iter().collect();
     ordered.sort_by_key(|(m, _)| m == "delete");
     for (method, path) in ordered {
-        let url = format!("{}{}", h.base, path.replace("{code}", code));
+        let url = format!(
+            "{}{}",
+            h.base,
+            path.replace("{code}", code)
+                .replace("{hostname}", "go.relink-docs.net")
+        );
         let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
         let edge = path.starts_with("/v1/edge/");
         let key = if edge { EDGE_TOKEN } else { h.alice.as_str() };
         let mut req = h.http.request(m, url).bearer_auth(key);
-        if method == "post" || method == "patch" {
+        if (method == "post" || method == "patch") && !path.ends_with("/verify") {
             let body = if edge {
                 r#"{"clicks":[]}"#
+            } else if path == "/v1/domains" {
+                r#"{"hostname":"other.relink-docs.net"}"#
             } else {
                 r#"{"enabled":true,"url":"https://example.com/"}"#
             };
@@ -730,10 +746,15 @@ async fn openapi_matches_the_router_and_responses() {
     let (_, usage) = h.api(Method::GET, "/v1/usage", &h.alice, None).await;
     let keys: BTreeSet<String> = usage.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("Usage"));
-    for meter in ["links", "clicks"] {
+    for meter in ["links", "clicks", "domains"] {
         let keys: BTreeSet<String> = usage[meter].as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, schema_keys("Meter"));
     }
+    let keys: BTreeSet<String> = domain.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("Domain"));
+    let (_, list) = h.api(Method::GET, "/v1/domains", &h.alice, None).await;
+    let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("DomainList"));
     let (_, err) = h.api(Method::GET, "/v1/links/nope", &h.alice, None).await;
     let keys: BTreeSet<String> = err["error"].as_object().unwrap().keys().cloned().collect();
     assert_eq!(

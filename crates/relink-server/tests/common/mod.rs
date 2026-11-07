@@ -203,6 +203,10 @@ pub fn config(database_url: &str, extra: &[(&str, &str)]) -> Config {
         ("RELINK_API_RATE", "1000"),
         ("RELINK_API_BURST", "1000"),
         ("RELINK_SHUTDOWN_TIMEOUT_S", "5"),
+        // Domain verification never leaves the machine: nothing listens
+        // here, so lookups fail at once. Tests that verify domains run a
+        // FakeDns and point RELINK_DNS_SERVERS at it.
+        ("RELINK_DNS_SERVERS", "127.0.0.1:1"),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -425,5 +429,100 @@ pub fn new_link_for(owner: &str, alias: &str) -> relink_server::store::NewLink {
         fallback_url: None,
         enabled: true,
         health_check: false,
+        domain: None,
     }
+}
+
+/// A recursive resolver on loopback that answers TXT questions from a
+/// table the test edits: names it does not know get NXDOMAIN. UDP only,
+/// which is all relink needs for answers this small.
+pub struct FakeDns {
+    pub addr: SocketAddr,
+    records: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    task: JoinHandle<()>,
+}
+
+impl FakeDns {
+    pub async fn start() -> FakeDns {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let records: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::default();
+        let table = records.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let answer = fake_answer(&buf[..n], &table.lock().unwrap());
+                if let Some(answer) = answer {
+                    let _ = sock.send_to(&answer, from).await;
+                }
+            }
+        });
+        FakeDns {
+            addr,
+            records,
+            task,
+        }
+    }
+
+    /// Sets the TXT records of `name` (an empty list removes it).
+    pub fn set_txt(&self, name: &str, texts: &[&str]) {
+        let mut r = self.records.lock().unwrap();
+        if texts.is_empty() {
+            r.remove(name);
+        } else {
+            r.insert(
+                name.to_owned(),
+                texts.iter().map(|t| t.to_string()).collect(),
+            );
+        }
+    }
+}
+
+impl Drop for FakeDns {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Answers a one-question query from `table`.
+fn fake_answer(query: &[u8], table: &HashMap<String, Vec<String>>) -> Option<Vec<u8>> {
+    if query.len() < 17 {
+        return None;
+    }
+    let mut labels = Vec::new();
+    let mut pos = 12;
+    loop {
+        let len = *query.get(pos)? as usize;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(query.get(pos..pos + len)?).to_lowercase());
+        pos += len;
+    }
+    let question_end = pos + 4;
+    let name = labels.join(".");
+    let texts = table.get(&name);
+    let mut out = query[..2].to_vec();
+    let rcode = if texts.is_some() { 0 } else { 3 };
+    out.extend_from_slice(&[0x81, 0x80 | rcode, 0, 1]);
+    out.extend_from_slice(&(texts.map_or(0, Vec::len) as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(query.get(12..question_end)?);
+    for t in texts.into_iter().flatten() {
+        // The owner as a pointer to the question's name.
+        out.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 1, 44]);
+        let bytes = t.as_bytes();
+        let mut rdata = Vec::new();
+        for chunk in bytes.chunks(255) {
+            rdata.push(chunk.len() as u8);
+            rdata.extend_from_slice(chunk);
+        }
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(&rdata);
+    }
+    Some(out)
 }

@@ -143,25 +143,52 @@ workspace at a limit gets `quota_exceeded` when it creates a link; its
 existing links keep redirecting and counting:
 
 ```console
-$ relink plan-set free --links 1000 --monthly-clicks 50000
-plan=free links=1000 monthly_clicks=50000
+$ relink plan-set free --links 1000 --monthly-clicks 50000 --domains 1
+plan=free links=1000 monthly_clicks=50000 domains=1
 $ relink plan-assign 3 free
-workspace=3 plan=free links=1000 monthly_clicks=50000 previous=unlimited
+workspace=3 plan=free links=1000 monthly_clicks=50000 domains=1 previous=unlimited
 $ curl -s localhost:8080/v1/usage -H "Authorization: Bearer $KEY"
 {"workspace_id":3,"plan":"free","period_start":"2026-11-01","period_end":"2026-12-01",
- "links":{"used":12,"limit":1000},"clicks":{"used":4210,"limit":50000}}
+ "links":{"used":12,"limit":1000},"clicks":{"used":4210,"limit":50000},
+ "domains":{"used":1,"limit":1}}
+```
+
+A workspace can serve links on its own domain. An admin or owner adds the
+hostname, publishes the TXT record relink gives back, and asks relink to
+check it; the first workspace to prove a hostname gets it. Links created
+with `"domain"` live on it, where codes need only be unique on that domain,
+and visitors are routed by the `Host` header (point the domain's DNS at
+relink or at the proxy in front of it). Any other host serves the default
+domain from `RELINK_PUBLIC_BASE_URL`:
+
+```console
+$ curl -s localhost:8080/v1/domains -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' -d '{"hostname": "go.example.com"}'
+{"hostname":"go.example.com","verified":false,"verification":{"type":"TXT",
+ "name":"_relink-challenge.go.example.com","value":"relink-domain-verification=4be1..."},...}
+$ curl -s -X POST localhost:8080/v1/domains/go.example.com/verify -H "Authorization: Bearer $KEY"
+{"hostname":"go.example.com","verified":true,"verified_at":"2026-11-07T09:12:44Z",...}
+$ curl -s localhost:8080/v1/links -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+    -d '{"url": "https://example.com/spring", "alias": "spring", "domain": "go.example.com"}'
+{"code":"spring","domain":"go.example.com","short_url":"http://go.example.com/spring",...}
+$ curl -si localhost:8080/spring -H 'Host: go.example.com' | grep -i ^location
+location: https://example.com/spring
 ```
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /{code}` | Redirect. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
-| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`. |
+| `GET /{code}` | Redirect, on the domain named by `Host`. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
+| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`. |
 | `GET /v1/links?limit=&cursor=` | Your links, newest first. |
-| `GET /v1/links/{code}` | One link, with per-destination health. |
-| `PATCH /v1/links/{code}` | Change fields; `null` clears optional ones. |
-| `DELETE /v1/links/{code}` | Delete the link and its statistics. |
-| `GET /v1/links/{code}/stats?from=&to=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
-| `GET /v1/usage` | The workspace's plan, link count and clicks this month, with their limits. |
+| `GET /v1/links/{code}?domain=` | One link, with per-destination health; `domain` for a link on a custom domain. |
+| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. |
+| `DELETE /v1/links/{code}?domain=` | Delete the link and its statistics. |
+| `GET /v1/links/{code}/stats?from=&to=&domain=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
+| `GET /v1/usage` | The workspace's plan, link and domain counts and clicks this month, with their limits. |
+| `POST /v1/domains` | Add a custom domain by `hostname`; answers with the TXT record that proves it. Admins and owners. |
+| `GET /v1/domains`, `GET /v1/domains/{hostname}` | The workspace's domains and their verification state. |
+| `POST /v1/domains/{hostname}/verify` | Look the TXT record up now; verified, or `check_error` says what was found. |
+| `DELETE /v1/domains/{hostname}` | Delete a domain that has no links left. |
 | `GET /v1/auth/login?return_to=` | Sign in with the OpenID Connect provider (authorization code with PKCE). Absent unless `RELINK_OIDC_ISSUER` is set. |
 | `GET /v1/auth/callback` | The provider's redirect back; starts a session cookie. |
 | `GET /v1/auth/session` | Who is signed in, the session's CSRF token, and their workspaces and roles. |
@@ -178,7 +205,8 @@ $ curl -s localhost:8080/v1/usage -H "Authorization: Bearer $KEY"
 Errors are `{"error":{"code":"invalid_argument","message":"...","request_id":"..."}}`.
 The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 403, `quota_exceeded` 403, `not_found` 404,
-`method_not_allowed` 405, `already_exists` 409, `payload_too_large` 413,
+`method_not_allowed` 405, `already_exists` 409, `failed_precondition` 409,
+`payload_too_large` 413,
 `unsupported_media_type` 415, `resource_exhausted` 429, `internal` 500 and
 `unavailable` 503. Another owner's link answers `not_found`.
 
@@ -196,6 +224,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 | Quotas | Against real Postgres: 20 concurrent creations racing for a workspace's last 3 link slots create exactly 3 (and 4 or 5 without the row lock); clicks are metered into the month of their own day and equal the statistics month by month; at the click allowance creation is refused while redirects continue; tenants cannot change their plan or read another workspace's usage; plan moves are audited. |
 | Invitations | Against real Postgres over HTTP: only the person invited joins (a verified address, or the member name); an unverified address, another person or an API key is refused; 20 concurrent acceptances of one link make one member; revoked, expired and used links are refused; admins cannot invite or revoke above their own role; 5 requests racing for the last 2 of 100 pending slots create exactly 2; tenants see only their own invitations and cannot delete any; each step is in the audit chain, which still verifies, and tokens are in neither the log nor the chain. |
 | Workspaces end to end | One test walks week 1 as a team would: three people sign in through a fake OpenID Connect provider; the owner invites one by email as an editor and one by member name as a viewer, and each accepts only their own link, once; the editor creates links in the team workspace, the viewer only reads, and a stranger is refused; scoped, rotated and expiring keys are made with the binary; a plan's link and click limits refuse new links while redirects continue; the tenant role sees no rows in any tenant table without a workspace; every change is attributed in the team's audit chain, which the binary verifies with and without an anchor; signing out ends the session. |
+| Custom domains | Against real Postgres over HTTP with a local DNS resolver: a domain verifies only with its own token published, and only the first workspace to prove a hostname gets it; the same code on the default and a custom domain are two links, routed by `Host` on two instances, including after an update; unknown hosts keep the default domain; a domain with links cannot be deleted, and once deleted both instances stop routing it; 12 concurrent adds against a 3-domain plan with one domain taken create exactly 2; editors and viewers cannot manage domains; the database refuses a link on another workspace's domain. The DNS client is tested against crafted answers (compression, CNAME chains, truncation, NXDOMAIN, forged IDs, random bytes) and a resolver that answers over UDP and TCP. |
 | Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |
@@ -204,7 +233,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 ```console
 $ docker run -d -e POSTGRES_PASSWORD=postgres -p 5439:5432 postgres:16-alpine
 $ export RELINK_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5439/postgres
-$ cargo test                         # 264 tests; database tests skip if the variable is unset
+$ cargo test                         # 284 tests; database tests skip if the variable is unset
 $ cargo llvm-cov --summary-only      # CI requires 90% of lines
 $ cargo build -p relink-core --target wasm32-unknown-unknown
 $ cargo +nightly fuzz run destination -- -max_total_time=60

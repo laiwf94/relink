@@ -9,8 +9,7 @@ Postgres is down. And a link with a click limit must never be followed more
 times than allowed, on any number of instances, without a database write per
 click.
 
-Out of scope for now: custom domains, a web console, and storage other than
-Postgres.
+Out of scope for now: a web console, and storage other than Postgres.
 
 ## Three crates, and why the split is where it is
 
@@ -43,7 +42,8 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 |---|---|
 | `workspaces` | The tenant boundary: name, and `personal_owner` for the workspace each API key owner gets implicitly. |
 | `workspace_members` | Member, workspace and role (`owner`, `admin`, `editor` or `viewer`). |
-| `links` | Code, workspace, owner (its creator), destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
+| `links` | Code, workspace, custom domain (none for the default domain), owner (its creator), destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
+| `domains` | Custom domains: workspace, hostname, verification token, who added it, when it was verified, and the outcome of the last check. |
 | `api_keys` | Workspace, owner, name, SHA-256 of the key, scopes, expiry, the key that replaced it on rotation, revocation time. |
 | `click_daily` | Click counts per link, UTC day, country, device class and referrer host. |
 | `visitor_daily` | Visitor hashes for unique counts, today and yesterday only. |
@@ -63,7 +63,9 @@ read, so a hand-edited row produces an error instead of a panic.
 
 | Index | Query it serves |
 |---|---|
-| `links (code)` unique | Redirect lookups by code, and alias conflicts as a constraint violation rather than a race. |
+| `links (COALESCE(domain_id, 0), code)` unique | Redirect lookups by domain and code, alias conflicts per domain as a constraint violation rather than a race, and the KV reconciliation's walk of default-domain codes. |
+| `domains (hostname) WHERE verified_at IS NOT NULL` unique | Only one workspace can prove a hostname; loading the verified hostnames for routing. |
+| `domains (workspace_id, hostname)` unique | A workspace adds a hostname once; finding one by hostname. |
 | `links (owner, id DESC)` | Keyset pagination `WHERE owner = $1 AND id < $cursor ORDER BY id DESC`; each page is a range scan whatever its depth. |
 | `links (health_checked_at NULLS FIRST) WHERE health_check AND enabled` | The health worker's "next due"; links without checks cost nothing. |
 | `api_keys (key_hash)` unique | One probe per uncached key. |
@@ -110,8 +112,9 @@ from the key's own. Every query the API runs lives on `Tenant`
 Those queries filter only by code or cursor: the workspace comes from the
 policies alone, so a link in another workspace is "not found" exactly like a
 code that does not exist, and links belong to the workspace, not to the key
-owner who created them (`links.owner` records the creator). Codes stay
-globally unique, because the short URL carries no workspace. Statistics read
+owner who created them (`links.owner` records the creator). Codes are
+unique per domain: the short URL carries no workspace, but it does carry
+its host ("Custom domains" below). Statistics read
 the link and its four aggregates in one transaction, so all parts come from
 one snapshot. A read that was one round trip is now three (`BEGIN` with the
 scoping, the query, `COMMIT`); the API is not latency-critical the way
@@ -314,8 +317,8 @@ with `--anchors`, detects that too, back to the oldest anchor.
 ### Plans and quotas
 
 A plan (`src/quota.rs`, migration 0008) is a named row of limits: how many
-links a workspace may hold and how many clicks it may receive in a calendar
-month, UTC. A missing limit is no limit. Every workspace is on one plan; the
+links and custom domains a workspace may hold and how many clicks it may
+receive in a calendar month, UTC. A missing limit is no limit. Every workspace is on one plan; the
 seeded `unlimited` plan is the default, so a self-hosted install behaves as
 before until an operator defines plans with `relink plan-set` and moves
 workspaces with `relink plan-assign`, which is recorded in the workspace's
@@ -350,8 +353,14 @@ Quotas never refuse a redirect. A printed QR code or a link in a sent email
 must keep working when its workspace runs out of clicks, so over the
 monthly allowance links keep redirecting and keep being counted, and only
 creating new links stops until the month turns. `GET /v1/usage` (scope
-`stats:read`) returns the plan, the link count and the month's clicks, each
-with its limit.
+`stats:read`) returns the plan, the link and domain counts and the month's
+clicks, each with its limit.
+
+The domain limit (migration 0010) is checked when a domain is added, under
+the same workspace row lock, so concurrent adds cannot overrun it either;
+unverified domains count, since each one is a pending claim. Whatever the
+plan, a workspace holds at most 1,000 domains, so listing them is always
+one bounded answer.
 
 ### Invitations
 
@@ -403,6 +412,72 @@ overrun it; beyond that is `quota_exceeded`. `GET /v1/invitations` lists
 every pending invitation, then the newest others, 200 in all, with a
 status computed from the database clock: `pending`, `accepted`, `revoked`
 or `expired`.
+
+### Custom domains
+
+A workspace can serve links on its own hostnames (`src/domains.rs`,
+migration 0010). `POST /v1/domains` adds a hostname, unverified, with a
+random 128-bit token; the workspace publishes it as a TXT record
+`relink-domain-verification=<token>` at `_relink-challenge.<hostname>`, and
+`POST /v1/domains/{hostname}/verify` checks for it. Adding, verifying and
+deleting need `links:write` and the admin or owner role (reading needs
+`links:read`), and each lands in the audit chain as `domain.create`,
+`domain.verify` or `domain.delete`.
+
+A hostname is stored lowercase with IDNA applied and no final dot, and
+must pass the public-host rules destinations follow (no IP addresses,
+single labels, `localhost`, `.internal` and the like) and be letters,
+digits and hyphens; the server's own host is refused. Many workspaces may
+claim the same hostname, but a unique index over verified hostnames lets
+only the first to prove it have it. A claim that cannot be proved
+therefore blocks nobody, which matters because anyone can type anyone's
+domain into the form.
+
+The lookup speaks DNS itself (`src/dns.rs`): the operating system's
+resolver only answers address queries. One question over UDP to the
+resolvers in `RELINK_DNS_SERVERS` (or `/etc/resolv.conf`), retried over
+TCP when truncated, with a random query ID, a connected socket and the
+question checked in the answer, and CNAME chains followed only within the
+answer. relink never connects to the domain being verified, and the name
+it asks about has already passed the public-host rules, so verification
+cannot be aimed at an internal service. Each verify request costs one
+query, limited by the per-key API rate. A failed check stores what was
+found (no record, records of another kind, another token, a resolver
+error) and answers 200 with the domain, so a console can show why.
+
+Codes are unique per domain: a unique index on `(COALESCE(domain_id, 0),
+code)`, with 0 for the default domain, so `promo` on the default domain and
+`promo` on `go.example.com` are two links. A link's domain must belong to
+its workspace, which a foreign key on `(workspace_id, domain_id)` enforces
+even against the table owner, and must be verified when the link is
+created. A domain with links cannot be deleted (`failed_precondition`):
+their short URLs are printed and sent, and deleting the domain would break
+them silently. The API addresses a link on a domain with `?domain=` on
+`/v1/links/{code}` and its statistics; links carry `domain` and a
+`short_url` on it.
+
+Redirects are routed by `Host`. Every instance keeps the verified
+hostnames in memory, in 16 shards behind reader-writer locks, loaded at
+start, whenever a `domains` change notification arrives (sent in the
+verifying or deleting transaction), whenever the change listener
+reconnects and once a minute. A request whose host is a verified domain
+looks its code up there and nowhere else; any other host, including the
+one in `RELINK_PUBLIC_BASE_URL`, is the default domain, exactly as before
+custom domains existed. The default host is compared first without
+allocating, and with no verified domains the map is not touched at all,
+so the default domain's hot path is unchanged. The cache key of a link on
+a domain is `<domain id>/<code>`, so the two never collide in the cache,
+the single flight or change notifications. Lookups run as
+`relink_redirect` through `relink_link_by_domain_code(domain, code)`, as
+narrow as the default-domain function, which now matches only links
+without a domain. Until the first load succeeds, a request for a host that
+could be a custom domain gets 503: serving the default domain's link of
+the same code could send a visitor somewhere the domain's owner never
+chose. IP addresses and single-label hosts can never be one, so they are
+always the default domain.
+
+The edge serves the default domain only for now: links on custom domains
+are not published to KV, so the KV records keyed by code stay unambiguous.
 
 ### A management request, start to finish
 
@@ -742,6 +817,8 @@ and counts the clicks it could not write.
 | KV API failing | Changes wait in the outbox and are retried with backoff; the edge serves the last records it has. |
 | KV missing a record | The edge forwards to the origin. |
 | Worker isolate evicted | Up to 50 unsent edge clicks are lost. |
+| Verified domains not loaded | Possible only when Postgres went away between migrations and start; requests whose host could be a custom domain get 503 until the change listener connects and loads them. |
+| DNS resolver down | Verification answers 200 with the resolver error in `check_error`; verified domains are unaffected. |
 | Health target hangs | 5 s timeout, counted as a failure. |
 
 ## Limits
@@ -767,7 +844,9 @@ and counts the clicks it could not write.
 | API rate | 10/s, burst 20, per key and instance |
 | KV outbox retry | 1 s doubling to 10 min |
 | Edge click batch | 50 clicks or 5 s |
-| Plan limits | 0 to 10¹⁵ links and monthly clicks, or unlimited (the default plan) |
+| Plan limits | 0 to 10¹⁵ links, domains and monthly clicks, or unlimited (the default plan) |
+| Custom domains | 1,000 per workspace whatever the plan; hostnames up to 253 characters |
+| DNS answer | 2 s per resolver (`RELINK_DNS_TIMEOUT_MS`); 4 KiB over UDP, 64 KiB over TCP |
 
 ## Observability
 

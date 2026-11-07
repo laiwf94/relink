@@ -1,6 +1,7 @@
-//! Plans and quotas: how many links a workspace may hold and how many clicks
-//! it may receive in a calendar month (UTC), what it has used, and the
-//! operator commands that define plans and move workspaces between them.
+//! Plans and quotas: how many links and custom domains a workspace may hold
+//! and how many clicks it may receive in a calendar month (UTC), what it has
+//! used, and the operator commands that define plans and move workspaces
+//! between them.
 //!
 //! A plan is a named set of limits in the `plans` table (migration 0008);
 //! `None` means no limit, and every workspace starts on `unlimited`.
@@ -12,7 +13,8 @@
 //! the statistics show.
 //!
 //! Limits are checked when a link is created, inside the creating
-//! transaction ([`admit_new_link`]). A workspace at its link limit, or one
+//! transaction ([`admit_new_link`]), and the domain limit when a domain is
+//! added ([`admit_new_domain`]). A workspace at its link limit, or one
 //! that has used its month's clicks, gets [`QuotaExceeded`], which the API
 //! answers with the stable code `quota_exceeded`. Redirects are never
 //! refused for quota: links already handed out keep working, and their
@@ -44,6 +46,8 @@ pub const DEFAULT_PLAN: &str = "unlimited";
 pub struct Limits {
     pub max_links: Option<i64>,
     pub monthly_clicks: Option<i64>,
+    /// Custom domains, verified or not.
+    pub max_domains: Option<i64>,
 }
 
 /// A named plan.
@@ -59,6 +63,8 @@ pub struct Plan {
 pub enum QuotaKind {
     Links,
     MonthlyClicks,
+    /// Custom domains, counted when one is added.
+    Domains,
     /// Open invitations: the same bound for every plan
     /// ([`MAX_PENDING_INVITATIONS`]), so the table cannot be filled.
     PendingInvitations,
@@ -73,6 +79,7 @@ impl QuotaKind {
         match self {
             QuotaKind::Links => "links",
             QuotaKind::MonthlyClicks => "monthly_clicks",
+            QuotaKind::Domains => "domains",
             QuotaKind::PendingInvitations => "pending_invitations",
         }
     }
@@ -105,6 +112,12 @@ impl fmt::Display for QuotaExceeded {
                 f,
                 "the workspace holds the {} links its plan allows; delete links or move \
                  the workspace to a larger plan",
+                self.limit
+            ),
+            (QuotaKind::Domains, _) => write!(
+                f,
+                "the workspace holds the {} domains its plan allows; delete a domain or \
+                 move the workspace to a larger plan",
                 self.limit
             ),
             (QuotaKind::PendingInvitations, _) => write!(
@@ -182,6 +195,8 @@ pub(crate) async fn admit_new_link(
     let limits = Limits {
         max_links: row.try_get("max_links")?,
         monthly_clicks: row.try_get("monthly_clicks")?,
+        // Not a link limit; checked when a domain is added.
+        max_domains: None,
     };
     let clicks: i64 = row.try_get("clicks")?;
     let links = match limits.max_links {
@@ -200,6 +215,46 @@ pub(crate) async fn admit_new_link(
         }
     };
     Ok(check_new_link(&limits, links, clicks, month))
+}
+
+/// Admits one new custom domain in the tenant transaction `tx`, under the
+/// plan's domain limit and never beyond `hard_limit` whatever the plan.
+/// Locks the workspace row until `tx` ends, like [`admit_new_link`], so
+/// concurrent requests cannot both take the last slot; the caller must
+/// insert the domain in the same transaction. Domains are added rarely, so
+/// unlike links there is no lock-free path for unlimited plans.
+pub(crate) async fn admit_new_domain(
+    tx: &mut Transaction<'_, Postgres>,
+    hard_limit: i64,
+) -> Result<Result<(), QuotaExceeded>, sqlx::Error> {
+    let plan: Option<i64> = sqlx::query_scalar(
+        "SELECT p.max_domains FROM workspaces w JOIN plans p ON p.name = w.plan",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let limit = plan.map_or(hard_limit, |p| p.min(hard_limit));
+    sqlx::query("SELECT 1 FROM workspaces FOR NO KEY UPDATE")
+        .execute(&mut **tx)
+        .await?;
+    let domains: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM (SELECT 1 FROM domains LIMIT $1) d")
+            .bind(limit)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(check_new_domain(limit, domains))
+}
+
+/// Whether a workspace holding `domains` domains may add one more under a
+/// limit of `limit`.
+pub fn check_new_domain(limit: i64, domains: i64) -> Result<(), QuotaExceeded> {
+    if domains >= limit {
+        return Err(QuotaExceeded {
+            kind: QuotaKind::Domains,
+            limit,
+            resets_on: None,
+        });
+    }
+    Ok(())
 }
 
 /// One metered quantity and its limit.
@@ -221,6 +276,7 @@ pub struct Usage {
     pub period_end: NaiveDate,
     pub links: Meter,
     pub clicks: Meter,
+    pub domains: Meter,
 }
 
 /// Reads the usage of the tenant transaction's workspace on the UTC day
@@ -231,8 +287,9 @@ pub(crate) async fn read_usage(
 ) -> Result<Usage, sqlx::Error> {
     let month = month_start(today);
     let row = sqlx::query(
-        "SELECT w.id, w.plan, p.max_links, p.monthly_clicks,
+        "SELECT w.id, w.plan, p.max_links, p.monthly_clicks, p.max_domains,
                 (SELECT count(*) FROM links) AS links,
+                (SELECT count(*) FROM domains) AS domains,
                 COALESCE((SELECT u.clicks FROM workspace_usage u
                            WHERE u.workspace_id = w.id AND u.month = $1), 0) AS clicks
            FROM workspaces w JOIN plans p ON p.name = w.plan",
@@ -253,6 +310,10 @@ pub(crate) async fn read_usage(
             used: row.try_get("clicks")?,
             limit: row.try_get("monthly_clicks")?,
         },
+        domains: Meter {
+            used: row.try_get("domains")?,
+            limit: row.try_get("max_domains")?,
+        },
     })
 }
 
@@ -262,6 +323,7 @@ pub(crate) async fn read_usage(
 pub struct PlanChange {
     pub max_links: Option<Option<i64>>,
     pub monthly_clicks: Option<Option<i64>>,
+    pub max_domains: Option<Option<i64>>,
 }
 
 /// Why a plan could not be assigned.
@@ -298,6 +360,7 @@ fn plan_state(plan: &Plan) -> serde_json::Value {
         "plan": plan.name,
         "max_links": plan.limits.max_links,
         "monthly_clicks": plan.limits.monthly_clicks,
+        "max_domains": plan.limits.max_domains,
     })
 }
 
@@ -307,6 +370,7 @@ fn row_to_plan(row: &sqlx::postgres::PgRow) -> Result<Plan, sqlx::Error> {
         limits: Limits {
             max_links: row.try_get("max_links")?,
             monthly_clicks: row.try_get("monthly_clicks")?,
+            max_domains: row.try_get("max_domains")?,
         },
     })
 }
@@ -321,19 +385,24 @@ impl Db {
         let row = self
             .timed(
                 sqlx::query(
-                    "INSERT INTO plans (name, max_links, monthly_clicks) VALUES ($1, $3, $5)
+                    "INSERT INTO plans (name, max_links, monthly_clicks, max_domains)
+                     VALUES ($1, $3, $5, $7)
                      ON CONFLICT (name) DO UPDATE SET
                          max_links = CASE WHEN $2 THEN EXCLUDED.max_links ELSE plans.max_links END,
                          monthly_clicks = CASE WHEN $4 THEN EXCLUDED.monthly_clicks
                                                ELSE plans.monthly_clicks END,
+                         max_domains = CASE WHEN $6 THEN EXCLUDED.max_domains
+                                            ELSE plans.max_domains END,
                          updated_at = now()
-                     RETURNING name, max_links, monthly_clicks",
+                     RETURNING name, max_links, monthly_clicks, max_domains",
                 )
                 .bind(name)
                 .bind(change.max_links.is_some())
                 .bind(change.max_links.flatten())
                 .bind(change.monthly_clicks.is_some())
                 .bind(change.monthly_clicks.flatten())
+                .bind(change.max_domains.is_some())
+                .bind(change.max_domains.flatten())
                 .fetch_one(self.pool()),
             )
             .await?;
@@ -344,8 +413,10 @@ impl Db {
     pub async fn plans(&self) -> Result<Vec<Plan>, DbError> {
         let rows = self
             .timed(
-                sqlx::query("SELECT name, max_links, monthly_clicks FROM plans ORDER BY name")
-                    .fetch_all(self.pool()),
+                sqlx::query(
+                    "SELECT name, max_links, monthly_clicks, max_domains FROM plans ORDER BY name",
+                )
+                .fetch_all(self.pool()),
             )
             .await?;
         rows.iter()
@@ -367,7 +438,7 @@ impl Db {
         self.timed(async {
             let mut tx = self.pool().begin().await?;
             let Some(old) = sqlx::query(
-                "SELECT p.name, p.max_links, p.monthly_clicks
+                "SELECT p.name, p.max_links, p.monthly_clicks, p.max_domains
                        FROM workspaces w JOIN plans p ON p.name = w.plan
                       WHERE w.id = $1 FOR NO KEY UPDATE OF w",
             )
@@ -380,7 +451,8 @@ impl Db {
             let old = row_to_plan(&old)?;
             // Locks the plan against deletion until the move commits.
             let Some(new) = sqlx::query(
-                "SELECT name, max_links, monthly_clicks FROM plans WHERE name = $1 FOR KEY SHARE",
+                "SELECT name, max_links, monthly_clicks, max_domains FROM plans
+                  WHERE name = $1 FOR KEY SHARE",
             )
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -436,7 +508,7 @@ mod tests {
 
         let links = Limits {
             max_links: Some(3),
-            monthly_clicks: None,
+            ..Limits::default()
         };
         assert_eq!(check_new_link(&links, 2, 1_000_000, month), Ok(()));
         let err = check_new_link(&links, 3, 0, month).unwrap_err();
@@ -446,8 +518,8 @@ mod tests {
         assert!(err.to_string().contains("3 links"), "{err}");
 
         let clicks = Limits {
-            max_links: None,
             monthly_clicks: Some(100),
+            ..Limits::default()
         };
         assert_eq!(check_new_link(&clicks, 10, 99, month), Ok(()));
         let err = check_new_link(&clicks, 10, 100, month).unwrap_err();
@@ -459,6 +531,7 @@ mod tests {
         let zero = Limits {
             max_links: Some(0),
             monthly_clicks: Some(0),
+            max_domains: Some(0),
         };
         assert_eq!(
             check_new_link(&zero, 0, 0, month).unwrap_err().kind,
@@ -470,6 +543,14 @@ mod tests {
     fn messages_name_the_limit() {
         assert_eq!(QuotaKind::Links.as_str(), "links");
         assert_eq!(QuotaKind::MonthlyClicks.as_str(), "monthly_clicks");
+        assert_eq!(QuotaKind::Domains.as_str(), "domains");
+        assert_eq!(check_new_domain(2, 1), Ok(()));
+        let e = check_new_domain(2, 2).unwrap_err();
+        assert_eq!(
+            (e.kind, e.limit, e.resets_on),
+            (QuotaKind::Domains, 2, None)
+        );
+        assert!(e.to_string().contains("2 domains"), "{e}");
         assert_eq!(
             QuotaKind::PendingInvitations.as_str(),
             "pending_invitations"
@@ -508,16 +589,19 @@ mod tests {
             name: "free".into(),
             limits: Limits {
                 max_links: Some(10),
-                monthly_clicks: None,
+                max_domains: Some(3),
+                ..Limits::default()
             },
         };
         assert_eq!(
             serde_json::to_value(&plan).unwrap(),
-            serde_json::json!({"name": "free", "max_links": 10, "monthly_clicks": null})
+            serde_json::json!({"name": "free", "max_links": 10, "monthly_clicks": null,
+                               "max_domains": 3})
         );
         assert_eq!(
             plan_state(&plan),
-            serde_json::json!({"plan": "free", "max_links": 10, "monthly_clicks": null})
+            serde_json::json!({"plan": "free", "max_links": 10, "monthly_clicks": null,
+                               "max_domains": 3})
         );
     }
 }

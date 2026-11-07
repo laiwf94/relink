@@ -255,6 +255,7 @@ async fn reconciliation_repairs_drift() {
                 fallback_url: None,
                 enabled: true,
                 health_check: false,
+                domain: None,
             },
             7,
         )

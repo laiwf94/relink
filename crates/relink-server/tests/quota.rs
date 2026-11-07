@@ -38,6 +38,7 @@ fn limits(links: Option<i64>, clicks: Option<i64>) -> PlanChange {
     PlanChange {
         max_links: Some(links),
         monthly_clicks: Some(clicks),
+        max_domains: None,
     }
 }
 
@@ -484,11 +485,12 @@ async fn plans_are_defined_assigned_and_audited() {
     assert_eq!(target, format!("workspace:{ws}"));
     assert_eq!(
         before,
-        json!({"plan": "unlimited", "max_links": null, "monthly_clicks": null})
+        json!({"plan": "unlimited", "max_links": null, "monthly_clicks": null,
+               "max_domains": null})
     );
     assert_eq!(
         after,
-        json!({"plan": "team", "max_links": 50, "monthly_clicks": 1000})
+        json!({"plan": "team", "max_links": 50, "monthly_clicks": 1000, "max_domains": null})
     );
     h.store.verify_audit(Some(ws), &[]).await.unwrap();
 

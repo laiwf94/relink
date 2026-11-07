@@ -37,8 +37,20 @@ use crate::quota::{self, Usage};
 use crate::server::App;
 use crate::store::{
     Bucket, DayStats, Db, DbError, LinkPatch, NewLink, STATS_COUNTRY, STATS_DEVICE, STATS_REFERRER,
-    STATS_TOP_N, Stats, StoredLink, columns, geo_columns,
+    STATS_TOP_N, Stats, StoredLink, api_columns, columns, geo_columns,
 };
+
+/// `WHERE` clause finding a link by code (`$1`) on a domain named by its
+/// hostname (`$2`, NULL for the default domain) in the tenant's workspace.
+/// A hostname the workspace does not have matches no link (-1 is no
+/// domain's ID), rather than falling back to the default domain. Served by
+/// the `links_domain_code` index.
+macro_rules! by_code {
+    () => {
+        " WHERE COALESCE(domain_id, 0) = (CASE WHEN $2::text IS NULL THEN 0 ELSE \
+         COALESCE((SELECT d.id FROM domains d WHERE d.hostname = $2), -1) END) AND code = $1"
+    };
+}
 
 /// Request header naming the workspace a request is meant for. Optional:
 /// without it, a request acts in its key's workspace.
@@ -214,18 +226,21 @@ impl<'a> Tenant<'a> {
         self.db.begin_tenant_untimed(self.workspace_id).await
     }
 
-    /// The link with `code` in this workspace.
-    pub async fn link(&self, code: &str) -> Result<StoredLink, DbError> {
+    /// The link with `code` on `domain` (a hostname; `None` for the
+    /// default domain) in this workspace.
+    pub async fn link(&self, code: &str, domain: Option<&str>) -> Result<StoredLink, DbError> {
         let row = self
             .db
             .timed(async {
                 let mut tx = self.begin().await?;
                 let row = sqlx::query(concat!(
                     "SELECT ",
-                    columns!(),
-                    " FROM links WHERE code = $1"
+                    api_columns!(),
+                    " FROM links",
+                    by_code!()
                 ))
                 .bind(code)
+                .bind(domain)
                 .fetch_optional(&mut *tx)
                 .await?;
                 tx.commit().await?;
@@ -238,9 +253,11 @@ impl<'a> Tenant<'a> {
 
     /// Inserts a link into this workspace, with `new.owner` recorded as its
     /// creator, if the workspace's plan admits one more (`DbError::Quota`
-    /// otherwise; see src/quota.rs). With an alias, a taken code (in any workspace: codes are
-    /// global) is `Conflict`; with a random code, collisions are retried with
-    /// a fresh code up to five times.
+    /// otherwise; see src/quota.rs). A link on a custom domain needs a
+    /// domain this workspace has verified (`DbError::Invalid` otherwise).
+    /// With an alias, a code taken on the same domain (by any workspace, for
+    /// the default domain) is `Conflict`; with a random code, collisions are
+    /// retried with a fresh code up to five times.
     pub async fn insert_link(&self, new: &NewLink, code_len: usize) -> Result<StoredLink, DbError> {
         let attempts = if new.alias.is_some() { 1 } else { 5 };
         for _ in 0..attempts {
@@ -254,14 +271,37 @@ impl<'a> Tenant<'a> {
                 .timed(async {
                     let mut tx = self.begin().await?;
                     if let Err(q) = quota::admit_new_link(&mut tx, Utc::now().date_naive()).await? {
-                        return Ok(Err(q));
+                        return Ok(Err(DbError::Quota(q)));
                     }
+                    let domain_id: Option<i64> = match &new.domain {
+                        None => None,
+                        Some(host) => {
+                            // FOR KEY SHARE: the domain cannot be deleted
+                            // before this link commits.
+                            let id = sqlx::query_scalar(
+                                "SELECT id FROM domains WHERE hostname = $1 \
+                                 AND verified_at IS NOT NULL FOR KEY SHARE",
+                            )
+                            .bind(host)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                            match id {
+                                Some(id) => Some(id),
+                                None => {
+                                    return Ok(Err(DbError::Invalid(format!(
+                                        "domain: {host} is not a verified domain of this workspace"
+                                    ))));
+                                }
+                            }
+                        }
+                    };
                     // workspace_id defaults to the transaction's workspace.
                     let row = sqlx::query(concat!(
                         "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
-                         max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ",
-                        columns!()
+                         max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
+                         domain_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING ",
+                        api_columns!()
                     ))
                     .bind(&code)
                     .bind(&new.owner)
@@ -274,11 +314,12 @@ impl<'a> Tenant<'a> {
                     .bind(&new.fallback_url)
                     .bind(new.enabled)
                     .bind(new.health_check)
+                    .bind(domain_id)
                     .fetch_one(&mut *tx)
                     .await?;
                     let link = self.db.row_to_link(&row)?;
                     // Instances may hold a negative cache entry for this code.
-                    self.db.changed(&mut tx, link.id, &code).await?;
+                    self.db.changed(&mut tx, link.id, domain_id, &code).await?;
                     let change = Change {
                         after: Some(audit::link_state(&link)),
                         ..self.change(Action::LinkCreate, link.id)
@@ -290,7 +331,7 @@ impl<'a> Tenant<'a> {
                 .await;
             match res {
                 Ok(Ok(link)) => return Ok(link),
-                Ok(Err(q)) => return Err(DbError::Quota(q)),
+                Ok(Err(e)) => return Err(e),
                 Err(DbError::Conflict) if new.alias.is_none() => continue,
                 Err(e) => return Err(e),
             }
@@ -314,7 +355,7 @@ impl<'a> Tenant<'a> {
                 // this order, walks the (workspace_id, id DESC) index.
                 let rows = sqlx::query(concat!(
                     "SELECT ",
-                    columns!(),
+                    api_columns!(),
                     " FROM links WHERE ($1::bigint IS NULL OR id < $1) ORDER BY id DESC LIMIT $2"
                 ))
                 .bind(before_id)
@@ -331,18 +372,26 @@ impl<'a> Tenant<'a> {
             .map_err(DbError::from)
     }
 
-    /// Applies `patch` to a link in one transaction and notifies other
-    /// instances.
-    pub async fn update_link(&self, code: &str, patch: &LinkPatch) -> Result<StoredLink, DbError> {
+    /// Applies `patch` to the link with `code` on `domain` in one
+    /// transaction and notifies other instances.
+    pub async fn update_link(
+        &self,
+        code: &str,
+        domain: Option<&str>,
+        patch: &LinkPatch,
+    ) -> Result<StoredLink, DbError> {
         self.db
             .timed(async {
                 let mut tx = self.begin().await?;
                 let row = sqlx::query(concat!(
                     "SELECT ",
                     columns!(),
-                    " FROM links WHERE code = $1 FOR NO KEY UPDATE"
+                    " FROM links",
+                    by_code!(),
+                    " FOR NO KEY UPDATE"
                 ))
                 .bind(code)
+                .bind(domain)
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(sqlx::Error::RowNotFound)?;
@@ -384,7 +433,7 @@ impl<'a> Tenant<'a> {
                      redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
                      geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
                      updated_at = now() WHERE id = $1 RETURNING ",
-                    columns!()
+                    api_columns!()
                 ))
                 .bind(link.id)
                 .bind(Json(&link.destinations))
@@ -400,7 +449,9 @@ impl<'a> Tenant<'a> {
                 .fetch_one(&mut *tx)
                 .await?;
                 let updated = self.db.row_to_link(&row)?;
-                self.db.changed(&mut tx, updated.id, &updated.code).await?;
+                self.db
+                    .changed(&mut tx, updated.id, updated.domain_id, &updated.code)
+                    .await?;
                 let change = Change {
                     before: Some(before),
                     after: Some(audit::link_state(&updated)),
@@ -413,30 +464,39 @@ impl<'a> Tenant<'a> {
             .await
     }
 
-    /// Deletes a link and its statistics, and notifies other instances.
-    /// Returns the deleted link's ID.
-    pub async fn delete_link(&self, code: &str) -> Result<i64, DbError> {
+    /// Deletes the link with `code` on `domain` and its statistics, and
+    /// notifies other instances. Returns the deleted link.
+    pub async fn delete_link(
+        &self,
+        code: &str,
+        domain: Option<&str>,
+    ) -> Result<StoredLink, DbError> {
         self.db
             .timed(async {
                 let mut tx = self.begin().await?;
                 let row = sqlx::query(concat!(
-                    "DELETE FROM links WHERE code = $1 RETURNING ",
+                    "DELETE FROM links",
+                    by_code!(),
+                    " RETURNING ",
                     columns!()
                 ))
                 .bind(code)
+                .bind(domain)
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(sqlx::Error::RowNotFound)?;
                 let deleted = self.db.row_to_link(&row)?;
                 let id = deleted.id;
-                self.db.changed(&mut tx, id, code).await?;
+                self.db
+                    .changed(&mut tx, id, deleted.domain_id, code)
+                    .await?;
                 let change = Change {
                     before: Some(audit::link_state(&deleted)),
                     ..self.change(Action::LinkDelete, id)
                 };
                 audit::record(&mut tx, &self.actor, change).await?;
                 tx.commit().await?;
-                Ok(id)
+                Ok(deleted)
             })
             .await
     }
@@ -459,14 +519,16 @@ impl<'a> Tenant<'a> {
     pub async fn stats(
         &self,
         code: &str,
+        domain: Option<&str>,
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Stats, DbError> {
         self.db
             .timed(async {
                 let mut tx = self.begin().await?;
-                let id: i64 = sqlx::query_scalar("SELECT id FROM links WHERE code = $1")
+                let id: i64 = sqlx::query_scalar(concat!("SELECT id FROM links", by_code!()))
                     .bind(code)
+                    .bind(domain)
                     .fetch_optional(&mut *tx)
                     .await?
                     .ok_or(sqlx::Error::RowNotFound)?;

@@ -22,15 +22,18 @@ use crate::singleflight::SingleFlight;
 use crate::store::{Db, DbError};
 use crate::util::BoxFuture;
 
-/// Where links come from on a cache miss. Implemented by [`Db`]; benchmarks
-/// and tests use an in-memory map.
+/// Where links come from on a cache miss, by [`link_key`]: the code alone
+/// on the default domain, `<domain id>/<code>` on a custom one.
+/// Implemented by [`Db`]; benchmarks and tests use an in-memory map.
+///
+/// [`link_key`]: crate::store::link_key
 pub trait LinkSource: Send + Sync {
-    fn load<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<Option<Link>, DbError>>;
+    fn load<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Link>, DbError>>;
 }
 
 impl LinkSource for Db {
-    fn load<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<Option<Link>, DbError>> {
-        Box::pin(async move { Ok(self.link_by_code(code).await?.map(|s| s.link)) })
+    fn load<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Link>, DbError>> {
+        Box::pin(async move { Ok(self.link_by_key(key).await?.map(|s| s.link)) })
     }
 }
 

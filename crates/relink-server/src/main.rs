@@ -23,6 +23,7 @@
 //!                             unchanged. Exits non-zero at the first break
 //! relink kv-record CODE       print the JSON the edge would get for CODE
 //! relink plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited]
+//!                  [--domains N|unlimited]
 //!                             create a plan or change its limits (omitted
 //!                             limits stay as they are; a new plan starts
 //!                             without limits)
@@ -38,7 +39,7 @@
 //! | `RELINK_DATABASE_URL` | required | `postgres://user:pass@host:5432/db` |
 //! | `RELINK_ADDR` | `0.0.0.0:8080` | Public listener: redirects, API, probes |
 //! | `RELINK_ADMIN_ADDR` | `127.0.0.1:9090` | Admin listener: `/metrics`, probes |
-//! | `RELINK_PUBLIC_BASE_URL` | `http://localhost:8080` | Prefix for `short_url` in responses |
+//! | `RELINK_PUBLIC_BASE_URL` | `http://localhost:8080` | Prefix for `short_url` in responses; its host is the default domain |
 //! | `RELINK_CODE_LENGTH` | `7` | Generated code length, 4 to 32 |
 //! | `RELINK_COOKIE_KEY` | random | 64+ hex chars; HMAC key for A/B cookies. Set it so assignments survive restarts and match across instances |
 //! | `RELINK_COOKIE_SECURE` | `true` | Add `Secure` to A/B and session cookies |
@@ -83,6 +84,8 @@
 //! | `RELINK_OIDC_SCOPES` | `openid email profile` | Scopes requested; must include `openid` |
 //! | `RELINK_OIDC_ALLOWED_DOMAINS` | unset | Comma-separated email domains; when set, only verified addresses there may sign in |
 //! | `RELINK_SESSION_TTL_S` | `43200` | Lifetime of a sign-in session, 300 to 2592000 seconds |
+//! | `RELINK_DNS_SERVERS` | from `/etc/resolv.conf` | Comma-separated recursive resolvers (`ip` or `ip:port`) asked for the TXT records that verify custom domains |
+//! | `RELINK_DNS_TIMEOUT_MS` | `2000` | Wait for each resolver's answer |
 //! | `RELINK_LOG` | `info,sqlx::postgres::notice=warn` | Log filter (`tracing` env-filter syntax) |
 
 use std::process::ExitCode;
@@ -101,6 +104,7 @@ const USAGE: &str = "usage: relink [serve | migrate | create-key OWNER [NAME] [-
                      | revoke-key ID | kv-record CODE \
                      | audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...] \
                      | plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited] \
+                       [--domains N|unlimited] \
                      | plan-assign WORKSPACE PLAN | plan-list]";
 
 #[tokio::main]
@@ -278,10 +282,11 @@ async fn audit_verify(args: &[&str]) -> Result<(), String> {
 fn describe_plan(plan: &Plan) -> String {
     let limit = |l: Option<i64>| l.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
     format!(
-        "plan={} links={} monthly_clicks={}",
+        "plan={} links={} monthly_clicks={} domains={}",
         plan.name,
         limit(plan.limits.max_links),
-        limit(plan.limits.monthly_clicks)
+        limit(plan.limits.monthly_clicks),
+        limit(plan.limits.max_domains)
     )
 }
 

@@ -285,20 +285,29 @@ async fn plan_commands() {
     };
     assert_eq!(
         stdout(&["plan-set", "free", "--links", "100"]),
-        "plan=free links=100 monthly_clicks=unlimited\n"
+        "plan=free links=100 monthly_clicks=unlimited domains=unlimited\n"
     );
     assert_eq!(
-        stdout(&["plan-set", "free", "--monthly-clicks", "5000"]),
-        "plan=free links=100 monthly_clicks=5000\n"
+        stdout(&[
+            "plan-set",
+            "free",
+            "--monthly-clicks",
+            "5000",
+            "--domains",
+            "2"
+        ]),
+        "plan=free links=100 monthly_clicks=5000 domains=2\n"
     );
     assert_eq!(
         stdout(&["plan-assign", &ws.to_string(), "free"]),
-        format!("workspace={ws} plan=free links=100 monthly_clicks=5000 previous=unlimited\n")
+        format!(
+            "workspace={ws} plan=free links=100 monthly_clicks=5000 domains=2 previous=unlimited\n"
+        )
     );
     assert_eq!(
         stdout(&["plan-list"]),
-        "plan=free links=100 monthly_clicks=5000\n\
-         plan=unlimited links=unlimited monthly_clicks=unlimited\n"
+        "plan=free links=100 monthly_clicks=5000 domains=2\n\
+         plan=unlimited links=unlimited monthly_clicks=unlimited domains=unlimited\n"
     );
     let out = relink(&db.url, &["plan-assign", &ws.to_string(), "gold"]);
     assert!(!out.status.success());

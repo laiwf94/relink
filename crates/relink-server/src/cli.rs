@@ -5,7 +5,7 @@
 //! relink create-key OWNER [NAME] [--workspace ID] [--scopes LIST] [--expires-in DURATION]
 //! relink rotate-key ID [--overlap DURATION]
 //! relink audit-verify [--workspace ID] [--anchors WORKSPACE:SEQ:HASH,...]
-//! relink plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited]
+//! relink plan-set NAME [--links N|unlimited] [--monthly-clicks N|unlimited] [--domains N|unlimited]
 //! relink plan-assign WORKSPACE PLAN
 //! relink plan-list
 //! ```
@@ -219,7 +219,7 @@ impl AuditVerify {
 impl PlanSet {
     /// Parses the words after `plan-set`.
     pub fn parse(args: &[&str]) -> Result<PlanSet, String> {
-        let (pos, flags) = split(args, &["links", "monthly-clicks"])?;
+        let (pos, flags) = split(args, &["links", "monthly-clicks", "domains"])?;
         let [name] = pos.as_slice() else {
             return Err("plan-set takes one plan NAME".into());
         };
@@ -231,6 +231,7 @@ impl PlanSet {
             let limit = plan_limit(flag, value)?;
             match flag {
                 "links" => set.change.max_links = Some(limit),
+                "domains" => set.change.max_domains = Some(limit),
                 _ => set.change.monthly_clicks = Some(limit),
             }
         }
@@ -396,7 +397,13 @@ mod tests {
         assert!(err(&["free", "--links", "lots"]).contains("--links must be"));
         let over = (MAX_PLAN_LIMIT + 1).to_string();
         assert!(err(&["free", "--monthly-clicks", &over]).contains("--monthly-clicks must be"));
-        assert!(err(&["free", "--domains", "3"]).contains("unknown option"));
+        let p = PlanSet::parse(&["free", "--domains", "3"]).unwrap();
+        assert_eq!(p.change.max_domains, Some(Some(3)));
+        assert_eq!((p.change.max_links, p.change.monthly_clicks), (None, None));
+        let p = PlanSet::parse(&["free", "--domains", "unlimited"]).unwrap();
+        assert_eq!(p.change.max_domains, Some(None));
+        assert!(err(&["free", "--domains", "x"]).contains("--domains must be"));
+        assert!(err(&["free", "--seats", "3"]).contains("unknown option"));
     }
 
     #[test]

@@ -33,7 +33,7 @@ use crate::destination::normalize;
 use crate::model::{Destination, GeoMode, GeoRule};
 use crate::server::App;
 use crate::session;
-use crate::store::{DbError, LinkPatch, NewLink, Stats, StoredLink};
+use crate::store::{DbError, LinkPatch, NewLink, Stats, StoredLink, link_key};
 use crate::tenant::{Allowed, LinksRead, LinksWrite, StatsRead};
 use crate::util::{fast_random, hex_decode, hex_encode, now_ms, utc_day};
 
@@ -109,6 +109,10 @@ impl ApiError {
     pub fn conflict(message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::CONFLICT, "already_exists", message)
     }
+    /// The request cannot be applied in the resource's current state.
+    pub fn failed_precondition(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::CONFLICT, "failed_precondition", message)
+    }
     pub fn too_large() -> ApiError {
         ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -172,6 +176,8 @@ impl From<DbError> for ApiError {
                 ApiError::internal()
             }
             DbError::Quota(q) => ApiError::quota_exceeded(q.to_string()),
+            DbError::Invalid(m) => ApiError::invalid(m),
+            DbError::Precondition(m) => ApiError::failed_precondition(m),
         }
     }
 }
@@ -461,6 +467,9 @@ pub struct CreateLink {
     pub fallback_url: Option<String>,
     pub enabled: Option<bool>,
     pub health_check: Option<bool>,
+    /// A verified custom domain of the workspace to create the link on;
+    /// absent or null for the default domain.
+    pub domain: Option<String>,
 }
 
 /// Distinguishes "absent" (outer None) from "null" (Some(None)).
@@ -506,6 +515,8 @@ pub struct GeoView {
 #[derive(Debug, Serialize)]
 pub struct LinkView {
     pub code: String,
+    /// The custom domain the link is on; `null` for the default domain.
+    pub domain: Option<String>,
     pub short_url: String,
     pub destinations: Vec<DestinationView>,
     pub redirect_type: u16,
@@ -521,10 +532,20 @@ pub struct LinkView {
 }
 
 impl LinkView {
+    /// `base_url` is the default domain's; a link on a custom domain gets a
+    /// short URL on that domain, with the same scheme.
     pub fn new(link: &StoredLink, base_url: &str) -> LinkView {
+        let short_url = match &link.domain {
+            None => format!("{base_url}/{}", link.code),
+            Some(host) => {
+                let scheme = base_url.split_once("://").map_or("https", |(s, _)| s);
+                format!("{scheme}://{host}/{}", link.code)
+            }
+        };
         LinkView {
             code: link.code.clone(),
-            short_url: format!("{base_url}/{}", link.code),
+            domain: link.domain.clone(),
+            short_url,
             destinations: link
                 .destinations
                 .iter()
@@ -570,6 +591,20 @@ pub struct ListQuery {
 pub struct StatsQuery {
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
+    pub domain: Option<String>,
+}
+
+/// `?domain=` on the routes for one link: the custom domain its code is
+/// on, absent for the default domain.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainQuery {
+    pub domain: Option<String>,
+}
+
+/// A hostname from `?domain=` or a request body, in stored form.
+fn domain_param(raw: Option<String>) -> Option<String> {
+    raw.map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
 }
 
 #[derive(Debug, Serialize)]
@@ -724,6 +759,7 @@ pub async fn create_link(
             .transpose()?,
         enabled: req.enabled.unwrap_or(true),
         health_check: req.health_check.unwrap_or(false),
+        domain: domain_param(req.domain),
     };
     let link = ws
         .tenant(&app.db)
@@ -736,13 +772,18 @@ pub async fn create_link(
         })?;
     // The code may be cached as "not found" here; other instances hear
     // about it through the change notification sent with the insert.
-    app.resolver.invalidate(&link.code);
+    app.resolver
+        .invalidate(&link_key(link.domain_id, &link.code));
     tracing::info!(code = %link.code, "link created");
     let mut resp = json(
         StatusCode::CREATED,
         &LinkView::new(&link, &app.cfg.public_base_url),
     );
-    if let Ok(v) = HeaderValue::from_str(&format!("/v1/links/{}", link.code)) {
+    let location = match &link.domain {
+        None => format!("/v1/links/{}", link.code),
+        Some(d) => format!("/v1/links/{}?domain={d}", link.code),
+    };
+    if let Ok(v) = HeaderValue::from_str(&location) {
         resp.headers_mut().insert(header::LOCATION, v);
     }
     Ok(resp)
@@ -787,8 +828,10 @@ pub async fn get_link(
     State(app): State<Arc<App>>,
     ws: Allowed<LinksRead>,
     Path(code): Path<String>,
+    StrictQuery(q): StrictQuery<DomainQuery>,
 ) -> Result<Response, ApiError> {
-    let link = app.db.tenant(ws.id).link(&code).await?;
+    let domain = domain_param(q.domain);
+    let link = app.db.tenant(ws.id).link(&code, domain.as_deref()).await?;
     Ok(json(
         StatusCode::OK,
         &LinkView::new(&link, &app.cfg.public_base_url),
@@ -799,6 +842,7 @@ pub async fn update_link(
     State(app): State<Arc<App>>,
     ws: Allowed<LinksWrite>,
     Path(code): Path<String>,
+    StrictQuery(q): StrictQuery<DomainQuery>,
     StrictJson(req): StrictJson<PatchLink>,
 ) -> Result<Response, ApiError> {
     let patch = LinkPatch {
@@ -834,8 +878,13 @@ pub async fn update_link(
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }
-    let link = ws.tenant(&app.db).update_link(&code, &patch).await?;
-    app.resolver.invalidate(&link.code);
+    let domain = domain_param(q.domain);
+    let link = ws
+        .tenant(&app.db)
+        .update_link(&code, domain.as_deref(), &patch)
+        .await?;
+    app.resolver
+        .invalidate(&link_key(link.domain_id, &link.code));
     app.limiter.invalidate(link.id).await;
     tracing::info!(code = %link.code, "link updated");
     Ok(json(
@@ -848,10 +897,16 @@ pub async fn delete_link(
     State(app): State<Arc<App>>,
     ws: Allowed<LinksWrite>,
     Path(code): Path<String>,
+    StrictQuery(q): StrictQuery<DomainQuery>,
 ) -> Result<Response, ApiError> {
-    let id = ws.tenant(&app.db).delete_link(&code).await?;
-    app.resolver.invalidate(&code);
-    app.limiter.invalidate(id).await;
+    let domain = domain_param(q.domain);
+    let link = ws
+        .tenant(&app.db)
+        .delete_link(&code, domain.as_deref())
+        .await?;
+    app.resolver
+        .invalidate(&link_key(link.domain_id, &link.code));
+    app.limiter.invalidate(link.id).await;
     tracing::info!(code = %code, "link deleted");
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -872,7 +927,12 @@ pub async fn link_stats(
             "the range must be at most {MAX_STATS_DAYS} days"
         )));
     }
-    let stats = app.db.tenant(ws.id).stats(&code, from, to).await?;
+    let domain = domain_param(q.domain);
+    let stats = app
+        .db
+        .tenant(ws.id)
+        .stats(&code, domain.as_deref(), from, to)
+        .await?;
     Ok(json(
         StatusCode::OK,
         &StatsView {
@@ -1047,6 +1107,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("delete", "/v1/links/{code}"),
     ("get", "/v1/links/{code}/stats"),
     ("get", "/v1/usage"),
+    ("post", "/v1/domains"),
+    ("get", "/v1/domains"),
+    ("get", "/v1/domains/{hostname}"),
+    ("delete", "/v1/domains/{hostname}"),
+    ("post", "/v1/domains/{hostname}/verify"),
     ("get", "/v1/auth/login"),
     ("get", "/v1/auth/callback"),
     ("get", "/v1/auth/session"),

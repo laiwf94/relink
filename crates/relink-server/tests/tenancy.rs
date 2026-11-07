@@ -42,6 +42,7 @@ fn new_link(owner: &str, alias: &str) -> NewLink {
         fallback_url: None,
         enabled: true,
         health_check: false,
+        domain: None,
     }
 }
 
@@ -400,7 +401,7 @@ async fn tenant_queries_reach_only_their_workspace() {
     assert_eq!(alice.workspace_id(), a1.workspace_id);
 
     // Every query treats the other workspace's link as missing.
-    assert_eq!(alice.link("bob1").await, Err(DbError::NotFound));
+    assert_eq!(alice.link("bob1", None).await, Err(DbError::NotFound));
     let codes: Vec<String> = alice
         .list_links(None, 10)
         .await
@@ -414,13 +415,19 @@ async fn tenant_queries_reach_only_their_workspace() {
         ..Default::default()
     };
     assert_eq!(
-        alice.update_link("bob1", &patch).await,
+        alice.update_link("bob1", None, &patch).await,
         Err(DbError::NotFound)
     );
     let day = chrono::Utc::now().date_naive();
-    assert_eq!(alice.stats("bob1", day, day).await, Err(DbError::NotFound));
-    assert_eq!(alice.delete_link("bob1").await, Err(DbError::NotFound));
-    let untouched = bob.link("bob1").await.unwrap();
+    assert_eq!(
+        alice.stats("bob1", None, day, day).await,
+        Err(DbError::NotFound)
+    );
+    assert_eq!(
+        alice.delete_link("bob1", None).await,
+        Err(DbError::NotFound)
+    );
+    let untouched = bob.link("bob1", None).await.unwrap();
     assert!(untouched.enabled);
 
     // Links are the workspace's, not their creator's: a link carol created
@@ -433,13 +440,19 @@ async fn tenant_queries_reach_only_their_workspace() {
         (c1.workspace_id, c1.owner.as_str()),
         (a1.workspace_id, "carol")
     );
-    assert!(!alice.update_link("carol1", &patch).await.unwrap().enabled);
+    assert!(
+        !alice
+            .update_link("carol1", None, &patch)
+            .await
+            .unwrap()
+            .enabled
+    );
     // An alias taken in another workspace is still taken: codes are global.
     assert_eq!(
         alice.insert_link(&new_link("alice", "bob1"), 7).await,
         Err(DbError::Conflict)
     );
-    assert_eq!(bob.delete_link("bob1").await.unwrap(), b1.id);
+    assert_eq!(bob.delete_link("bob1", None).await.unwrap().id, b1.id);
     assert_eq!(alice.list_links(None, 10).await.unwrap().len(), 2);
 }
 

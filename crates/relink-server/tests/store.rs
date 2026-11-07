@@ -43,6 +43,7 @@ fn new_link(alias: Option<&str>, max_clicks: Option<i64>) -> NewLink {
         fallback_url: None,
         enabled: true,
         health_check: true,
+        domain: None,
     }
 }
 
@@ -115,7 +116,7 @@ async fn aliases_conflict_and_codes_are_unique() {
     // Codes are global, but another workspace cannot see the link.
     let bob = store.personal_workspace("bob").await.unwrap();
     assert_eq!(
-        store.tenant(bob).link("taken").await,
+        store.tenant(bob).link("taken", None).await,
         Err(DbError::NotFound)
     );
     assert!(store.link_by_code("missing").await.unwrap().is_none());
@@ -195,14 +196,14 @@ async fn visitor_hashes_roll_up_and_salts_are_destroyed() {
     let from = relink_server::store::day_to_date(old_day);
     let to = relink_server::store::day_to_date(today);
     let alice = store.tenant(link.workspace_id);
-    let stats = alice.stats(&link.code, from, to).await.unwrap();
+    let stats = alice.stats(&link.code, None, from, to).await.unwrap();
     assert_eq!(stats.total_clicks, 8);
     assert_eq!(stats.days.len(), 2);
     assert_eq!(stats.days[0].unique_visitors, 2, "rolled up");
     assert_eq!(stats.days[1].unique_visitors, 1);
     assert_eq!(stats.referrers[0].value, "(direct)");
     // Clicks for a deleted link are skipped, not an error.
-    alice.delete_link(&link.code).await.unwrap();
+    alice.delete_link(&link.code, None).await.unwrap();
     store
         .flush_clicks(&[(row(today), 1)], &[(link.id, today, [9; 16])])
         .await
@@ -244,6 +245,7 @@ async fn health_targets_are_claimed_once_and_updates_are_guarded() {
     alice
         .update_link(
             &code,
+            None,
             &relink_server::store::LinkPatch {
                 destinations: Some(vec![Destination {
                     url: "https://example.org/".into(),
@@ -255,7 +257,7 @@ async fn health_targets_are_claimed_once_and_updates_are_guarded() {
         .await
         .unwrap();
     assert!(!store.record_health(&target, &[5]).await.unwrap());
-    let link = alice.link(&code).await.unwrap();
+    let link = alice.link(&code, None).await.unwrap();
     assert_eq!(
         link.unhealthy,
         vec![false],

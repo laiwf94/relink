@@ -28,12 +28,25 @@ use crate::util::BoxFuture;
 /// Columns read into a [`Link`], as a literal so queries stay `&'static str`.
 macro_rules! columns {
     () => {
-        "id, code, owner, workspace_id, destinations, destinations_version, redirect_status, \
+        "id, code, owner, workspace_id, domain_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
          health_failures, health_checked_at, created_at, updated_at"
     };
 }
 pub(crate) use columns;
+
+/// [`columns!`] plus the hostname of the link's custom domain, for queries
+/// whose rows go back to the API. Not for the redirect role, which cannot
+/// read `domains`.
+macro_rules! api_columns {
+    () => {
+        concat!(
+            columns!(),
+            ", (SELECT d.hostname FROM domains d WHERE d.id = links.domain_id) AS domain_host"
+        )
+    };
+}
+pub(crate) use api_columns;
 
 /// Embedded migrations from `migrations/`.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -52,8 +65,44 @@ pub const REDIRECT_ROLE: &str = "relink_redirect";
 /// acts for. Unset, a tenant transaction sees no rows.
 pub const WORKSPACE_SETTING: &str = "relink.workspace_id";
 
-/// Channel for link change notifications. Payload: `<id>:<code>`.
+/// Channel for change notifications. Payload: `<id>:<key>` for a link,
+/// where the key is [`link_key`]; [`DOMAINS_CHANGED`] when the set of
+/// verified domains changed.
 pub const CHANGES_CHANNEL: &str = "relink_link_changes";
+
+/// The [`CHANGES_CHANNEL`] payload sent when a domain is verified or deleted.
+pub const DOMAINS_CHANGED: &str = "domains";
+
+/// The cache and notification key of a link: its code on the default
+/// domain, `<domain id>/<code>` on a custom domain. Codes never contain `/`,
+/// so the two forms cannot collide.
+pub fn link_key(domain_id: Option<i64>, code: &str) -> String {
+    match domain_id {
+        None => code.to_owned(),
+        Some(d) => format!("{d}/{code}"),
+    }
+}
+
+/// Splits a [`link_key`] into its domain (None for the default one) and
+/// code, if it is well formed.
+pub fn split_link_key(key: &str) -> Option<(Option<i64>, &str)> {
+    let (domain, code) = match key.split_once('/') {
+        None => (None, key),
+        Some((d, code)) => {
+            // Canonical decimal only, so a key has exactly one spelling.
+            if d.is_empty()
+                || d.len() > 19
+                || d.starts_with('0')
+                || !d.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let d: i64 = d.parse().ok().filter(|&d| d > 0)?;
+            (Some(d), code)
+        }
+    };
+    crate::code::is_plausible_code(code).then_some((domain, code))
+}
 
 /// Database errors as the rest of the service sees them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +117,12 @@ pub enum DbError {
     Other(String),
     /// Refused because the workspace is at one of its plan's limits.
     Quota(crate::quota::QuotaExceeded),
+    /// The request names something it may not use, such as a domain the
+    /// workspace has not verified. The message says what.
+    Invalid(String),
+    /// The request cannot be applied in the current state, such as deleting
+    /// a domain that still has links. The message says why.
+    Precondition(String),
 }
 
 impl fmt::Display for DbError {
@@ -78,6 +133,7 @@ impl fmt::Display for DbError {
             DbError::Unavailable(m) => write!(f, "database unavailable: {m}"),
             DbError::Other(m) => write!(f, "database error: {m}"),
             DbError::Quota(q) => q.fmt(f),
+            DbError::Invalid(m) | DbError::Precondition(m) => f.write_str(m),
         }
     }
 }
@@ -105,7 +161,7 @@ impl From<sqlx::Error> for DbError {
 }
 
 impl DbError {
-    fn is_fk_violation(e: &sqlx::Error) -> bool {
+    pub(crate) fn is_fk_violation(e: &sqlx::Error) -> bool {
         matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23503"))
     }
 }
@@ -116,6 +172,10 @@ pub struct StoredLink {
     pub link: Link,
     pub owner: String,
     pub workspace_id: i64,
+    /// The custom domain the link is on; `None` for the default domain.
+    pub domain_id: Option<i64>,
+    /// That domain's hostname, when the query read it ([`api_columns!`]).
+    pub domain: Option<String>,
     pub health_checked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -148,6 +208,9 @@ pub struct NewLink {
     pub fallback_url: Option<String>,
     pub enabled: bool,
     pub health_check: bool,
+    /// The verified custom domain (hostname) to create the link on, or
+    /// `None` for the default domain.
+    pub domain: Option<String>,
 }
 
 /// A partial update, already validated. The outer `Option` is "change this
@@ -307,6 +370,7 @@ pub struct ClickRow {
 #[derive(Clone, Debug)]
 pub struct HealthTarget {
     pub id: i64,
+    pub domain_id: Option<i64>,
     pub code: String,
     pub destinations: Vec<Destination>,
     pub version: i32,
@@ -501,28 +565,66 @@ impl Db {
             link,
             owner: row.try_get("owner")?,
             workspace_id: row.try_get("workspace_id")?,
+            domain_id: row.try_get("domain_id")?,
+            domain: if row
+                .columns()
+                .iter()
+                .any(|c| sqlx::Column::name(c) == "domain_host")
+            {
+                row.try_get("domain_host")?
+            } else {
+                None
+            },
             health_checked_at: row.try_get("health_checked_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
     }
 
-    /// The link for a code, in any workspace (redirect path and edge
-    /// publishing). Runs on the lookup pool as [`REDIRECT_ROLE`], through
-    /// the one function that role may call. Retried once on an I/O error
-    /// from a pooled connection that died while idle (the pool does not ping
-    /// before use, and a read is safe to repeat). Both attempts share one
-    /// deadline.
+    /// The link for a code on the default domain, in any workspace
+    /// (redirect path and edge publishing). Runs on the lookup pool as
+    /// [`REDIRECT_ROLE`], through the one function that role may call for
+    /// it. Retried once on an I/O error from a pooled connection that died
+    /// while idle (the pool does not ping before use, and a read is safe to
+    /// repeat). Both attempts share one deadline.
     pub async fn link_by_code(&self, code: &str) -> Result<Option<StoredLink>, DbError> {
+        self.lookup_link(None, code).await
+    }
+
+    /// The link for a [`link_key`]: a code on the default domain, or on a
+    /// verified custom domain. Same pool, role and retry as
+    /// [`Db::link_by_code`]. A link on a domain that is not verified is not
+    /// found.
+    pub async fn link_by_key(&self, key: &str) -> Result<Option<StoredLink>, DbError> {
+        match split_link_key(key) {
+            Some((domain, code)) => self.lookup_link(domain, code).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn lookup_link(
+        &self,
+        domain: Option<i64>,
+        code: &str,
+    ) -> Result<Option<StoredLink>, DbError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut retried = false;
         loop {
-            let query = sqlx::query(concat!(
-                "SELECT ",
-                columns!(),
-                " FROM relink_link_by_code($1)"
-            ))
-            .bind(code)
+            let query = match domain {
+                None => sqlx::query(concat!(
+                    "SELECT ",
+                    columns!(),
+                    " FROM relink_link_by_code($1)"
+                ))
+                .bind(code),
+                Some(d) => sqlx::query(concat!(
+                    "SELECT ",
+                    columns!(),
+                    " FROM relink_link_by_domain_code($2, $1)"
+                ))
+                .bind(code)
+                .bind(d),
+            }
             .fetch_optional(&self.lookup);
             match tokio::time::timeout_at(deadline, query).await {
                 Ok(Ok(row)) => {
@@ -538,20 +640,32 @@ impl Db {
         }
     }
 
-    /// Records that link `code` changed, inside the caller's transaction:
-    /// other instances are told to drop their cached copy, and, when edge
-    /// publishing is on, the code joins the KV outbox.
+    /// Records that link `code` on `domain_id` changed, inside the caller's
+    /// transaction: other instances are told to drop their cached copy, and,
+    /// when edge publishing is on, a default-domain code joins the KV
+    /// outbox. The edge serves only the default domain so far, so links on
+    /// custom domains are not published.
     pub(crate) async fn changed(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         id: i64,
+        domain_id: Option<i64>,
         code: &str,
     ) -> Result<(), sqlx::Error> {
-        notify(tx, id, code).await?;
-        if self.outbox {
+        notify(tx, &format!("{id}:{}", link_key(domain_id, code))).await?;
+        if self.outbox && domain_id.is_none() {
             enqueue(tx, code).await?;
         }
         Ok(())
+    }
+
+    /// Tells every instance, when `tx` commits, that the set of verified
+    /// domains changed.
+    pub(crate) async fn domains_changed(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), sqlx::Error> {
+        notify(tx, DOMAINS_CHANGED).await
     }
 
     /// Claims up to `limit` outbox entries that are due and pushes their next
@@ -621,14 +735,17 @@ impl Db {
             .await
     }
 
-    /// Link codes after `after`, in code order, `limit` at a time
-    /// (reconciliation walks every link this way).
+    /// Default-domain link codes after `after`, in code order, `limit` at a
+    /// time (reconciliation walks every link the edge serves this way).
     pub async fn codes_after(&self, after: &str, limit: i64) -> Result<Vec<String>, DbError> {
         self.timed(
-            sqlx::query_scalar("SELECT code FROM links WHERE code > $1 ORDER BY code LIMIT $2")
-                .bind(after)
-                .bind(limit)
-                .fetch_all(&self.pool),
+            sqlx::query_scalar(
+                "SELECT code FROM links WHERE COALESCE(domain_id, 0) = 0 AND code > $1
+                  ORDER BY code LIMIT $2",
+            )
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool),
         )
         .await
     }
@@ -850,7 +967,8 @@ impl Db {
                              ORDER BY health_checked_at NULLS FIRST
                              LIMIT $2
                                FOR NO KEY UPDATE SKIP LOCKED)
-                  RETURNING id, code, destinations, destinations_version, health_failures",
+                  RETURNING id, domain_id, code, destinations, destinations_version,
+                            health_failures",
                 )
                 .bind(interval.as_secs_f64())
                 .bind(limit)
@@ -862,6 +980,7 @@ impl Db {
                 let Json(destinations): Json<Vec<Destination>> = r.try_get("destinations")?;
                 Ok(HealthTarget {
                     id: r.try_get("id")?,
+                    domain_id: r.try_get("domain_id")?,
                     code: r.try_get("code")?,
                     destinations,
                     version: r.try_get("destinations_version")?,
@@ -898,7 +1017,8 @@ impl Db {
             .rows_affected()
                 == 1;
             if updated && flipped {
-                self.changed(&mut tx, target.id, &target.code).await?;
+                self.changed(&mut tx, target.id, target.domain_id, &target.code)
+                    .await?;
             }
             tx.commit().await?;
             Ok(updated)
@@ -1337,14 +1457,10 @@ async fn enqueue(tx: &mut Transaction<'_, Postgres>, code: &str) -> Result<(), s
     .map(|_| ())
 }
 
-async fn notify(
-    tx: &mut Transaction<'_, Postgres>,
-    id: i64,
-    code: &str,
-) -> Result<(), sqlx::Error> {
+async fn notify(tx: &mut Transaction<'_, Postgres>, payload: &str) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(CHANGES_CHANNEL)
-        .bind(format!("{id}:{code}"))
+        .bind(payload)
         .execute(&mut **tx)
         .await
         .map(|_| ())
@@ -1357,14 +1473,15 @@ pub(crate) fn geo_columns(geo: Option<&GeoRule>) -> (Option<&'static str>, Vec<S
     }
 }
 
-/// Parses a change notification payload `<id>:<code>`.
+/// Parses a link change notification payload `<id>:<key>`, returning the
+/// link ID and its [`link_key`].
 pub fn parse_change(payload: &str) -> Option<(i64, &str)> {
-    let (id, code) = payload.split_once(':')?;
+    let (id, key) = payload.split_once(':')?;
     let id: i64 = id.parse().ok()?;
-    if id <= 0 || !crate::code::is_plausible_code(code) {
+    if id <= 0 || split_link_key(key).is_none() {
         return None;
     }
-    Some((id, code))
+    Some((id, key))
 }
 
 impl LeaseStore for Db {
@@ -1409,6 +1526,31 @@ mod tests {
         assert_eq!(parse_change("-1:abc"), None);
         assert_eq!(parse_change("12"), None);
         assert_eq!(parse_change("12:"), None);
+        assert_eq!(parse_change("12:7/abc"), Some((12, "7/abc")));
+        assert_eq!(parse_change("12:0/abc"), None);
+        assert_eq!(parse_change(DOMAINS_CHANGED), None);
+    }
+
+    #[test]
+    fn link_keys_round_trip() {
+        assert_eq!(link_key(None, "abc"), "abc");
+        assert_eq!(link_key(Some(42), "abc"), "42/abc");
+        assert_eq!(split_link_key("abc"), Some((None, "abc")));
+        assert_eq!(split_link_key("42/abc"), Some((Some(42), "abc")));
+        for bad in [
+            "",
+            "/abc",
+            "x/abc",
+            "-1/abc",
+            "0/abc",
+            "42/",
+            "42/a/b",
+            "42/a b",
+            "99999999999999999999/abc",
+            "+4/abc",
+        ] {
+            assert_eq!(split_link_key(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -1439,6 +1581,8 @@ mod tests {
             DbError::Conflict,
             DbError::Unavailable("x".into()),
             DbError::Other("y".into()),
+            DbError::Invalid("z".into()),
+            DbError::Precondition("w".into()),
         ] {
             assert!(!e.to_string().is_empty());
         }

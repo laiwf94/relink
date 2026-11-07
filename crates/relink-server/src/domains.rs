@@ -1,0 +1,1031 @@
+//! Custom domains: a workspace adds a hostname, proves it controls it with
+//! a DNS TXT record, and then creates links on it. Codes are unique per
+//! domain, and a redirect is routed by its `Host` header.
+//!
+//! Verification: adding `go.example.com` gives the workspace a random token
+//! to publish as a TXT record `relink-domain-verification=<token>` at
+//! `_relink-challenge.go.example.com`. `POST /v1/domains/{hostname}/verify`
+//! looks the record up through the configured recursive resolvers
+//! (src/dns.rs) and marks the domain verified when the token is there. Many
+//! workspaces may claim a hostname, but only the first to prove it gets it
+//! (a unique index over verified hostnames), so an unverified claim cannot
+//! lock the real owner out. Hostnames pass the same public-host rules as
+//! destinations before anything is looked up, and relink never connects to
+//! the domain itself.
+//!
+//! Routing: every instance keeps the verified hostnames in memory
+//! ([`DomainMap`]), loaded at start, on every change notification, whenever
+//! the change listener reconnects and once a minute. A request whose `Host`
+//! is a verified domain looks its code up on that domain only; any other
+//! host, including the one in `RELINK_PUBLIC_BASE_URL`, is the default
+//! domain, as before custom domains existed. Until the first load succeeds,
+//! requests for hosts that could be custom domains are answered 503 rather
+//! than guessed at.
+//!
+//! Limits: the plan's `max_domains` and a hard [`MAX_DOMAINS`] per
+//! workspace, checked when a domain is added under the workspace row lock
+//! (src/quota.rs). Managing domains needs `links:write` (reading them
+//! `links:read`) and the admin or owner role.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+
+use axum::extract::{Path, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sqlx::Row;
+use sqlx::postgres::PgRow;
+
+use crate::api::{ApiError, StrictJson, json};
+use crate::audit::{self, Action, Change};
+use crate::auth::Role;
+use crate::destination::{Policy, normalize};
+use crate::quota;
+use crate::server::App;
+use crate::store::{Db, DbError};
+use crate::tenant::{Allowed, LinksRead, LinksWrite, Tenant};
+use crate::util::{hex_encode, secure_random};
+
+/// The label in front of a hostname where its verification record lives.
+pub const CHALLENGE_LABEL: &str = "_relink-challenge";
+
+/// What the verification record's text starts with; the token follows.
+pub const RECORD_PREFIX: &str = "relink-domain-verification=";
+
+/// Most domains a workspace may hold whatever its plan, so a list of them is
+/// always one bounded answer.
+pub const MAX_DOMAINS: i64 = 1_000;
+
+/// Longest hostname (RFC 1035 section 2.3.4, without the final dot).
+pub const MAX_HOSTNAME: usize = 253;
+
+/// Validates a hostname a workspace wants to add and returns its stored
+/// form: lowercase, IDNA applied (`bücher.example.com` becomes
+/// `xn--bcher-kva.example.com`), no final dot. It must be a public name by
+/// the rules destinations follow (no IP addresses, single labels,
+/// `localhost`, `.internal` and the like), use only letters, digits and
+/// hyphens, and not be `default_host`.
+pub fn parse_hostname(raw: &str, default_host: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("hostname is required".into());
+    }
+    if raw.len() > 4 * MAX_HOSTNAME
+        || raw
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "/:@?#[]\\%".contains(c))
+    {
+        return Err(
+            "hostname must be a bare host name such as go.example.com, without a scheme, \
+             port or path"
+                .into(),
+        );
+    }
+    let policy = Policy {
+        allow_ip_literals: false,
+        allow_private: false,
+    };
+    let url = normalize(&format!("https://{raw}/"), policy).map_err(|e| {
+        format!(
+            "hostname: {}",
+            e.to_string()
+                .replace("URL host", "the host")
+                .replace("URL", "it")
+        )
+    })?;
+    let host = url::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .ok_or("hostname is not a valid host name")?;
+    let host = host.trim_end_matches('.').to_owned();
+    if !is_valid_hostname(&host) {
+        return Err(
+            "hostname must be labels of letters, digits and hyphens (not at either end of a \
+             label), at most 63 characters each and 253 in all, with at least two labels"
+                .into(),
+        );
+    }
+    if host == default_host {
+        return Err(format!(
+            "{host} is this server's own domain and needs no verification"
+        ));
+    }
+    Ok(host)
+}
+
+/// Whether `host` (lowercase, no final dot) is a hostname the `domains`
+/// table accepts: at least two labels of `[a-z0-9-]`, 1 to 63 characters,
+/// no hyphen at either end, 253 characters in all, and a top-level label
+/// that is not all digits (that would be an IPv4 address).
+pub fn is_valid_hostname(host: &str) -> bool {
+    !host.bytes().any(|b| b.is_ascii_uppercase()) && could_be_domain(host)
+}
+
+/// [`is_valid_hostname`] ignoring case: whether a `Host` could name a
+/// verified domain at all. IP addresses and single labels never can.
+fn could_be_domain(host: &str) -> bool {
+    if host.is_empty() || host.len() > MAX_HOSTNAME {
+        return false;
+    }
+    let mut labels = 0;
+    let mut last = "";
+    for l in host.split('.') {
+        let ok = !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !ok {
+            return false;
+        }
+        labels += 1;
+        last = l;
+    }
+    labels >= 2 && !last.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The host part of a `Host` header value: without the port and the final
+/// dot, case preserved. `None` for an IP literal in brackets, a malformed
+/// port, or anything that cannot be a hostname; those requests can only be
+/// for the default domain.
+pub fn host_part(raw: &[u8]) -> Option<&str> {
+    if raw.is_empty() || raw.len() > MAX_HOSTNAME + 7 || raw[0] == b'[' {
+        return None;
+    }
+    let s = std::str::from_utf8(raw).ok()?;
+    let host = match s.rsplit_once(':') {
+        Some((h, port)) => {
+            if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            h
+        }
+        None => s,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let ok = !host.is_empty()
+        && host.len() <= MAX_HOSTNAME
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    ok.then_some(host)
+}
+
+/// Which domain a redirect request is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// The default domain: codes without a custom domain.
+    Default,
+    /// The verified custom domain with this ID.
+    Domain(i64),
+    /// The verified domains have not been loaded yet, and the host is not
+    /// the default one, so the answer could be wrong either way.
+    Unavailable,
+}
+
+const SHARDS: usize = 16;
+
+/// The verified hostnames and their IDs, in memory on every instance. Split
+/// into shards so requests for different domains rarely share a lock, and
+/// skipped entirely while no domain is verified.
+pub struct DomainMap {
+    shards: [RwLock<HashMap<Box<str>, i64>>; SHARDS],
+    loaded: AtomicBool,
+    len: AtomicUsize,
+}
+
+impl Default for DomainMap {
+    fn default() -> Self {
+        DomainMap {
+            shards: Default::default(),
+            loaded: AtomicBool::new(false),
+            len: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// FNV-1a: a few instructions, and the hostnames are verified ones, which
+/// no stranger chooses, so flooding a shard is not a concern.
+fn shard_of(host: &str) -> usize {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in host.bytes() {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    h as usize % SHARDS
+}
+
+impl DomainMap {
+    /// Whether a load has succeeded since start.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    /// Verified domains known.
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The ID of a verified domain by its lowercase hostname.
+    pub fn get(&self, host: &str) -> Option<i64> {
+        self.shards[shard_of(host)]
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .copied()
+    }
+
+    /// Replaces the contents with `domains` (hostname, ID).
+    pub fn replace(&self, domains: Vec<(String, i64)>) {
+        let mut fresh: [HashMap<Box<str>, i64>; SHARDS] = Default::default();
+        let n = domains.len();
+        for (host, id) in domains {
+            fresh[shard_of(&host)].insert(host.into_boxed_str(), id);
+        }
+        for (shard, map) in self.shards.iter().zip(fresh) {
+            *shard.write().unwrap_or_else(|e| e.into_inner()) = map;
+        }
+        self.len.store(n, Ordering::Release);
+        self.loaded.store(true, Ordering::Release);
+    }
+
+    /// Routes a request by its `Host` header. No header, or one that
+    /// cannot name a verified domain (an IP address, a single label), is the
+    /// default domain, whether or not the domains have loaded.
+    pub fn route(&self, host_header: Option<&[u8]>, default_host: &str) -> Route {
+        let Some(host) = host_header.and_then(host_part) else {
+            return Route::Default;
+        };
+        if host.eq_ignore_ascii_case(default_host) || !could_be_domain(host) {
+            return Route::Default;
+        }
+        if !self.is_loaded() {
+            return Route::Unavailable;
+        }
+        if self.is_empty() {
+            return Route::Default;
+        }
+        match self.get(&host.to_ascii_lowercase()) {
+            Some(id) => Route::Domain(id),
+            None => Route::Default,
+        }
+    }
+}
+
+/// The DNS name whose TXT records verify `hostname`.
+pub fn challenge_name(hostname: &str) -> String {
+    format!("{CHALLENGE_LABEL}.{hostname}")
+}
+
+/// The TXT record text that verifies a domain with `token`.
+pub fn expected_record(token: &str) -> String {
+    format!("{RECORD_PREFIX}{token}")
+}
+
+/// A fresh verification token: 128 random bits as 32 hex characters.
+pub fn generate_token() -> String {
+    let mut b = [0u8; 16];
+    secure_random(&mut b);
+    hex_encode(&b)
+}
+
+/// Whether the TXT `records` found at the challenge name prove `token`.
+/// Surrounding spaces are forgiven (some DNS consoles add them); anything
+/// else must match exactly. The error says what was found instead.
+pub fn check_records(records: &[String], token: &str) -> Result<(), String> {
+    let want = expected_record(token);
+    if records.iter().any(|r| r.trim() == want) {
+        return Ok(());
+    }
+    let ours = records
+        .iter()
+        .filter(|r| r.trim().starts_with(RECORD_PREFIX))
+        .count();
+    Err(match (records.len(), ours) {
+        (0, _) => "no TXT record found".to_owned(),
+        (_, 0) => format!(
+            "{} TXT record(s) found, none starting with {RECORD_PREFIX}",
+            records.len()
+        ),
+        _ => format!(
+            "a {RECORD_PREFIX} record was found, but with another token (from an earlier \
+             attempt, or another workspace's)"
+        ),
+    })
+}
+
+/// A domain as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Domain {
+    pub id: i64,
+    pub hostname: String,
+    pub verification_token: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub check_error: Option<String>,
+}
+
+/// Columns read into a [`Domain`], as a literal so queries stay `&'static str`.
+macro_rules! domain_columns {
+    () => {
+        "id, hostname, verification_token, created_by, created_at, verified_at, checked_at, \
+         check_error"
+    };
+}
+
+fn row_to_domain(r: &PgRow) -> Result<Domain, sqlx::Error> {
+    Ok(Domain {
+        id: r.try_get("id")?,
+        hostname: r.try_get("hostname")?,
+        verification_token: r.try_get("verification_token")?,
+        created_by: r.try_get("created_by")?,
+        created_at: r.try_get("created_at")?,
+        verified_at: r.try_get("verified_at")?,
+        checked_at: r.try_get("checked_at")?,
+        check_error: r.try_get("check_error")?,
+    })
+}
+
+/// A domain as the audit log shows it.
+pub fn domain_state(d: &Domain) -> Value {
+    json!({
+        "id": d.id,
+        "hostname": d.hostname,
+        "verified_at": d.verified_at,
+    })
+}
+
+/// The record to publish, as `GET /v1/domains` shows it.
+#[derive(Debug, Serialize)]
+pub struct VerificationView {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub name: String,
+    pub value: String,
+}
+
+/// A domain as the API returns it.
+#[derive(Debug, Serialize)]
+pub struct DomainView {
+    pub hostname: String,
+    pub verified: bool,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub verification: VerificationView,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub check_error: Option<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&Domain> for DomainView {
+    fn from(d: &Domain) -> DomainView {
+        DomainView {
+            hostname: d.hostname.clone(),
+            verified: d.verified_at.is_some(),
+            verified_at: d.verified_at,
+            verification: VerificationView {
+                kind: "TXT",
+                name: challenge_name(&d.hostname),
+                value: expected_record(&d.verification_token),
+            },
+            checked_at: d.checked_at,
+            check_error: d.check_error.clone(),
+            created_by: d.created_by.clone(),
+            created_at: d.created_at,
+        }
+    }
+}
+
+/// Longest stored check error; the column allows 300.
+const MAX_CHECK_ERROR: usize = 300;
+
+fn clip(mut s: String) -> String {
+    if s.len() > MAX_CHECK_ERROR {
+        let mut end = MAX_CHECK_ERROR;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
+impl Db {
+    /// Every verified domain as (hostname, ID), for routing. Crosses
+    /// workspaces by design, so it runs as the server's own role.
+    pub async fn verified_domains(&self) -> Result<Vec<(String, i64)>, DbError> {
+        let rows = self
+            .timed(
+                sqlx::query("SELECT hostname, id FROM domains WHERE verified_at IS NOT NULL")
+                    .fetch_all(self.pool()),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("hostname")?, r.try_get("id")?)))
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+}
+
+impl Tenant<'_> {
+    /// Adds `hostname` (already validated) to this workspace, unverified,
+    /// with a fresh token, if the plan admits another domain. The same
+    /// hostname twice in one workspace is `Conflict`.
+    pub async fn add_domain(&self, hostname: &str, created_by: &str) -> Result<Domain, DbError> {
+        let token = generate_token();
+        self.db()
+            .timed(async {
+                let mut tx = self.begin().await?;
+                if let Err(q) = quota::admit_new_domain(&mut tx, MAX_DOMAINS).await? {
+                    return Ok(Err(DbError::Quota(q)));
+                }
+                let row = sqlx::query(concat!(
+                    "INSERT INTO domains (hostname, verification_token, created_by) \
+                     VALUES ($1, $2, $3) RETURNING ",
+                    domain_columns!()
+                ))
+                .bind(hostname)
+                .bind(&token)
+                .bind(created_by)
+                .fetch_one(&mut *tx)
+                .await?;
+                let domain = row_to_domain(&row)?;
+                let change = Change {
+                    workspace_id: self.workspace_id(),
+                    action: Action::DomainCreate,
+                    target: format!("domain:{}", domain.id),
+                    before: None,
+                    after: Some(domain_state(&domain)),
+                };
+                audit::record(&mut tx, self.actor(), change).await?;
+                tx.commit().await?;
+                Ok(Ok(domain))
+            })
+            .await?
+    }
+
+    /// This workspace's domains, by hostname.
+    pub async fn domains(&self) -> Result<Vec<Domain>, DbError> {
+        let rows = self
+            .db()
+            .timed(async {
+                let mut tx = self.begin().await?;
+                let rows = sqlx::query(concat!(
+                    "SELECT ",
+                    domain_columns!(),
+                    " FROM domains ORDER BY hostname"
+                ))
+                .fetch_all(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(rows)
+            })
+            .await?;
+        rows.iter()
+            .map(row_to_domain)
+            .collect::<Result<_, _>>()
+            .map_err(DbError::from)
+    }
+
+    /// One of this workspace's domains by hostname.
+    pub async fn domain(&self, hostname: &str) -> Result<Domain, DbError> {
+        let row = self
+            .db()
+            .timed(async {
+                let mut tx = self.begin().await?;
+                let row = sqlx::query(concat!(
+                    "SELECT ",
+                    domain_columns!(),
+                    " FROM domains WHERE hostname = $1"
+                ))
+                .bind(hostname)
+                .fetch_optional(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(row)
+            })
+            .await?
+            .ok_or(DbError::NotFound)?;
+        row_to_domain(&row).map_err(DbError::from)
+    }
+
+    /// Records the outcome of a verification attempt for a domain that was
+    /// not verified: `Ok` verifies it (audited, and every instance is told),
+    /// `Err` stores why not. A hostname another workspace verified first is
+    /// `Conflict`. A domain verified meanwhile is returned as it is.
+    pub async fn record_check(
+        &self,
+        hostname: &str,
+        outcome: Result<(), String>,
+    ) -> Result<Domain, DbError> {
+        let ok = outcome.is_ok();
+        let error = outcome.err().map(clip);
+        self.db()
+            .timed(async {
+                let mut tx = self.begin().await?;
+                let row = sqlx::query(concat!(
+                    "UPDATE domains SET checked_at = now(), check_error = $2, \
+                            verified_at = CASE WHEN $3 THEN now() END \
+                      WHERE hostname = $1 AND verified_at IS NULL RETURNING ",
+                    domain_columns!()
+                ))
+                .bind(hostname)
+                .bind(&error)
+                .bind(ok)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(row) = row else {
+                    // Verified by a concurrent request, or deleted.
+                    let row = sqlx::query(concat!(
+                        "SELECT ",
+                        domain_columns!(),
+                        " FROM domains WHERE hostname = $1"
+                    ))
+                    .bind(hostname)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(sqlx::Error::RowNotFound)?;
+                    tx.commit().await?;
+                    return row_to_domain(&row);
+                };
+                let domain = row_to_domain(&row)?;
+                if ok {
+                    let change = Change {
+                        workspace_id: self.workspace_id(),
+                        action: Action::DomainVerify,
+                        target: format!("domain:{}", domain.id),
+                        before: Some(domain_state(&Domain {
+                            verified_at: None,
+                            ..domain.clone()
+                        })),
+                        after: Some(domain_state(&domain)),
+                    };
+                    audit::record(&mut tx, self.actor(), change).await?;
+                    self.db().domains_changed(&mut tx).await?;
+                }
+                tx.commit().await?;
+                Ok(domain)
+            })
+            .await
+    }
+
+    /// Deletes a domain. One that still has links is refused
+    /// (`Precondition`): their short URLs are out there, and deleting
+    /// the domain would break them silently.
+    pub async fn delete_domain(&self, hostname: &str) -> Result<Domain, DbError> {
+        self.db()
+            .timed(async {
+                let mut tx = self.begin().await?;
+                let deleted = sqlx::query(concat!(
+                    "DELETE FROM domains WHERE hostname = $1 RETURNING ",
+                    domain_columns!()
+                ))
+                .bind(hostname)
+                .fetch_optional(&mut *tx)
+                .await;
+                let row = match deleted {
+                    Err(e) if DbError::is_fk_violation(&e) => {
+                        return Ok(Err(DbError::Precondition(format!(
+                            "{hostname} still has links; delete them before the domain"
+                        ))));
+                    }
+                    other => other?.ok_or(sqlx::Error::RowNotFound)?,
+                };
+                let domain = row_to_domain(&row)?;
+                let change = Change {
+                    workspace_id: self.workspace_id(),
+                    action: Action::DomainDelete,
+                    target: format!("domain:{}", domain.id),
+                    before: Some(domain_state(&domain)),
+                    after: None,
+                };
+                audit::record(&mut tx, self.actor(), change).await?;
+                if domain.verified_at.is_some() {
+                    self.db().domains_changed(&mut tx).await?;
+                }
+                tx.commit().await?;
+                Ok(Ok(domain))
+            })
+            .await?
+    }
+}
+
+impl App {
+    /// Reloads the verified domains from the database. On failure the
+    /// previous set stays in use.
+    pub async fn reload_domains(&self) -> Result<(), DbError> {
+        let domains = self.db.verified_domains().await?;
+        self.domains.replace(domains);
+        Ok(())
+    }
+}
+
+/// Reloads the verified domains in the background (from the change
+/// listener, which must not wait on a query).
+pub fn spawn_reload(app: Arc<App>) {
+    tokio::spawn(async move {
+        if let Err(e) = app.reload_domains().await {
+            app.metrics.db_error(crate::metrics::DbOp::Maintenance);
+            tracing::warn!(error = %e, "could not reload verified domains");
+        }
+    });
+}
+
+/// Managing domains is for admins and owners: a domain is the workspace's
+/// public name, and its plan may limit how many it has.
+fn require_admin(app: &App, role: Role) -> Result<(), ApiError> {
+    if role.manages(Role::Editor) {
+        Ok(())
+    } else {
+        app.metrics.permission_denied.inc();
+        Err(ApiError::permission_denied(format!(
+            "managing domains needs the admin or owner role; this member is {}",
+            role.as_str()
+        )))
+    }
+}
+
+/// A hostname from a path, lowercased; the lookup decides whether it exists.
+fn path_hostname(raw: &str) -> String {
+    raw.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn domain_error(e: DbError, hostname: &str) -> ApiError {
+    match e {
+        DbError::NotFound => {
+            ApiError::not_found_msg(format!("no domain {hostname} in this workspace"))
+        }
+        other => ApiError::from(other),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateDomain {
+    pub hostname: String,
+}
+
+#[derive(Serialize)]
+struct DomainList {
+    domains: Vec<DomainView>,
+}
+
+/// `POST /v1/domains`: adds an unverified domain and returns the record to
+/// publish.
+pub async fn create_domain(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksWrite>,
+    StrictJson(req): StrictJson<CreateDomain>,
+) -> Result<Response, ApiError> {
+    require_admin(&app, ws.principal.role)?;
+    let hostname =
+        parse_hostname(&req.hostname, &app.cfg.default_host).map_err(ApiError::invalid)?;
+    let domain = ws
+        .tenant(&app.db)
+        .add_domain(&hostname, &ws.principal.owner)
+        .await
+        .map_err(|e| match e {
+            DbError::Conflict => {
+                ApiError::conflict(format!("this workspace already has the domain {hostname}"))
+            }
+            DbError::Quota(q) => {
+                app.metrics.quota_exceeded(q.kind);
+                ApiError::from(DbError::Quota(q))
+            }
+            other => ApiError::from(other),
+        })?;
+    tracing::info!(domain = domain.id, "domain added");
+    let mut resp = json(StatusCode::CREATED, &DomainView::from(&domain));
+    if let Ok(v) = HeaderValue::from_str(&format!("/v1/domains/{}", domain.hostname)) {
+        resp.headers_mut().insert(header::LOCATION, v);
+    }
+    Ok(resp)
+}
+
+/// `GET /v1/domains`: every domain of the workspace.
+pub async fn list_domains(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksRead>,
+) -> Result<Response, ApiError> {
+    let domains = ws.tenant(&app.db).domains().await?;
+    Ok(json(
+        StatusCode::OK,
+        &DomainList {
+            domains: domains.iter().map(DomainView::from).collect(),
+        },
+    ))
+}
+
+/// `GET /v1/domains/{hostname}`.
+pub async fn get_domain(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksRead>,
+    Path(hostname): Path<String>,
+) -> Result<Response, ApiError> {
+    let hostname = path_hostname(&hostname);
+    let domain = ws
+        .tenant(&app.db)
+        .domain(&hostname)
+        .await
+        .map_err(|e| domain_error(e, &hostname))?;
+    Ok(json(StatusCode::OK, &DomainView::from(&domain)))
+}
+
+/// `POST /v1/domains/{hostname}/verify`: looks the TXT record up now. The
+/// answer is the domain, verified or with `check_error` saying what was
+/// found instead; a hostname another workspace verified first is
+/// `already_exists`.
+pub async fn verify_domain(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksWrite>,
+    Path(hostname): Path<String>,
+) -> Result<Response, ApiError> {
+    require_admin(&app, ws.principal.role)?;
+    let hostname = path_hostname(&hostname);
+    let tenant = ws.tenant(&app.db);
+    let domain = tenant
+        .domain(&hostname)
+        .await
+        .map_err(|e| domain_error(e, &hostname))?;
+    if domain.verified_at.is_some() {
+        return Ok(json(StatusCode::OK, &DomainView::from(&domain)));
+    }
+    let outcome = match app.dns.txt(&challenge_name(&hostname)).await {
+        Ok(records) => check_records(&records, &domain.verification_token),
+        Err(e) => Err(e.to_string()),
+    };
+    let checked = tenant
+        .record_check(&hostname, outcome)
+        .await
+        .map_err(|e| match e {
+            DbError::Conflict => ApiError::conflict(format!(
+                "{hostname} is already verified by another workspace"
+            )),
+            other => domain_error(other, &hostname),
+        })?;
+    if checked.verified_at.is_some() {
+        // This instance routes the domain at once; others when the change
+        // notification arrives.
+        if let Err(e) = app.reload_domains().await {
+            tracing::warn!(error = %e, "could not reload verified domains");
+        }
+        tracing::info!(domain = checked.id, "domain verified");
+    }
+    Ok(json(StatusCode::OK, &DomainView::from(&checked)))
+}
+
+/// `DELETE /v1/domains/{hostname}`: only once it has no links.
+pub async fn delete_domain(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksWrite>,
+    Path(hostname): Path<String>,
+) -> Result<Response, ApiError> {
+    require_admin(&app, ws.principal.role)?;
+    let hostname = path_hostname(&hostname);
+    let domain = ws
+        .tenant(&app.db)
+        .delete_domain(&hostname)
+        .await
+        .map_err(|e| domain_error(e, &hostname))?;
+    if domain.verified_at.is_some()
+        && let Err(e) = app.reload_domains().await
+    {
+        tracing::warn!(error = %e, "could not reload verified domains");
+    }
+    tracing::info!(domain = domain.id, "domain deleted");
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFAULT: &str = "s.relink.dev";
+
+    #[test]
+    fn hostnames_are_normalised_and_checked() {
+        let ok = |raw: &str| parse_hostname(raw, DEFAULT).unwrap();
+        assert_eq!(ok("go.example.com"), "go.example.com");
+        assert_eq!(ok("  Go.Example.COM. "), "go.example.com");
+        assert_eq!(ok("bücher.example.com"), "xn--bcher-kva.example.com");
+        assert_eq!(ok("a-b.c-d.co"), "a-b.c-d.co");
+        let label = "a".repeat(63);
+        assert_eq!(ok(&format!("{label}.com")), format!("{label}.com"));
+        let err = |raw: &str| parse_hostname(raw, DEFAULT).unwrap_err();
+        assert!(err("").contains("required"));
+        for raw in [
+            "https://go.example.com",
+            "go.example.com/x",
+            "go.example.com:443",
+            "user@go.example.com",
+            "go example.com",
+            "go.example.com?x",
+            "[::1]",
+            "go%2eexample.com",
+        ] {
+            assert!(err(raw).contains("bare host name"), "{raw}: {}", err(raw));
+        }
+        for raw in ["127.0.0.1", "10.0.0.1", "0x7f.1"] {
+            assert!(err(raw).contains("IP address"), "{raw}: {}", err(raw));
+        }
+        for raw in [
+            "localhost",
+            "intranet",
+            "db.internal",
+            "x.local",
+            "a.test",
+            "foo.onion",
+        ] {
+            assert!(err(raw).contains("public"), "{raw}: {}", err(raw));
+        }
+        for raw in [
+            "go_x.example.com",
+            "-go.example.com",
+            "go-.example.com",
+            &format!("{}a.com", "a".repeat(63)),
+            &format!("{}com", "a.".repeat(126)),
+        ] {
+            assert!(err(raw).contains("labels"), "{raw}: {}", err(raw));
+        }
+        assert!(err("S.Relink.dev").contains("own domain"));
+    }
+
+    #[test]
+    fn valid_hostnames_match_the_database_check() {
+        for ok in [
+            "a.b",
+            "go.example.com",
+            "xn--bcher-kva.example",
+            "1.example.com",
+            "a.b2",
+        ] {
+            assert!(is_valid_hostname(ok), "{ok}");
+        }
+        for bad in [
+            "", "com", "a..b", ".a.b", "a.b.", "A.b", "a_b.c", "1.2.3.4", "a.-b", "a.b-",
+        ] {
+            assert!(!is_valid_hostname(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_headers_are_reduced_to_their_host() {
+        assert_eq!(host_part(b"go.example.com"), Some("go.example.com"));
+        assert_eq!(host_part(b"Go.Example.com:8080"), Some("Go.Example.com"));
+        assert_eq!(host_part(b"go.example.com."), Some("go.example.com"));
+        assert_eq!(host_part(b"go.example.com.:443"), Some("go.example.com"));
+        assert_eq!(host_part(b"127.0.0.1:80"), Some("127.0.0.1"));
+        for bad in [
+            &b""[..],
+            b"[::1]:8080",
+            b"go.example.com:",
+            b"go.example.com:http",
+            b"go.example.com:123456",
+            b"a:b:c",
+            b"go example.com",
+            b"go_x.com",
+            b".",
+            b"\xff.com",
+        ] {
+            assert_eq!(host_part(bad), None, "{:?}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(host_part("a".repeat(300).as_bytes()), None);
+    }
+
+    #[test]
+    fn requests_route_by_host() {
+        let map = DomainMap::default();
+        // Before the first load only the default host can be answered.
+        assert_eq!(
+            map.route(Some(b"go.example.com"), DEFAULT),
+            Route::Unavailable
+        );
+        assert_eq!(
+            map.route(Some(b"S.RELINK.dev:443"), DEFAULT),
+            Route::Default
+        );
+        assert_eq!(map.route(None, DEFAULT), Route::Default);
+        assert_eq!(map.route(Some(b"[::1]:80"), DEFAULT), Route::Default);
+        for never_a_domain in [
+            &b"127.0.0.1:8080"[..],
+            b"localhost",
+            b"intranet:80",
+            b"a..b",
+        ] {
+            assert_eq!(map.route(Some(never_a_domain), DEFAULT), Route::Default);
+        }
+        map.replace(vec![]);
+        assert!(map.is_loaded() && map.is_empty());
+        assert_eq!(map.route(Some(b"go.example.com"), DEFAULT), Route::Default);
+        map.replace(vec![
+            ("go.example.com".into(), 7),
+            ("x.example.org".into(), 9),
+        ]);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.route(Some(b"Go.Example.com:8443"), DEFAULT),
+            Route::Domain(7)
+        );
+        assert_eq!(
+            map.route(Some(b"x.example.org."), DEFAULT),
+            Route::Domain(9)
+        );
+        // Unknown hosts get the default domain, as before custom domains.
+        assert_eq!(
+            map.route(Some(b"other.example.com"), DEFAULT),
+            Route::Default
+        );
+        assert_eq!(map.route(Some(b"127.0.0.1:8080"), DEFAULT), Route::Default);
+        // A reload drops what is no longer verified.
+        map.replace(vec![("x.example.org".into(), 9)]);
+        assert_eq!(map.get("go.example.com"), None);
+        assert_eq!(map.route(Some(b"go.example.com"), DEFAULT), Route::Default);
+        // Many domains spread over the shards and are all found.
+        let many: Vec<(String, i64)> = (0..500).map(|i| (format!("d{i}.example.com"), i)).collect();
+        map.replace(many.clone());
+        for (host, id) in many {
+            assert_eq!(map.get(&host), Some(id));
+        }
+    }
+
+    #[test]
+    fn records_prove_the_token_or_say_why_not() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            challenge_name("go.example.com"),
+            "_relink-challenge.go.example.com"
+        );
+        let good = expected_record(token);
+        assert_eq!(check_records(std::slice::from_ref(&good), token), Ok(()));
+        assert_eq!(
+            check_records(&["v=spf1 -all".into(), format!(" {good} ")], token),
+            Ok(())
+        );
+        assert!(
+            check_records(&[], token)
+                .unwrap_err()
+                .contains("no TXT record")
+        );
+        assert!(
+            check_records(&["v=spf1 -all".into()], token)
+                .unwrap_err()
+                .contains("none starting with relink-domain-verification=")
+        );
+        assert!(
+            check_records(&[expected_record(&"f".repeat(32))], token)
+                .unwrap_err()
+                .contains("another token")
+        );
+        // A record that merely contains the token is not enough.
+        assert!(check_records(&[format!("x{good}")], token).is_err());
+        assert!(check_records(&[good.to_uppercase()], token).is_err());
+        let t = generate_token();
+        assert_eq!(t.len(), 32);
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_ne!(t, generate_token());
+    }
+
+    #[test]
+    fn views_and_states() {
+        let d = Domain {
+            id: 3,
+            hostname: "go.example.com".into(),
+            verification_token: "ab".repeat(16),
+            created_by: "alice".into(),
+            created_at: Utc::now(),
+            verified_at: None,
+            checked_at: None,
+            check_error: Some("no TXT record found".into()),
+        };
+        let v = serde_json::to_value(DomainView::from(&d)).unwrap();
+        assert_eq!(v["verified"], false);
+        assert_eq!(v["verification"]["type"], "TXT");
+        assert_eq!(
+            v["verification"]["name"],
+            "_relink-challenge.go.example.com"
+        );
+        assert_eq!(
+            v["verification"]["value"],
+            format!("relink-domain-verification={}", "ab".repeat(16))
+        );
+        assert_eq!(
+            domain_state(&d),
+            json!({"id": 3, "hostname": "go.example.com", "verified_at": null})
+        );
+        assert_eq!(clip("é".repeat(200)).len(), 300);
+        assert_eq!(clip("x".repeat(10)), "x".repeat(10));
+        assert_eq!(path_hostname("Go.Example.com."), "go.example.com");
+    }
+}

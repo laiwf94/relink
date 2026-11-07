@@ -14,6 +14,7 @@
         "summary": "Follow a short link",
         "operationId": "redirect",
         "security": [],
+        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's.",
         "parameters": [{ "$ref": "#/components/parameters/Code" }],
         "responses": {
           "301": { "$ref": "#/components/responses/Redirect" },
@@ -23,7 +24,7 @@
           "404": { "description": "Unknown or disabled code.", "content": { "text/plain": { "schema": { "type": "string" } } } },
           "410": { "description": "Expired or click limit reached.", "content": { "text/plain": { "schema": { "type": "string" } } } },
           "451": { "description": "Not available in the visitor's country and no fallback URL is set.", "content": { "text/plain": { "schema": { "type": "string" } } } },
-          "503": { "description": "The link is not cached and the database is unavailable.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/plain": { "schema": { "type": "string" } } } }
+          "503": { "description": "The link is not cached and the database is unavailable, or the host may be a custom domain and the verified domains have not been loaded yet.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/plain": { "schema": { "type": "string" } } } }
         }
       }
     },
@@ -60,7 +61,7 @@
       "post": {
         "summary": "Create a link",
         "operationId": "createLink",
-        "description": "Refused with quota_exceeded (403) when the workspace holds as many links as its plan allows or has used its plan's clicks for the current UTC month; see GET /v1/usage.",
+        "description": "Refused with quota_exceeded (403) when the workspace holds as many links as its plan allows or has used its plan's clicks for the current UTC month; see GET /v1/usage. With domain, the code is on that verified custom domain and only needs to be unique there.",
         "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
         "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateLink" } } } },
@@ -95,7 +96,7 @@
       }
     },
     "/v1/links/{code}": {
-      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }],
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
       "get": {
         "summary": "Get a link in the workspace",
         "operationId": "getLink",
@@ -149,12 +150,97 @@
         "summary": "Plan, limits and usage",
         "operationId": "usage",
         "security": [{ "apiKey": ["stats:read"] }, { "session": [] }],
-        "description": "The workspace's plan, how many links it holds and how many clicks it has had in the current UTC month, each with the plan's limit (null for none). Clicks are counted when the click pipeline writes them, so they trail redirects by up to the flush interval. Over a limit, creating links is refused with quota_exceeded; redirects are never refused.",
+        "description": "The workspace's plan, how many links and custom domains it holds and how many clicks it has had in the current UTC month, each with the plan's limit (null for none). Clicks are counted when the click pipeline writes them, so they trail redirects by up to the flush interval. Over a limit, creating links is refused with quota_exceeded; redirects are never refused.",
         "responses": {
           "200": { "description": "Usage.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Usage" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/domains": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Add a custom domain",
+        "operationId": "createDomain",
+        "description": "Adds an unverified domain and returns the TXT record that proves it. Needs the admin or owner role. Refused with quota_exceeded (403) when the workspace holds as many domains as its plan allows (and never more than 1000), already_exists (409) when it already has this hostname.",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateDomain" } } } },
+        "responses": {
+          "201": { "description": "Added, not yet verified.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Domain" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List the workspace's custom domains",
+        "operationId": "listDomains",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": { "description": "Every domain, by hostname.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DomainList" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/domains/{hostname}": {
+      "parameters": [{ "$ref": "#/components/parameters/Hostname" }, { "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "Get a custom domain",
+        "operationId": "getDomain",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": { "description": "The domain.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Domain" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a custom domain",
+        "operationId": "deleteDomain",
+        "description": "Needs the admin or owner role. A domain that still has links is refused with failed_precondition (409).",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "204": { "description": "Deleted." },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/domains/{hostname}/verify": {
+      "parameters": [{ "$ref": "#/components/parameters/Hostname" }, { "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Check a custom domain's TXT record now",
+        "operationId": "verifyDomain",
+        "description": "Looks up the TXT record at verification.name through the server's DNS resolvers. When it holds verification.value the domain is verified and serves links from then on; otherwise check_error says what was found. Needs the admin or owner role and no body. A hostname another workspace verified first is already_exists (409).",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "200": { "description": "The domain after the check.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Domain" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
         }
@@ -338,7 +424,7 @@
       }
     },
     "/v1/links/{code}/stats": {
-      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }],
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
       "get": {
         "summary": "Click statistics",
         "operationId": "linkStats",
@@ -368,6 +454,8 @@
     },
     "parameters": {
       "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } },
+      "Domain": { "name": "domain", "in": "query", "required": false, "schema": { "type": "string", "maxLength": 253 }, "description": "The custom domain the code is on; absent for the default domain. A hostname the workspace does not have finds no link." },
+      "Hostname": { "name": "hostname", "in": "path", "required": true, "schema": { "type": "string", "maxLength": 253 }, "description": "The domain's hostname, case-insensitive." },
       "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied. A session acts in the named workspace if the person is a member, else in their personal workspace." },
       "InviteToken": { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^rli_[0-9a-f]{64}$" }, "description": "The token from the invitation link. It is a credential: relink never logs it." },
       "Csrf": { "name": "X-CSRF-Token", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "description": "The session's CSRF token; required on every state-changing request authenticated by the session cookie." }
@@ -425,7 +513,7 @@
             "type": "object",
             "required": ["code", "message", "request_id"],
             "properties": {
-              "code": { "enum": ["invalid_argument", "unauthenticated", "permission_denied", "quota_exceeded", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "internal", "unavailable"] },
+              "code": { "enum": ["invalid_argument", "unauthenticated", "permission_denied", "quota_exceeded", "not_found", "method_not_allowed", "already_exists", "payload_too_large", "unsupported_media_type", "resource_exhausted", "failed_precondition", "internal", "unavailable"] },
               "message": { "type": "string" },
               "request_id": { "type": "string" }
             }
@@ -464,7 +552,8 @@
           "geo": { "$ref": "#/components/schemas/Geo" },
           "fallback_url": { "type": "string", "maxLength": 2048, "description": "Used for geo-blocked visitors and when every destination is unhealthy." },
           "enabled": { "type": "boolean", "default": true },
-          "health_check": { "type": "boolean", "default": false }
+          "health_check": { "type": "boolean", "default": false },
+          "domain": { "type": ["string", "null"], "maxLength": 253, "description": "A custom domain the workspace has verified; absent or null for the default domain." }
         }
       },
       "PatchLink": {
@@ -485,9 +574,10 @@
       },
       "Link": {
         "type": "object",
-        "required": ["code", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "created_at", "updated_at"],
+        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "created_at", "updated_at"],
         "properties": {
           "code": { "type": "string" },
+          "domain": { "type": ["string", "null"], "description": "The custom domain the link is on; null for the default domain." },
           "short_url": { "type": "string" },
           "destinations": {
             "type": "array",
@@ -636,15 +726,48 @@
       },
       "Usage": {
         "type": "object",
-        "required": ["workspace_id", "plan", "period_start", "period_end", "links", "clicks"],
+        "required": ["workspace_id", "plan", "period_start", "period_end", "links", "clicks", "domains"],
         "properties": {
           "workspace_id": { "type": "integer" },
           "plan": { "type": "string" },
           "period_start": { "type": "string", "format": "date", "description": "First day of the current UTC month." },
           "period_end": { "type": "string", "format": "date", "description": "First day of the next month, when the click meter starts again." },
           "links": { "$ref": "#/components/schemas/Meter" },
-          "clicks": { "$ref": "#/components/schemas/Meter" }
+          "clicks": { "$ref": "#/components/schemas/Meter" },
+          "domains": { "$ref": "#/components/schemas/Meter" }
         }
+      },
+      "CreateDomain": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hostname"],
+        "properties": {
+          "hostname": { "type": "string", "description": "A public hostname such as go.example.com, without scheme, port or path. Stored lowercase with IDNA applied." }
+        }
+      },
+      "Domain": {
+        "type": "object",
+        "required": ["hostname", "verified", "verified_at", "verification", "checked_at", "check_error", "created_by", "created_at"],
+        "properties": {
+          "hostname": { "type": "string" },
+          "verified": { "type": "boolean" },
+          "verified_at": { "type": ["string", "null"], "format": "date-time" },
+          "verification": {
+            "type": "object",
+            "required": ["type", "name", "value"],
+            "description": "The DNS record to publish to verify the domain.",
+            "properties": { "type": { "const": "TXT" }, "name": { "type": "string" }, "value": { "type": "string" } }
+          },
+          "checked_at": { "type": ["string", "null"], "format": "date-time", "description": "The last verification attempt." },
+          "check_error": { "type": ["string", "null"], "description": "Why the last attempt did not verify the domain." },
+          "created_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "DomainList": {
+        "type": "object",
+        "required": ["domains"],
+        "properties": { "domains": { "type": "array", "items": { "$ref": "#/components/schemas/Domain" } } }
       },
       "Stats": {
         "type": "object",

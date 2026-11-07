@@ -65,12 +65,23 @@ fn all_but(s: Scope) -> Scopes {
         .fold(Scopes::NONE, |acc, o| acc | o)
 }
 
+/// The custom domain the domain routes act on.
+const HOST: &str = "go.relink-docs.net";
+
 /// Sends one request for a documented route with a body that would succeed.
 async fn call(h: &Harness, method: &str, path: &str, code: &str, key: &str) -> (u16, Value) {
     let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
-    let body = matches!(method, "post" | "patch")
-        .then(|| json!({"enabled": true, "url": "https://example.com/"}));
-    h.api(m, &path.replace("{code}", code), key, body).await
+    let body = match (method, path) {
+        (_, "/v1/domains/{hostname}/verify") => None,
+        // A new hostname each time, so a second call is not a duplicate.
+        ("post", "/v1/domains") => Some(json!({
+            "hostname": format!("d{}.relink-docs.net", relink_server::code::random_code(8).to_lowercase())
+        })),
+        ("post" | "patch", _) => Some(json!({"enabled": true, "url": "https://example.com/"})),
+        _ => None,
+    };
+    let path = path.replace("{code}", code).replace("{hostname}", HOST);
+    h.api(m, &path, key, body).await
 }
 
 #[tokio::test]
@@ -110,12 +121,21 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 7);
+    assert_eq!(routes.len(), 12);
     // Deletion last, so the other routes still find the link.
     routes.sort_by_key(|(m, _, _)| *m == "delete");
 
     let link = h.create(json!({"url": "https://example.com/"})).await;
     let code = link["code"].as_str().unwrap();
+    let (status, body) = h
+        .api(
+            Method::POST,
+            "/v1/domains",
+            &h.alice,
+            Some(json!({"hostname": HOST})),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
     for (method, path, scope) in &routes {
         let (without, _) = make_key(&h, "alice", None, all_but(*scope), None)
             .await
@@ -151,7 +171,7 @@ async fn every_route_requires_its_documented_scope() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
-    assert!(metric(&h.metrics().await, "relink_api_permission_denied_total") >= 8.0);
+    assert!(metric(&h.metrics().await, "relink_api_permission_denied_total") >= 13.0);
     h.shutdown().await;
 }
 

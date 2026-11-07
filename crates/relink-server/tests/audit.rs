@@ -83,7 +83,7 @@ async fn api_changes_are_recorded_with_actor_before_and_after() {
 
     h.create(json!({"url": "https://example.com/a", "alias": "audited"}))
         .await;
-    let link_id = h.store.tenant(ws).link("audited").await.unwrap().id;
+    let link_id = h.store.tenant(ws).link("audited", None).await.unwrap().id;
     let (status, _) = h
         .api(
             Method::PATCH,
@@ -223,7 +223,7 @@ async fn tampering_is_found_and_located() {
             enabled: Some(enabled),
             ..LinkPatch::default()
         };
-        alice.update_link("tamper1", &patch).await.unwrap();
+        alice.update_link("tamper1", None, &patch).await.unwrap();
     }
     // Entries 1 to 5: workspace.create, link.create, three updates.
     let heads = store.verify_audit(Some(ws), &[]).await.unwrap();

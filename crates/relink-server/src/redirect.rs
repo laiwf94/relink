@@ -1,7 +1,7 @@
 //! `GET /{code}` on the origin. The decision itself is
 //! `relink_core::rules::evaluate`, shared with the edge worker; this module
-//! adds what only the origin has: the cache, the click limiter and the click
-//! queue.
+//! adds what only the origin has: routing by `Host` to a custom domain
+//! (src/domains.rs), the cache, the click limiter and the click queue.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -14,12 +14,14 @@ use axum::response::{IntoResponse, Response};
 use crate::classify::{UNKNOWN_COUNTRY, country, device_class, referrer_host};
 use crate::clicks::{ClickEvent, fingerprint};
 use crate::code::is_plausible_code;
+use crate::domains::Route;
 use crate::limiter::Admit;
 use crate::metrics::Outcome;
 use crate::model::Link;
 use crate::resolver::Resolved;
 use crate::rules::{Decision, Settings, Visit, evaluate};
 use crate::server::App;
+use crate::store::link_key;
 use crate::util::{fast_random, now_ms, utc_day};
 
 pub async fn redirect(
@@ -83,7 +85,16 @@ pub async fn handle(
             Outcome::NotFound,
         );
     }
-    let link = match app.resolver.resolve(code).await {
+    let route = app.domains.route(
+        headers.get(header::HOST).map(HeaderValue::as_bytes),
+        &app.cfg.default_host,
+    );
+    let key = match route {
+        Route::Default => None,
+        Route::Domain(id) => Some(link_key(Some(id), code)),
+        Route::Unavailable => return (unavailable(), Outcome::Unavailable),
+    };
+    let link = match app.resolver.resolve(key.as_deref().unwrap_or(code)).await {
         Resolved::Found(link) => link,
         Resolved::NotFound => {
             return (
