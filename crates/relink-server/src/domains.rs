@@ -332,13 +332,27 @@ pub struct Domain {
     pub verified_at: Option<DateTime<Utc>>,
     pub checked_at: Option<DateTime<Utc>>,
     pub check_error: Option<String>,
+    /// The certificate's state (migration 0011, src/acme.rs).
+    pub tls: TlsState,
+}
+
+/// Where a domain's certificate stands, as the ACME worker last left it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsState {
+    pub not_after: Option<DateTime<Utc>>,
+    pub renew_at: Option<DateTime<Utc>>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub failures: i32,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
 }
 
 /// Columns read into a [`Domain`], as a literal so queries stay `&'static str`.
 macro_rules! domain_columns {
     () => {
         "id, hostname, verification_token, created_by, created_at, verified_at, checked_at, \
-         check_error"
+         check_error, tls_not_after, tls_renew_at, tls_next_attempt_at, tls_failures, \
+         tls_checked_at, tls_error"
     };
 }
 
@@ -352,6 +366,14 @@ fn row_to_domain(r: &PgRow) -> Result<Domain, sqlx::Error> {
         verified_at: r.try_get("verified_at")?,
         checked_at: r.try_get("checked_at")?,
         check_error: r.try_get("check_error")?,
+        tls: TlsState {
+            not_after: r.try_get("tls_not_after")?,
+            renew_at: r.try_get("tls_renew_at")?,
+            next_attempt_at: r.try_get("tls_next_attempt_at")?,
+            failures: r.try_get("tls_failures")?,
+            checked_at: r.try_get("tls_checked_at")?,
+            error: r.try_get("tls_error")?,
+        },
     })
 }
 
@@ -382,8 +404,45 @@ pub struct DomainView {
     pub verification: VerificationView,
     pub checked_at: Option<DateTime<Utc>>,
     pub check_error: Option<String>,
+    /// For a verified domain: its certificate's state.
+    pub certificate: Option<CertificateView>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// A verified domain's certificate, as the API returns it. `status` is
+/// `issued` once there is one (renewal failures then show in `error`
+/// while it is still valid), else `pending` until an attempt fails, then
+/// `failed` with `error` saying why and `next_attempt_at` when it is retried.
+#[derive(Debug, Serialize)]
+pub struct CertificateView {
+    pub status: &'static str,
+    pub not_after: Option<DateTime<Utc>>,
+    pub renew_at: Option<DateTime<Utc>>,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+}
+
+impl From<&TlsState> for CertificateView {
+    fn from(t: &TlsState) -> CertificateView {
+        let status = if t.not_after.is_some() {
+            "issued"
+        } else if t.error.is_some() {
+            "failed"
+        } else {
+            "pending"
+        };
+        CertificateView {
+            status,
+            not_after: t.not_after,
+            renew_at: t.renew_at,
+            checked_at: t.checked_at,
+            error: t.error.clone(),
+            // While an order is in flight this is its lease, not a retry.
+            next_attempt_at: t.error.as_ref().and(t.next_attempt_at),
+        }
+    }
 }
 
 impl From<&Domain> for DomainView {
@@ -399,6 +458,7 @@ impl From<&Domain> for DomainView {
             },
             checked_at: d.checked_at,
             check_error: d.check_error.clone(),
+            certificate: d.verified_at.map(|_| CertificateView::from(&d.tls)),
             created_by: d.created_by.clone(),
             created_at: d.created_at,
         }
@@ -778,6 +838,8 @@ pub async fn verify_domain(
         if let Err(e) = app.reload_domains().await {
             tracing::warn!(error = %e, "could not reload verified domains");
         }
+        // Its certificate is ordered now, not at the next round.
+        app.acme_wake.notify_one();
         tracing::info!(domain = checked.id, "domain verified");
     }
     Ok(json(StatusCode::OK, &DomainView::from(&checked)))
@@ -1008,9 +1070,15 @@ mod tests {
             verified_at: None,
             checked_at: None,
             check_error: Some("no TXT record found".into()),
+            tls: TlsState::default(),
         };
         let v = serde_json::to_value(DomainView::from(&d)).unwrap();
         assert_eq!(v["verified"], false);
+        assert_eq!(
+            v["certificate"],
+            Value::Null,
+            "only verified domains have one"
+        );
         assert_eq!(v["verification"]["type"], "TXT");
         assert_eq!(
             v["verification"]["name"],
@@ -1024,6 +1092,29 @@ mod tests {
             domain_state(&d),
             json!({"id": 3, "hostname": "go.example.com", "verified_at": null})
         );
+        // A verified domain's certificate, through its states.
+        let at: DateTime<Utc> = "2026-11-09T00:00:00Z".parse().unwrap();
+        let mut d = Domain {
+            verified_at: Some(at),
+            ..d
+        };
+        let cert =
+            |d: &Domain| serde_json::to_value(DomainView::from(d)).unwrap()["certificate"].clone();
+        assert_eq!(cert(&d)["status"], "pending");
+        d.tls.next_attempt_at = Some(at);
+        assert_eq!(
+            cert(&d)["next_attempt_at"],
+            Value::Null,
+            "a lease, not a retry"
+        );
+        d.tls.error = Some("validation failed: connection refused".into());
+        d.tls.failures = 1;
+        assert_eq!(cert(&d)["status"], "failed");
+        assert_eq!(cert(&d)["next_attempt_at"], json!(at));
+        d.tls.not_after = Some(at);
+        d.tls.renew_at = Some(at);
+        assert_eq!(cert(&d)["status"], "issued");
+        assert_eq!(cert(&d)["not_after"], json!(at));
         assert_eq!(clip("é".repeat(200)).len(), 300);
         assert_eq!(clip("x".repeat(10)), "x".repeat(10));
         assert_eq!(path_hostname("Go.Example.com."), "go.example.com");

@@ -17,6 +17,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::abtest::Signer;
+use crate::acme::{self, AcmeWorker, ChallengeMap};
 use crate::api;
 use crate::auth::{Authenticator, Credential, LookupLimits};
 use crate::cache::Cache;
@@ -61,6 +62,11 @@ pub struct App {
     pub domains: DomainMap,
     /// TXT lookups for domain verification.
     pub dns: DnsClient,
+    /// Pending ACME HTTP-01 challenges, answered on every instance.
+    pub challenges: ChallengeMap,
+    /// Poked when a domain is verified, so its certificate is ordered
+    /// without waiting for the next round.
+    pub acme_wake: Arc<Notify>,
 }
 
 /// Credentials tracked by the API rate limiter (one bucket per key or person).
@@ -119,6 +125,8 @@ impl App {
                 }),
                 cfg.dns_timeout,
             ),
+            challenges: ChallengeMap::default(),
+            acme_wake: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             change_feed: AtomicBool::new(false),
             kv_wake: Arc::new(Notify::new()),
@@ -200,6 +208,7 @@ pub fn public_router(app: Arc<App>) -> Router {
         .route("/healthz", get(api::healthz))
         .route("/readyz", get(api::readyz))
         .route("/openapi.json", get(api::openapi))
+        .route("/.well-known/acme-challenge/{token}", get(acme::http01))
         .route("/{code}", get(redirect::redirect))
         .fallback(api::not_found)
         .layer(axum::middleware::from_fn_with_state(
@@ -320,6 +329,9 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
     if let Err(e) = app.reload_domains().await {
         tracing::warn!(error = %e, "could not load verified domains yet");
     }
+    if let Err(e) = app.reload_challenges().await {
+        tracing::debug!(error = %e, "could not load ACME challenges yet");
+    }
 
     let public = TcpListener::bind(cfg.addr)
         .await
@@ -368,6 +380,20 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         None => None,
     };
 
+    let certificates = match &cfg.acme {
+        Some(acme_cfg) => {
+            let worker = AcmeWorker::new(
+                acme_cfg.clone(),
+                db.clone(),
+                metrics.clone(),
+                app.acme_wake.clone(),
+            )
+            .map_err(|e| format!("cannot build the ACME client: {e}"))?;
+            Some(tokio::spawn(worker.run(bg_rx.clone())))
+        }
+        None => None,
+    };
+
     let public_srv = tokio::spawn(serve(public, public_router(app.clone()), stop_rx.clone()));
     let admin_srv = tokio::spawn(serve(admin, admin_router(app.clone()), stop_rx.clone()));
 
@@ -396,6 +422,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, maintenance];
         tasks.extend(health);
         tasks.extend(kv);
+        tasks.extend(certificates);
         for mut task in tasks {
             if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
@@ -468,8 +495,9 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         wait = Duration::from_millis(200);
         app.resolver.cache().bump_epoch();
         app.limiter.forget_exhausted();
-        // Domain changes may have been missed too.
+        // Domain and challenge changes may have been missed too.
         domains::spawn_reload(app.clone());
+        acme::spawn_reload(app.clone());
         app.change_feed.store(true, Ordering::Release);
         tracing::info!("listening for link changes");
         loop {
@@ -478,6 +506,10 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
                     Ok(Some(n)) => {
                         if n.payload() == DOMAINS_CHANGED {
                             domains::spawn_reload(app.clone());
+                            // A newly verified domain needs a certificate.
+                            app.acme_wake.notify_one();
+                        } else if n.payload() == acme::CHALLENGES_CHANGED {
+                            acme::spawn_reload(app.clone());
                         } else if let Some((id, key)) = parse_change(n.payload()) {
                             app.link_changed(id, key).await;
                         }
@@ -497,7 +529,8 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
 
 /// Periodic housekeeping: visitor-hash roll-up and salt deletion, expired
 /// sessions and sign-ins, idle lease return, rate limiter cleanup, and a
-/// reload of the verified domains in case a notification was lost.
+/// reload of the verified domains and pending ACME challenges in case a
+/// notification was lost.
 async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -517,6 +550,10 @@ async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         if let Err(e) = app.reload_domains().await {
             app.metrics.db_error(DbOp::Maintenance);
             tracing::warn!(error = %e, "could not reload verified domains");
+        }
+        if let Err(e) = app.reload_challenges().await {
+            app.metrics.db_error(DbOp::Maintenance);
+            tracing::warn!(error = %e, "could not reload ACME challenges");
         }
         app.limiter.sweep(Instant::now()).await;
         app.api_limiter.sweep(Instant::now());

@@ -285,6 +285,12 @@ pub struct Metrics {
     pub kv_errors: Counter,
     pub kv_reconciled: Counter,
     pub edge_clicks: Counter,
+    /// Certificates issued or renewed through ACME.
+    pub certificates_issued: Counter,
+    /// ACME orders that did not end in a certificate.
+    pub certificate_failures: Counter,
+    /// HTTP-01 challenge requests answered with a key authorization.
+    pub acme_challenges_served: Counter,
     /// Visitor hashes dropped because their day's salt was already destroyed.
     pub late_visitors: Counter,
     /// Gauge: aggregated click rows held by the flusher.
@@ -321,6 +327,9 @@ impl Default for Metrics {
             kv_errors: Counter::default(),
             kv_reconciled: Counter::default(),
             edge_clicks: Counter::default(),
+            certificates_issued: Counter::default(),
+            certificate_failures: Counter::default(),
+            acme_challenges_served: Counter::default(),
             late_visitors: Counter::default(),
             backlog: AtomicU64::new(0),
         }
@@ -438,7 +447,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 21] = [
+        let counters: [(&str, &str, u64); 24] = [
             (
                 "relink_kv_writes_total",
                 "Link records written to Workers KV.",
@@ -463,6 +472,21 @@ impl Metrics {
                 "relink_edge_clicks_total",
                 "Clicks reported by the edge worker.",
                 self.edge_clicks.get(),
+            ),
+            (
+                "relink_certificates_issued_total",
+                "Certificates issued or renewed for custom domains through ACME.",
+                self.certificates_issued.get(),
+            ),
+            (
+                "relink_certificate_failures_total",
+                "ACME orders for custom domains that did not end in a certificate.",
+                self.certificate_failures.get(),
+            ),
+            (
+                "relink_acme_challenges_served_total",
+                "HTTP-01 challenge requests answered with a key authorization.",
+                self.acme_challenges_served.get(),
             ),
             (
                 "relink_visitors_dropped_total",

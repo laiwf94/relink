@@ -7,6 +7,8 @@
 //! [`audit`] records every change in a hash chain per workspace, and
 //! [`quota`] holds plans, limits and usage; [`domains`] adds custom
 //! domains, verified through [`dns`], and routes redirects by `Host`;
+//! [`acme`] gets their certificates from an ACME CA, with [`der`] for the
+//! certificate request;
 //! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
 //! decides which forwarding headers to believe; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
@@ -14,6 +16,7 @@
 //! commands. The rules shared with the edge come from `relink_core` and are
 //! re-exported below.
 
+pub mod acme;
 pub mod api;
 pub mod audit;
 pub mod auth;
@@ -22,6 +25,7 @@ pub mod cli;
 pub mod clicks;
 pub mod code;
 pub mod config;
+pub mod der;
 pub mod dns;
 pub mod domains;
 pub mod health;

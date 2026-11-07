@@ -77,6 +77,7 @@ deserve a mention here. `RELINK_TRUSTED_PROXIES` lists the addresses of your
 CDN or load balancer; the country and client-address headers are read only
 from those peers, so a visitor cannot pick their own country. `RELINK_KV_*`
 turns on publishing to Workers KV; without it the origin works alone.
+`RELINK_ACME_DIRECTORY` turns on certificates for custom domains.
 
 ## Endpoints
 
@@ -175,6 +176,21 @@ $ curl -si localhost:8080/spring -H 'Host: go.example.com' | grep -i ^location
 location: https://example.com/spring
 ```
 
+With `RELINK_ACME_DIRECTORY` set (for example
+`https://acme-v02.api.letsencrypt.org/directory`, which accepts that CA's
+terms of service), relink orders a certificate for each domain as soon as
+it is verified, from its own ACME client. The CA checks the domain over
+HTTP-01, so port 80 of the domain must reach relink, and any instance can
+answer it. Certificates are renewed after two thirds of their lifetime;
+failed attempts are retried with back-off. The domain shows where its
+certificate stands:
+
+```console
+$ curl -s localhost:8080/v1/domains/go.example.com -H "Authorization: Bearer $KEY"
+{"hostname":"go.example.com","verified":true,...,"certificate":{"status":"issued",
+ "not_after":"2027-02-05T09:12:47Z","renew_at":"2027-01-06T09:12:47Z","error":null,...}}
+```
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /{code}` | Redirect, on the domain named by `Host`. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
@@ -186,9 +202,10 @@ location: https://example.com/spring
 | `GET /v1/links/{code}/stats?from=&to=&domain=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
 | `GET /v1/usage` | The workspace's plan, link and domain counts and clicks this month, with their limits. |
 | `POST /v1/domains` | Add a custom domain by `hostname`; answers with the TXT record that proves it. Admins and owners. |
-| `GET /v1/domains`, `GET /v1/domains/{hostname}` | The workspace's domains and their verification state. |
+| `GET /v1/domains`, `GET /v1/domains/{hostname}` | The workspace's domains, their verification state and, once verified, their certificate's. |
 | `POST /v1/domains/{hostname}/verify` | Look the TXT record up now; verified, or `check_error` says what was found. |
 | `DELETE /v1/domains/{hostname}` | Delete a domain that has no links left. |
+| `GET /.well-known/acme-challenge/{token}` | The ACME HTTP-01 answer, on the host being validated, while its certificate is being ordered. |
 | `GET /v1/auth/login?return_to=` | Sign in with the OpenID Connect provider (authorization code with PKCE). Absent unless `RELINK_OIDC_ISSUER` is set. |
 | `GET /v1/auth/callback` | The provider's redirect back; starts a session cookie. |
 | `GET /v1/auth/session` | Who is signed in, the session's CSRF token, and their workspaces and roles. |
@@ -225,6 +242,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 | Invitations | Against real Postgres over HTTP: only the person invited joins (a verified address, or the member name); an unverified address, another person or an API key is refused; 20 concurrent acceptances of one link make one member; revoked, expired and used links are refused; admins cannot invite or revoke above their own role; 5 requests racing for the last 2 of 100 pending slots create exactly 2; tenants see only their own invitations and cannot delete any; each step is in the audit chain, which still verifies, and tokens are in neither the log nor the chain. |
 | Workspaces end to end | One test walks week 1 as a team would: three people sign in through a fake OpenID Connect provider; the owner invites one by email as an editor and one by member name as a viewer, and each accepts only their own link, once; the editor creates links in the team workspace, the viewer only reads, and a stranger is refused; scoped, rotated and expiring keys are made with the binary; a plan's link and click limits refuse new links while redirects continue; the tenant role sees no rows in any tenant table without a workspace; every change is attributed in the team's audit chain, which the binary verifies with and without an anchor; signing out ends the session. |
 | Custom domains | Against real Postgres over HTTP with a local DNS resolver: a domain verifies only with its own token published, and only the first workspace to prove a hostname gets it; the same code on the default and a custom domain are two links, routed by `Host` on two instances, including after an update; unknown hosts keep the default domain; a domain with links cannot be deleted, and once deleted both instances stop routing it; 12 concurrent adds against a 3-domain plan with one domain taken create exactly 2; editors and viewers cannot manage domains; the database refuses a link on another workspace's domain. The DNS client is tested against crafted answers (compression, CNAME chains, truncation, NXDOMAIN, forged IDs, random bytes) and a resolver that answers over UDP and TCP. |
+| Certificates | The ACME client against a local CA that checks what a real one does (JWS signatures over its own nonces and the requested URL, HTTP-01 fetched with the domain as `Host`, a certificate request signed by its key and naming exactly the order's identifiers) and signs real X.509 certificates: issuance, a stale nonce retried but not forever, why validation failed, a rate limit's `Retry-After`, a certificate for another key refused, an order that never finishes, URLs that leave https, a lost account. In two running servers on Postgres: a domain gets a certificate once verified, with the CA's request answered by the other instance, and is renewed at two thirds of its lifetime with a fresh key; the instances never order the same domain at once and keep one account; failures back off (5 then 10 minutes) and show in the domain until an attempt succeeds; the challenge answer is per host, reaches every instance by notification or a database lookup, and is withdrawn after use. Tenants cannot read certificate keys. The DER reader and base64 are property-tested on random bytes, and the request was checked with `openssl req -verify`. |
 | Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use axum::http::HeaderName;
 
+use crate::acme::AcmeConfig;
 use crate::cache;
 use crate::clicks::FlushConfig;
 use crate::code::{MAX_CODE_LEN, MIN_CODE_LEN};
@@ -111,6 +112,9 @@ pub struct Config {
     pub dns_servers: Option<Vec<SocketAddr>>,
     /// Bound on each resolver's answer.
     pub dns_timeout: Duration,
+    /// Certificates for custom domains from an ACME CA; `None` when not
+    /// configured.
+    pub acme: Option<AcmeConfig>,
 }
 
 impl fmt::Debug for Config {
@@ -152,6 +156,7 @@ impl fmt::Debug for Config {
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("dns_servers", &self.dns_servers)
             .field("dns_timeout", &self.dns_timeout)
+            .field("acme", &self.acme)
             .finish()
     }
 }
@@ -364,6 +369,29 @@ impl Config {
                 );
             }
         };
+        let acme = match v.raw("RELINK_ACME_DIRECTORY") {
+            None => {
+                if v.raw("RELINK_ACME_EMAIL").is_some() {
+                    return Err("RELINK_ACME_EMAIL needs RELINK_ACME_DIRECTORY".into());
+                }
+                None
+            }
+            Some(directory) => {
+                let acme = AcmeConfig {
+                    directory_url: directory.trim().to_owned(),
+                    email: v.raw("RELINK_ACME_EMAIL").map(|e| e.trim().to_owned()),
+                    interval: v.millis("RELINK_ACME_INTERVAL_MS", 60_000, 100, 86_400_000)?,
+                    order_timeout: Duration::from_secs(v.parse(
+                        "RELINK_ACME_ORDER_TIMEOUT_S",
+                        300,
+                        5,
+                        3_600,
+                    )?),
+                };
+                acme.validate()?;
+                Some(acme)
+            }
+        };
         let ttl = v.millis("RELINK_CACHE_TTL_MS", 30_000, 0, 86_400_000)?;
         let cfg = Config {
             database_url,
@@ -451,6 +479,7 @@ impl Config {
             )?),
             dns_servers,
             dns_timeout: v.millis("RELINK_DNS_TIMEOUT_MS", 2_000, 50, 30_000)?,
+            acme,
         };
         if (cfg.country_header.is_some() || cfg.client_ip_header.is_some())
             && cfg.trusted_proxies.is_empty()
@@ -501,6 +530,7 @@ mod tests {
         assert_eq!(c.default_host, "localhost");
         assert_eq!(c.dns_servers, None);
         assert_eq!(c.dns_timeout, Duration::from_secs(2));
+        assert_eq!(c.acme, None);
         let c = from(&[
             ("RELINK_DATABASE_URL", "postgres://x/y"),
             ("RELINK_PUBLIC_BASE_URL", "https://Go.Example.com:8443"),
@@ -515,6 +545,22 @@ mod tests {
                 "127.0.0.1:5353".parse().unwrap()
             ])
         );
+    }
+
+    #[test]
+    fn acme_settings() {
+        let c = from(&[
+            ("RELINK_DATABASE_URL", "postgres://x/y"),
+            ("RELINK_ACME_DIRECTORY", " https://acme.example.com/dir "),
+            ("RELINK_ACME_EMAIL", "ops@example.com"),
+            ("RELINK_ACME_INTERVAL_MS", "500"),
+        ])
+        .unwrap();
+        let a = c.acme.unwrap();
+        assert_eq!(a.directory_url, "https://acme.example.com/dir");
+        assert_eq!(a.email.as_deref(), Some("ops@example.com"));
+        assert_eq!(a.interval, Duration::from_millis(500));
+        assert_eq!(a.order_timeout, Duration::from_secs(300));
     }
 
     #[test]
@@ -625,6 +671,21 @@ mod tests {
             vec![base, ("RELINK_DNS_SERVERS", "1.1.1.1,dns.example.com")],
             vec![base, ("RELINK_DNS_TIMEOUT_MS", "10")],
             vec![base, ("RELINK_PUBLIC_BASE_URL", "http://")],
+            vec![base, ("RELINK_ACME_EMAIL", "ops@example.com")],
+            vec![
+                base,
+                ("RELINK_ACME_DIRECTORY", "http://acme.example.com/dir"),
+            ],
+            vec![
+                base,
+                ("RELINK_ACME_DIRECTORY", "https://acme.example.com/dir"),
+                ("RELINK_ACME_EMAIL", "nobody"),
+            ],
+            vec![
+                base,
+                ("RELINK_ACME_DIRECTORY", "https://acme.example.com/dir"),
+                ("RELINK_ACME_INTERVAL_MS", "10"),
+            ],
         ] {
             assert!(from(&bad).is_err(), "{bad:?}");
         }

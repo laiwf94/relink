@@ -687,6 +687,13 @@ async fn openapi_matches_the_router_and_responses() {
         }
         let resp = req.send().await.unwrap();
         let status = resp.status().as_u16();
+        if path.starts_with("/.well-known/acme-challenge/") {
+            // Served by its own handler (plain text, not the router's JSON
+            // 404): no challenge is pending; tests/acme.rs drives it.
+            assert_eq!(status, 404, "{method} {path}");
+            assert_eq!(resp.text().await.unwrap(), "not found\n");
+            continue;
+        }
         let session_only =
             doc["paths"][path.as_str()][method.as_str()]["security"] == json!([{ "session": [] }]);
         if path.starts_with("/v1/auth/") || session_only {

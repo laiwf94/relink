@@ -43,7 +43,10 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `workspaces` | The tenant boundary: name, and `personal_owner` for the workspace each API key owner gets implicitly. |
 | `workspace_members` | Member, workspace and role (`owner`, `admin`, `editor` or `viewer`). |
 | `links` | Code, workspace, custom domain (none for the default domain), owner (its creator), destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
-| `domains` | Custom domains: workspace, hostname, verification token, who added it, when it was verified, and the outcome of the last check. |
+| `domains` | Custom domains: workspace, hostname, verification token, who added it, when it was verified, and the outcome of the last check; the certificate's expiry and renewal time, and the last issuance attempt's outcome, failure count and next attempt. |
+| `domain_certificates` | Each domain's current certificate chain, PEM, its private key, validity and renewal time. Server role only. |
+| `acme_accounts` | The ACME account per CA directory: its URL and key. Server role only. |
+| `acme_challenges` | HTTP-01 challenges being validated: token, hostname, key authorization, expiry. |
 | `api_keys` | Workspace, owner, name, SHA-256 of the key, scopes, expiry, the key that replaced it on rotation, revocation time. |
 | `click_daily` | Click counts per link, UTC day, country, device class and referrer host. |
 | `visitor_daily` | Visitor hashes for unique counts, today and yesterday only. |
@@ -66,6 +69,7 @@ read, so a hand-edited row produces an error instead of a panic.
 | `links (COALESCE(domain_id, 0), code)` unique | Redirect lookups by domain and code, alias conflicts per domain as a constraint violation rather than a race, and the KV reconciliation's walk of default-domain codes. |
 | `domains (hostname) WHERE verified_at IS NOT NULL` unique | Only one workspace can prove a hostname; loading the verified hostnames for routing. |
 | `domains (workspace_id, hostname)` unique | A workspace adds a hostname once; finding one by hostname. |
+| `domains (tls_next_attempt_at NULLS FIRST, id) WHERE verified_at IS NOT NULL` | The certificate worker's claim of domains due for issuance or renewal. |
 | `links (owner, id DESC)` | Keyset pagination `WHERE owner = $1 AND id < $cursor ORDER BY id DESC`; each page is a range scan whatever its depth. |
 | `links (health_checked_at NULLS FIRST) WHERE health_check AND enabled` | The health worker's "next due"; links without checks cost nothing. |
 | `api_keys (key_hash)` unique | One probe per uncached key. |
@@ -479,6 +483,70 @@ always the default domain.
 The edge serves the default domain only for now: links on custom domains
 are not published to KV, so the KV records keyed by code stay unambiguous.
 
+### Certificates
+
+With `RELINK_ACME_DIRECTORY` set, relink gets a certificate for every
+verified domain from that ACME certificate authority (RFC 8555) with its
+own client (`src/acme.rs`, migration 0011). There is no certbot or sidecar
+to run, and no shared volume between instances: the state is in Postgres.
+
+The client is the protocol and nothing else. Every request is a JWS
+(RFC 7515) signed with the account's P-256 key, by `ring`, over a nonce the
+CA issued; spare nonces from responses are kept, and a request the CA
+refuses with `badNonce` is retried with a fresh one, at most three times.
+The account is registered once per directory and its key stored in
+`acme_accounts`; if two instances register at once, the first stored wins
+and the other's account is never used. An order is placed for the
+hostname, its authorization is answered over HTTP-01 (the key
+authorization is the token and the account key's RFC 7638 thumbprint), and
+once the order is ready it is finalized with a PKCS#10 request for a fresh
+P-256 key, written by `src/der.rs`. The chain is downloaded as PEM, and the
+leaf is read back: it must name the hostname and certify exactly the key
+relink generated. Polling follows the CA's `Retry-After` within 50 ms to
+10 s, and the whole order is bounded by `RELINK_ACME_ORDER_TIMEOUT_S`.
+Every URL the CA hands out must be https, like the directory. Each
+certificate gets its own key, so renewals rotate keys.
+
+`AcmeWorker` runs on every instance. A round claims up to four verified
+domains that have no certificate, or whose certificate has reached its
+renewal time, and are not waiting out a failure, with `FOR NO KEY UPDATE
+SKIP LOCKED`. The claim sets `tls_next_attempt_at` 15 minutes ahead, so
+instances never order the same domain at once and a crashed instance's
+claims lapse. A round runs every `RELINK_ACME_INTERVAL_MS` (a minute by
+default), and immediately when a domain is verified on any instance (the
+`domains` change notification). A certificate is renewed two thirds of the
+way through its lifetime: after 60 days for a 90-day certificate, leaving
+30 days for retries. A failure records the CA's reason in `tls_error` and
+waits 5 minutes, doubling per failure in a row up to a day, and never less
+than a `Retry-After` the CA sent with a rate limit. A CA that no longer
+knows the account (`accountDoesNotExist`) gets a new one at the next
+attempt. Success stores the chain and key in `domain_certificates` and the
+expiry and renewal time on the domain in one transaction, and clears the
+failures.
+
+The CA validates by fetching `http://<domain>/.well-known/acme-challenge/
+<token>`, and reaches whichever instance the domain's address points at.
+So every instance answers it. Challenges are written to `acme_challenges`
+with a `pg_notify`, and each instance keeps the pending ones in memory,
+loaded the way verified domains are: at start, on the notification, on
+reconnect and every minute. The answer is given only for the hostname the
+challenge was made for, matched without case or port. A token not in
+memory may have been published a moment ago, so it is looked up in
+Postgres, at most 20 times a second per instance. A flood of made-up
+tokens therefore costs memory lookups once that budget is spent, and never
+a query each. Challenges are withdrawn when the order ends, whatever the
+outcome, and expire after an hour if an instance dies first. The key
+authorization is not secret: the CA fetches it over plain HTTP.
+
+Tenants see a verified domain's certificate state in `GET
+/v1/domains/{hostname}`: `pending`, then `issued` (a failed renewal shows
+its error while the certificate is still valid) or `failed`, with the
+error and the next attempt. They cannot read `domain_certificates`,
+`acme_accounts` or `acme_challenges`, which have no grants for the tenant
+role. Private keys are stored as PKCS#8 in Postgres and readable only by
+the server's own role; they are encrypted at rest when relink terminates
+TLS itself, the next step.
+
 ### A management request, start to finish
 
 The pieces above meet on every management request, in this order:
@@ -819,6 +887,8 @@ and counts the clicks it could not write.
 | Worker isolate evicted | Up to 50 unsent edge clicks are lost. |
 | Verified domains not loaded | Possible only when Postgres went away between migrations and start; requests whose host could be a custom domain get 503 until the change listener connects and loads them. |
 | DNS resolver down | Verification answers 200 with the resolver error in `check_error`; verified domains are unaffected. |
+| ACME CA down or refusing | The domain keeps its current certificate; the error is stored on the domain and retried after 5 minutes, doubling to a day, or after the CA's `Retry-After`. A first certificate stays `pending` or `failed` meanwhile. |
+| Instance dies mid-order | Its claim lapses after 15 minutes and another instance orders again; its challenges expire after an hour. |
 | Health target hangs | 5 s timeout, counted as a failure. |
 
 ## Limits
@@ -847,6 +917,7 @@ and counts the clicks it could not write.
 | Plan limits | 0 to 10¹⁵ links, domains and monthly clicks, or unlimited (the default plan) |
 | Custom domains | 1,000 per workspace whatever the plan; hostnames up to 253 characters |
 | DNS answer | 2 s per resolver (`RELINK_DNS_TIMEOUT_MS`); 4 KiB over UDP, 64 KiB over TCP |
+| ACME | 4 domains claimed per round; an order within 300 s (`RELINK_ACME_ORDER_TIMEOUT_S`); responses up to 1 MiB; 16 spare nonces; 3 attempts on a bad nonce; retries 5 min doubling to a day; challenge database lookups 20/s per instance |
 
 ## Observability
 
@@ -857,7 +928,7 @@ the admin listener cover redirect latency, redirects by outcome, cache results
 lookups, click queue depth, backlog, drops by reason, late visitor hashes,
 database errors by operation, lease grants, health probes, KV writes, deletes,
 errors and reconciled drift, edge clicks, API requests and refusals, link creations refused per plan
-limit, and pool usage.
+limit, certificates issued and failed orders, HTTP-01 answers served, and pool usage.
 
 ## Dependencies
 
@@ -873,10 +944,10 @@ audit` known advisories.
 | `tokio` | The async runtime under axum, sqlx and reqwest. |
 | `axum` | Routing and extractors on hyper. Writing HTTP/1 parsing and graceful shutdown ourselves would be the riskiest code in the repo. |
 | `sqlx` | Postgres driver with a pool, `LISTEN/NOTIFY` and embedded migrations, without an ORM. Queries are plain SQL strings. |
-| `reqwest` | HTTP client for health probes and the KV API. It accepts a custom DNS resolver, which the SSRF defence depends on. |
+| `reqwest` | HTTP client for health probes, the KV API, the OpenID Connect provider and the ACME CA. It accepts a custom DNS resolver, which the SSRF defence depends on. |
 | `serde`, `serde_json` | JSON for the API, the KV record and the edge wire format. |
 | `url` | WHATWG URL parsing and IDNA; not something to hand-roll when the result decides where a server sends requests. |
-| `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens. RSA and ECDSA verification is not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
+| `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens, and P-256 key generation and ES256 signing for ACME requests and certificate requests. RSA and ECDSA are not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
 | `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys and the audit chain, constant-time comparison. |
 | `getrandom` | The OS CSPRNG for codes, keys and salts. |
 | `chrono` | Timestamps and UTC dates; the core uses it without its clock so it stays wasm-friendly. |
@@ -884,8 +955,12 @@ audit` known advisories.
 | `worker` | The workers-rs binding to the Cloudflare Workers runtime; wasm32 only. |
 | `proptest`, `criterion`, `tower` (dev) | Property tests, benchmarks, and driving the router in-process in benchmarks. |
 
-Metrics, the cache, single flight, token buckets, CIDR parsing, hex and
-base64url are each a few dozen lines and written here instead of pulled in.
+Metrics, the cache, single flight, token buckets, CIDR parsing, hex,
+base64 and base64url are each a few dozen lines and written here instead of
+pulled in. So is the DER the ACME client needs (`src/der.rs`, under 500
+lines with comments): writing one fixed shape of certificate request and reading the
+validity, names and key of a certificate. A general ASN.1 crate would be
+larger than that.
 
 ## At a larger scale
 

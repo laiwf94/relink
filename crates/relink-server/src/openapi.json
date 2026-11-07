@@ -56,6 +56,20 @@
         "responses": { "200": { "description": "OpenAPI 3.1 document.", "content": { "application/json": { "schema": { "type": "object" } } } } }
       }
     },
+    "/.well-known/acme-challenge/{token}": {
+      "get": {
+        "summary": "ACME HTTP-01 challenge response",
+        "operationId": "acmeChallenge",
+        "security": [],
+        "description": "Answered on every host while relink is ordering a certificate for that host from its ACME certificate authority, which fetches it over plain HTTP on port 80.",
+        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22,128}$" } }],
+        "responses": {
+          "200": { "description": "The key authorization for the token.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "404": { "description": "No pending challenge with this token for this host.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "503": { "description": "The database could not be asked about a token this instance has not loaded yet.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/plain": { "schema": { "type": "string" } } } }
+        }
+      }
+    },
     "/v1/links": {
       "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
       "post": {
@@ -747,7 +761,7 @@
       },
       "Domain": {
         "type": "object",
-        "required": ["hostname", "verified", "verified_at", "verification", "checked_at", "check_error", "created_by", "created_at"],
+        "required": ["hostname", "verified", "verified_at", "verification", "checked_at", "check_error", "certificate", "created_by", "created_at"],
         "properties": {
           "hostname": { "type": "string" },
           "verified": { "type": "boolean" },
@@ -760,6 +774,19 @@
           },
           "checked_at": { "type": ["string", "null"], "format": "date-time", "description": "The last verification attempt." },
           "check_error": { "type": ["string", "null"], "description": "Why the last attempt did not verify the domain." },
+          "certificate": {
+            "type": ["object", "null"],
+            "description": "Null until the domain is verified; then its TLS certificate from the ACME certificate authority. Stays pending while RELINK_ACME_DIRECTORY is not set.",
+            "required": ["status", "not_after", "renew_at", "checked_at", "error", "next_attempt_at"],
+            "properties": {
+              "status": { "enum": ["pending", "issued", "failed"], "description": "issued once there is a certificate (a failed renewal then shows in error); failed when the last attempt for a first certificate failed." },
+              "not_after": { "type": ["string", "null"], "format": "date-time", "description": "When the current certificate expires." },
+              "renew_at": { "type": ["string", "null"], "format": "date-time", "description": "Two thirds of the way through its lifetime, when it is renewed." },
+              "checked_at": { "type": ["string", "null"], "format": "date-time", "description": "The last attempt to issue or renew." },
+              "error": { "type": ["string", "null"], "description": "Why the last attempt failed." },
+              "next_attempt_at": { "type": ["string", "null"], "format": "date-time", "description": "After a failure, when the next attempt is due." }
+            }
+          },
           "created_by": { "type": "string" },
           "created_at": { "type": "string", "format": "date-time" }
         }

@@ -86,6 +86,10 @@
 //! | `RELINK_SESSION_TTL_S` | `43200` | Lifetime of a sign-in session, 300 to 2592000 seconds |
 //! | `RELINK_DNS_SERVERS` | from `/etc/resolv.conf` | Comma-separated recursive resolvers (`ip` or `ip:port`) asked for the TXT records that verify custom domains |
 //! | `RELINK_DNS_TIMEOUT_MS` | `2000` | Wait for each resolver's answer |
+//! | `RELINK_ACME_DIRECTORY` | unset | ACME directory URL (https) of the CA that issues certificates for verified custom domains; setting it accepts that CA's terms of service. Unset, no certificates are ordered |
+//! | `RELINK_ACME_EMAIL` | unset | Contact address given to the CA for the account (expiry notices) |
+//! | `RELINK_ACME_INTERVAL_MS` | `60000` | How often to look for domains that need a certificate or a renewal, 100 ms to a day; a newly verified domain is ordered at once |
+//! | `RELINK_ACME_ORDER_TIMEOUT_S` | `300` | Longest one order may take, validation and issuance included, 5 to 3600 seconds |
 //! | `RELINK_LOG` | `info,sqlx::postgres::notice=warn` | Log filter (`tracing` env-filter syntax) |
 
 use std::process::ExitCode;

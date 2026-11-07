@@ -1100,6 +1100,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/healthz"),
     ("get", "/readyz"),
     ("get", "/openapi.json"),
+    ("get", "/.well-known/acme-challenge/{token}"),
     ("post", "/v1/links"),
     ("get", "/v1/links"),
     ("get", "/v1/links/{code}"),
