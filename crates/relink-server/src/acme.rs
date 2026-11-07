@@ -1029,26 +1029,28 @@ impl Db {
             .map_err(DbError::from)
     }
 
-    /// Every pending challenge, (token, hostname, key authorization), after
-    /// deleting expired ones.
-    pub async fn pending_challenges(&self) -> Result<Vec<(String, String, String)>, DbError> {
+    /// Every pending challenge, after deleting expired ones.
+    pub async fn pending_challenges(&self) -> Result<Vec<PendingChallenge>, DbError> {
         let rows = self
             .timed(async {
                 sqlx::query("DELETE FROM acme_challenges WHERE expires_at <= now()")
                     .execute(self.pool())
                     .await?;
-                sqlx::query("SELECT token, hostname, key_authorization FROM acme_challenges")
-                    .fetch_all(self.pool())
-                    .await
+                sqlx::query(
+                    "SELECT token, hostname, key_authorization, expires_at FROM acme_challenges",
+                )
+                .fetch_all(self.pool())
+                .await
             })
             .await?;
         rows.iter()
             .map(|r| {
-                Ok((
-                    r.try_get("token")?,
-                    r.try_get("hostname")?,
-                    r.try_get("key_authorization")?,
-                ))
+                Ok(PendingChallenge {
+                    token: r.try_get("token")?,
+                    hostname: r.try_get("hostname")?,
+                    key_authorization: r.try_get("key_authorization")?,
+                    expires_at: r.try_get("expires_at")?,
+                })
             })
             .collect::<Result<_, sqlx::Error>>()
             .map_err(DbError::from)
@@ -1194,30 +1196,37 @@ impl Challenges for Db {
 // ---------------------------------------------------------------------------
 // Answering HTTP-01
 
-/// Pending challenges on this instance, by token: (hostname, key
-/// authorization). A handful at a time.
+/// A published HTTP-01 challenge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingChallenge {
+    pub token: String,
+    pub hostname: String,
+    pub key_authorization: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Pending challenges on this instance, by token. A handful at a time.
 #[derive(Default)]
 pub struct ChallengeMap {
-    map: RwLock<HashMap<String, (String, String)>>,
+    map: RwLock<HashMap<String, PendingChallenge>>,
     lookups: Mutex<Option<(Instant, f64)>>,
 }
 
 impl ChallengeMap {
-    pub fn replace(&self, pending: Vec<(String, String, String)>) {
-        let fresh = pending
-            .into_iter()
-            .map(|(token, host, ka)| (token, (host, ka)))
-            .collect();
+    pub fn replace(&self, pending: Vec<PendingChallenge>) {
+        let fresh = pending.into_iter().map(|c| (c.token.clone(), c)).collect();
         *self.map.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 
+    /// The key authorization for `token` on `hostname`, unless it has
+    /// expired since it was loaded.
     pub fn get(&self, token: &str, hostname: &str) -> Option<String> {
         self.map
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(token)
-            .filter(|(h, _)| h == hostname)
-            .map(|(_, ka)| ka.clone())
+            .filter(|c| c.hostname == hostname && c.expires_at > Utc::now())
+            .map(|c| c.key_authorization.clone())
     }
 
     pub fn len(&self) -> usize {
@@ -1686,11 +1695,24 @@ mod tests {
     fn the_challenge_map_matches_token_and_host() {
         let m = ChallengeMap::default();
         assert!(m.is_empty());
-        m.replace(vec![("t".into(), "go.example.com".into(), "t.k".into())]);
-        assert_eq!(m.len(), 1);
+        let pending = |token: &str, expires_at| PendingChallenge {
+            token: token.into(),
+            hostname: "go.example.com".into(),
+            key_authorization: format!("{token}.k"),
+            expires_at,
+        };
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let earlier = Utc::now() - chrono::Duration::seconds(1);
+        m.replace(vec![pending("t", later), pending("old", earlier)]);
+        assert_eq!(m.len(), 2);
         assert_eq!(m.get("t", "go.example.com").as_deref(), Some("t.k"));
         assert_eq!(m.get("t", "other.example.com"), None);
         assert_eq!(m.get("u", "go.example.com"), None);
+        assert_eq!(
+            m.get("old", "go.example.com"),
+            None,
+            "expired since loading"
+        );
         m.replace(vec![]);
         assert!(m.is_empty());
     }

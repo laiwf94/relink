@@ -505,11 +505,13 @@ async fn http01_answers_only_its_host_on_every_instance() {
     assert_eq!(get(h.base.clone(), "[::1]", token.clone()).await.0, 404);
 
     // Written without a notification (as if it were lost): found in the
-    // database, then by the next reload.
+    // database, then in memory after the next reload. Each lives a couple
+    // of seconds, after which neither memory nor the database serves it,
+    // and the next reload deletes it.
     let quiet = "Q".repeat(43);
     sqlx::query(
         "INSERT INTO acme_challenges (token, hostname, key_authorization, expires_at)
-         VALUES ($1, $2, 'q.k', now() + interval '1 hour')",
+         VALUES ($1, $2, 'q.k', now() + interval '2 seconds')",
     )
     .bind(&quiet)
     .bind(HOST)
@@ -517,18 +519,27 @@ async fn http01_answers_only_its_host_on_every_instance() {
     .await
     .unwrap();
     let (status, body) = get(other_base.clone(), HOST, quiet.clone()).await;
-    assert_eq!((status, body.as_str()), (200, "q.k"));
-    // Expired ones are not served, and are deleted on reload.
-    sqlx::query(
-        "UPDATE acme_challenges SET expires_at = now() - interval '1 second' WHERE token = $1",
-    )
-    .bind(&quiet)
-    .execute(h.store.pool())
-    .await
-    .unwrap();
+    assert_eq!((status, body.as_str()), (200, "q.k"), "from the database");
+    other.app.reload_challenges().await.unwrap();
+    assert_eq!(
+        other.app.challenges.get(&quiet, HOST).as_deref(),
+        Some("q.k")
+    );
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(
+        other.app.challenges.get(&quiet, HOST),
+        None,
+        "expired in memory"
+    );
     assert_eq!(get(other_base.clone(), HOST, quiet.clone()).await.0, 404);
     other.app.reload_challenges().await.unwrap();
     assert_eq!(other.app.challenges.len(), 1);
+    let left: i64 = sqlx::query("SELECT count(*) AS n FROM acme_challenges")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(left, 1, "the expired one is deleted");
 
     // Withdrawn: gone everywhere.
     h.store.delete_challenge(&token).await.unwrap();
