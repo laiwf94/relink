@@ -810,32 +810,22 @@ impl Db {
         .await
     }
 
-    /// Reserves a click lease (see [`crate::limiter`]). The row lock taken by
-    /// The row lock serialises concurrent reservations for the same link.
-    /// `NO KEY UPDATE` rather than `UPDATE`: click flushes hold key-share
-    /// locks on links through their foreign keys, and a plain `FOR UPDATE`
-    /// would queue behind every flush of a busy link.
+    /// Reserves a click lease (see [`crate::limiter`]) through
+    /// `relink_reserve_clicks` (migration 0014): the row is locked `FOR NO
+    /// KEY UPDATE`, which serialises concurrent reservations for the same
+    /// link without queueing behind the key-share locks click flushes hold
+    /// through their foreign keys, and then updated on the version locked.
+    /// Locking and updating in one self-joined statement deadlocked under
+    /// load (#76). Returns the clicks granted, 0 at the limit or for a link
+    /// without one.
     pub async fn reserve_clicks(&self, link_id: i64, max_lease: i64) -> Result<i64, DbError> {
-        let granted: Option<i64> = self
-            .timed(
-                sqlx::query_scalar(
-                    "UPDATE links l
-                        SET clicks_reserved = l.clicks_reserved + LEAST($2,
-                            GREATEST(1, (l.max_clicks - l.clicks_reserved) / 8),
-                            l.max_clicks - l.clicks_reserved)
-                       FROM (SELECT id, clicks_reserved AS before FROM links
-                              WHERE id = $1 FOR NO KEY UPDATE) o
-                      WHERE l.id = o.id
-                        AND l.max_clicks IS NOT NULL
-                        AND l.clicks_reserved < l.max_clicks
-                  RETURNING l.clicks_reserved - o.before",
-                )
+        self.timed(
+            sqlx::query_scalar("SELECT relink_reserve_clicks($1, $2)")
                 .bind(link_id)
                 .bind(max_lease)
-                .fetch_optional(&self.pool),
-            )
-            .await?;
-        Ok(granted.unwrap_or(0))
+                .fetch_one(&self.pool),
+        )
+        .await
     }
 
     /// Returns unspent clicks from a lease.

@@ -94,6 +94,85 @@ async fn lease_grants_follow_the_rule_and_never_exceed_the_limit() {
     assert_eq!(store.reserve_clicks(unlimited.id, 100).await.unwrap(), 0);
 }
 
+/// Reservations racing each other and the row's other writers on a
+/// multi-threaded runtime: every call must succeed (no deadlock, no
+/// serialisation failure) and the grants must add up to the limit exactly
+/// (#76).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_reservations_never_deadlock() {
+    let Some((_db, store)) = fresh().await else {
+        return;
+    };
+    let store = Arc::new(store);
+    for round in 0..5 {
+        let link = common::insert_link(&store, &new_link(None, Some(3_000)), 7)
+            .await
+            .unwrap();
+        let id = link.id;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Other users of the same row: a release of nothing writes a new row
+        // version, as returning leases and health updates do, and click
+        // flushes hold key-share locks on it through their foreign keys,
+        // which turns the row's lock into a multixact.
+        let mut writers: Vec<_> = (0..2)
+            .map(|_| {
+                let (s, done) = (store.clone(), done.clone());
+                tokio::spawn(async move {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        s.release_clicks(id, 0).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        writers.extend((0..4).map(|_| {
+            let (s, done) = (store.clone(), done.clone());
+            tokio::spawn(async move {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut tx = s.pool().begin().await.unwrap();
+                    sqlx::query("SELECT 1 FROM links WHERE id = $1 FOR KEY SHARE")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    sqlx::query("SELECT pg_sleep(0.002)")
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                }
+            })
+        }));
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let s = store.clone();
+                tokio::spawn(async move {
+                    let mut got = 0;
+                    loop {
+                        match s.reserve_clicks(id, 3).await {
+                            Ok(0) => return Ok(got),
+                            Ok(g) => got += g,
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut total = 0;
+        for t in tasks {
+            total += t
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.await.unwrap();
+        }
+        assert_eq!(total, 3_000, "round {round}");
+        assert_eq!(store.clicks_reserved(id).await.unwrap(), 3_000);
+    }
+}
+
 #[tokio::test]
 async fn aliases_conflict_and_codes_are_unique() {
     let Some((_db, store)) = fresh().await else {

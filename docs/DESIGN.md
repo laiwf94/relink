@@ -689,18 +689,28 @@ entries are served as they were, by design, for up to a day.
 ## Click limits without a write per click
 
 This is escrow (O'Neil, "The Escrow Transactional Method"). Each instance
-reserves a block of clicks with one statement and spends it from an atomic
-counter:
+reserves a block of clicks with one call to `relink_reserve_clicks`
+(migration 0014) and spends it from an atomic counter. The function locks
+the row, then updates the version it locked:
 
 ```sql
-UPDATE links l
-   SET clicks_reserved = l.clicks_reserved + LEAST($max_lease,
-         GREATEST(1, (l.max_clicks - l.clicks_reserved) / 8),
-         l.max_clicks - l.clicks_reserved)
-  FROM (SELECT id, clicks_reserved AS before FROM links WHERE id = $1 FOR NO KEY UPDATE) o
- WHERE l.id = o.id AND l.max_clicks IS NOT NULL AND l.clicks_reserved < l.max_clicks
-RETURNING l.clicks_reserved - o.before
+SELECT clicks_reserved, max_clicks INTO reserved, lim
+  FROM links WHERE id = p_link FOR NO KEY UPDATE;
+-- 0 when there is no limit or nothing is left
+grant_n := LEAST(p_max_lease, GREATEST(1, (lim - reserved) / 8), lim - reserved);
+UPDATE links SET clicks_reserved = reserved + grant_n WHERE id = p_link;
+RETURN grant_n;
 ```
+
+This used to be one `UPDATE ... FROM (SELECT ... FOR NO KEY UPDATE)` that
+joined the row to a locked copy of itself. Under load, with click flushes
+holding key-share locks on the row through their foreign keys, two
+reservations could deadlock: the outer update waited a second time for a
+tuple lock that the next reservation already held while waiting on the
+first (#76). Locking and then updating as separate statements, inside one
+function call, waits at most once and still costs one round trip.
+`NO KEY UPDATE` rather than `UPDATE` keeps reservations from queueing behind
+those flushes.
 
 The row lock serialises reservations, and a grant never exceeds what is
 left, so the grants sum to at most `max_clicks`. A redirect is served only
