@@ -18,5 +18,5 @@ RUN touch crates/*/src/lib.rs crates/relink-server/src/main.rs \
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /src/target/release/relink /relink
 USER nonroot:nonroot
-EXPOSE 8080 9090
+EXPOSE 8080 8443 9090
 ENTRYPOINT ["/relink"]

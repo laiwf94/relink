@@ -11,6 +11,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use sqlx::postgres::{PgConnectOptions, PgListener};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc, watch};
@@ -36,6 +37,7 @@ use crate::redirect;
 use crate::resolver::{LinkSource, Resolver};
 use crate::session;
 use crate::store::{CHANGES_CHANNEL, DOMAINS_CHANGED, Db, DbConfig, parse_change};
+use crate::tls::{self, Sealer, Tls, TlsListener};
 use crate::util::{now_ms, secure_random, stopped, utc_day};
 
 /// State shared by every request and background task.
@@ -67,6 +69,10 @@ pub struct App {
     /// Poked when a domain is verified, so its certificate is ordered
     /// without waiting for the next round.
     pub acme_wake: Arc<Notify>,
+    /// Encrypts and decrypts stored private keys, when a key is configured.
+    pub sealer: Option<Arc<Sealer>>,
+    /// Certificates for the TLS listener, when there is one.
+    pub tls: Option<Tls>,
 }
 
 /// Credentials tracked by the API rate limiter (one bucket per key or person).
@@ -127,6 +133,8 @@ impl App {
             ),
             challenges: ChallengeMap::default(),
             acme_wake: Arc::new(Notify::new()),
+            sealer: cfg.key_encryption_key.map(|k| Arc::new(Sealer::new(&k))),
+            tls: cfg.tls.clone().map(Tls::new),
             shutting_down: AtomicBool::new(false),
             change_feed: AtomicBool::new(false),
             kv_wake: Arc::new(Notify::new()),
@@ -148,6 +156,7 @@ impl App {
             leases: self.limiter.len(),
             db_pool_size: self.db.pool_stats().0,
             db_pool_idle: self.db.pool_stats().1,
+            tls_certificates: self.tls.as_ref().map_or(0, |t| t.store.len()),
         }
     }
 
@@ -282,6 +291,8 @@ pub async fn migrate_with_retry(db: &Db, deadline: Duration) -> Result<(), Strin
 pub struct Running {
     pub addr: SocketAddr,
     pub admin_addr: SocketAddr,
+    /// The TLS listener's address, when there is one.
+    pub tls_addr: Option<SocketAddr>,
     pub app: Arc<App>,
     stop: watch::Sender<bool>,
     done: JoinHandle<()>,
@@ -332,6 +343,32 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
     if let Err(e) = app.reload_challenges().await {
         tracing::debug!(error = %e, "could not load ACME challenges yet");
     }
+    let tls_listener = match &app.tls {
+        Some(t) => {
+            // A default certificate that cannot be read is a configuration
+            // error, found now rather than at the first handshake.
+            t.reload_files()?;
+            if let Err(e) = app.reload_certificates().await {
+                tracing::warn!(error = %e, "could not load certificates yet");
+            }
+            let tcp = TcpListener::bind(t.config.addr)
+                .await
+                .map_err(|e| format!("cannot listen on {}: {e}", t.config.addr))?;
+            Some(
+                TlsListener::new(
+                    tcp,
+                    tls::server_config(t.store.clone()),
+                    t.config.handshake_timeout,
+                    metrics.clone(),
+                )
+                .map_err(|e| e.to_string())?,
+            )
+        }
+        None => None,
+    };
+    let tls_addr = tls_listener
+        .as_ref()
+        .map(|l| axum::serve::Listener::local_addr(l).expect("the TLS listener knows its address"));
 
     let public = TcpListener::bind(cfg.addr)
         .await
@@ -387,6 +424,9 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
                 db.clone(),
                 metrics.clone(),
                 app.acme_wake.clone(),
+                app.sealer
+                    .clone()
+                    .expect("the configuration requires a key encryption key with ACME"),
             )
             .map_err(|e| format!("cannot build the ACME client: {e}"))?;
             Some(tokio::spawn(worker.run(bg_rx.clone())))
@@ -396,6 +436,15 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
 
     let public_srv = tokio::spawn(serve(public, public_router(app.clone()), stop_rx.clone()));
     let admin_srv = tokio::spawn(serve(admin, admin_router(app.clone()), stop_rx.clone()));
+    let tls_srv = tls_listener.map(|l| {
+        // TapIo, which does nothing here, is what gives connections through
+        // a listener of our own the peer address the handlers read.
+        tokio::spawn(serve(
+            l.tap_io(|_| {}),
+            public_router(app.clone()),
+            stop_rx.clone(),
+        ))
+    });
 
     let supervisor_app = app.clone();
     let timeout = cfg.shutdown_timeout;
@@ -407,7 +456,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         supervisor_app.shutting_down.store(true, Ordering::Release);
         tracing::info!("shutting down: draining requests");
-        for mut srv in [public_srv, admin_srv] {
+        for mut srv in [public_srv, admin_srv].into_iter().chain(tls_srv) {
             if tokio::time::timeout_at(deadline, &mut srv).await.is_err() {
                 tracing::warn!("in-flight requests did not finish before the shutdown deadline");
                 srv.abort();
@@ -438,17 +487,22 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         tracing::info!("shutdown complete");
     });
 
-    tracing::info!(%addr, %admin_addr, "listening");
+    tracing::info!(%addr, %admin_addr, tls_addr = ?tls_addr, "listening");
     Ok(Running {
         addr,
         admin_addr,
+        tls_addr,
         app,
         stop: stop_tx,
         done,
     })
 }
 
-async fn serve(listener: TcpListener, router: Router, mut stop: watch::Receiver<bool>) {
+async fn serve<L>(listener: L, router: Router, mut stop: watch::Receiver<bool>)
+where
+    L: axum::serve::Listener<Addr = SocketAddr>,
+    SocketAddr: for<'a> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
+{
     let result = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -498,6 +552,7 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         // Domain and challenge changes may have been missed too.
         domains::spawn_reload(app.clone());
         acme::spawn_reload(app.clone());
+        tls::spawn_reload(app.clone());
         app.change_feed.store(true, Ordering::Release);
         tracing::info!("listening for link changes");
         loop {
@@ -506,8 +561,12 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
                     Ok(Some(n)) => {
                         if n.payload() == DOMAINS_CHANGED {
                             domains::spawn_reload(app.clone());
-                            // A newly verified domain needs a certificate.
+                            // A newly verified domain needs a certificate;
+                            // a deleted one's is no longer served.
                             app.acme_wake.notify_one();
+                            tls::spawn_reload(app.clone());
+                        } else if n.payload() == tls::CERTIFICATES_CHANGED {
+                            tls::spawn_reload(app.clone());
                         } else if n.payload() == acme::CHALLENGES_CHANGED {
                             acme::spawn_reload(app.clone());
                         } else if let Some((id, key)) = parse_change(n.payload()) {
@@ -529,8 +588,9 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
 
 /// Periodic housekeeping: visitor-hash roll-up and salt deletion, expired
 /// sessions and sign-ins, idle lease return, rate limiter cleanup, and a
-/// reload of the verified domains and pending ACME challenges in case a
-/// notification was lost.
+/// reload of the verified domains, pending ACME challenges and certificates
+/// in case a notification was lost (and of the default certificate files,
+/// which have no notification).
 async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -554,6 +614,13 @@ async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         if let Err(e) = app.reload_challenges().await {
             app.metrics.db_error(DbOp::Maintenance);
             tracing::warn!(error = %e, "could not reload ACME challenges");
+        }
+        if let Err(e) = app.reload_certificates().await {
+            app.metrics.db_error(DbOp::Maintenance);
+            tracing::warn!(error = %e, "could not reload certificates");
+        }
+        if let Some(Err(e)) = app.tls.as_ref().map(Tls::reload_files) {
+            tracing::warn!(error = %e, "could not reload the default certificate; keeping the old one");
         }
         app.limiter.sweep(Instant::now()).await;
         app.api_limiter.sweep(Instant::now());

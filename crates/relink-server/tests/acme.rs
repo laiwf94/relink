@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use acme_ca::{FakeCa, MemChallenges, serve_challenges};
 use chrono::{DateTime, Utc};
-use common::{FakeDns, Harness, admin_url, eventually, metric};
+use common::{FakeDns, Harness, TEST_KEK, admin_url, eventually, hex32, metric};
 use relink_server::acme::{Account, AccountKey, Acme, AcmeConfig, AcmeError, public_key_info};
 use relink_server::der;
+use relink_server::tls::{Sealer, certificate_context};
 use reqwest::Method;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -288,8 +289,10 @@ async fn verified_domains_get_certificates_renewed_at_two_thirds() {
     let (not_after, renew_at) = (ts(&cert["not_after"]), ts(&cert["renew_at"]));
     assert_eq!(renew_at, not_after - chrono::Duration::seconds(2));
 
-    // Stored: the chain, and the key it certifies.
-    let (chain, key) = h.store.certificate(id).await.unwrap().unwrap();
+    // Stored: the chain, and the key it certifies, sealed for this domain.
+    let sealer = Sealer::new(&hex32(TEST_KEK));
+    let (chain, sealed) = h.store.certificate(id).await.unwrap().unwrap();
+    let key = sealer.open(&sealed, &certificate_context(id)).unwrap();
     let leaf =
         der::parse_certificate(&der::pem_decode_all(&chain, "CERTIFICATE").unwrap()[0]).unwrap();
     assert_eq!(leaf.dns_names, [HOST]);
@@ -311,7 +314,8 @@ async fn verified_domains_get_certificates_renewed_at_two_thirds() {
     })
     .await;
     assert!(renewed);
-    let (_, key2) = h.store.certificate(id).await.unwrap().unwrap();
+    let (_, sealed2) = h.store.certificate(id).await.unwrap().unwrap();
+    let key2 = sealer.open(&sealed2, &certificate_context(id)).unwrap();
     assert_ne!(key2, key, "each certificate gets a fresh key");
     // No renewal before two thirds: the second came after renew_at.
     let issued_at: DateTime<Utc> = sqlx::query("SELECT issued_at FROM domain_certificates")
@@ -443,7 +447,7 @@ async fn failures_back_off_and_are_shown_until_an_attempt_succeeds() {
         .begin_tenant(h.store.personal_workspace("alice").await.unwrap())
         .await
         .unwrap();
-    let denied = sqlx::query("SELECT key_pkcs8 FROM domain_certificates")
+    let denied = sqlx::query("SELECT key_sealed FROM domain_certificates")
         .fetch_all(&mut *tx)
         .await;
     assert!(denied.is_err());

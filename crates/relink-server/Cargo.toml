@@ -24,12 +24,16 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"]
 # RS256 and ES256 verification of OpenID Connect ID tokens (src/oidc.rs);
 # already in the tree through rustls.
 ring = "=0.17.14"
+# TLS termination for custom domains (src/tls.rs), on the aws-lc-rs
+# provider; both already in the tree through reqwest.
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "migrate", "macros", "chrono", "json"] }
 subtle = "=2.6.1"
 tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio-rustls = { version = "=0.26.6", default-features = false }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "fmt", "json", "env-filter", "ansi"] }
 url = { workspace = true }

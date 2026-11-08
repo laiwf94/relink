@@ -185,6 +185,9 @@ pub fn pg_addr(admin: &str) -> SocketAddr {
     format!("{host}:{}", opts.get_port()).parse().unwrap()
 }
 
+/// The key encryption key every test server runs with.
+pub const TEST_KEK: &str = "6b656b206f662074686520746573742073657276657273206f6e6c7921212121";
+
 /// Base configuration for tests; `extra` overrides any variable.
 pub fn config(database_url: &str, extra: &[(&str, &str)]) -> Config {
     let mut vars: HashMap<String, String> = [
@@ -207,6 +210,8 @@ pub fn config(database_url: &str, extra: &[(&str, &str)]) -> Config {
         // here, so lookups fail at once. Tests that verify domains run a
         // FakeDns and point RELINK_DNS_SERVERS at it.
         ("RELINK_DNS_SERVERS", "127.0.0.1:1"),
+        // Certificate and ACME account keys are sealed under this.
+        ("RELINK_KEY_ENCRYPTION_KEY", TEST_KEK),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -525,4 +530,11 @@ fn fake_answer(query: &[u8], table: &HashMap<String, Vec<String>>) -> Option<Vec
         out.extend_from_slice(&rdata);
     }
     Some(out)
+}
+
+/// A 32-byte key from 64 hex characters.
+pub fn hex32(hex: &str) -> [u8; 32] {
+    relink_server::util::hex_decode(hex)
+        .and_then(|b| b.try_into().ok())
+        .expect("64 hex characters")
 }

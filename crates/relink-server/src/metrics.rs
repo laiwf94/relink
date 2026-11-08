@@ -247,6 +247,8 @@ pub struct Gauges {
     pub leases: usize,
     pub db_pool_size: u32,
     pub db_pool_idle: usize,
+    /// Custom-domain certificates loaded for the TLS listener.
+    pub tls_certificates: usize,
 }
 
 /// Every metric the service exports.
@@ -291,6 +293,12 @@ pub struct Metrics {
     pub certificate_failures: Counter,
     /// HTTP-01 challenge requests answered with a key authorization.
     pub acme_challenges_served: Counter,
+    /// TLS handshakes completed on the TLS listener.
+    pub tls_handshakes: Counter,
+    /// TLS handshakes that failed or timed out.
+    pub tls_handshake_failures: Counter,
+    /// Stored certificates that could not be opened or parsed.
+    pub tls_certificate_errors: Counter,
     /// Visitor hashes dropped because their day's salt was already destroyed.
     pub late_visitors: Counter,
     /// Gauge: aggregated click rows held by the flusher.
@@ -330,6 +338,9 @@ impl Default for Metrics {
             certificates_issued: Counter::default(),
             certificate_failures: Counter::default(),
             acme_challenges_served: Counter::default(),
+            tls_handshakes: Counter::default(),
+            tls_handshake_failures: Counter::default(),
+            tls_certificate_errors: Counter::default(),
             late_visitors: Counter::default(),
             backlog: AtomicU64::new(0),
         }
@@ -447,7 +458,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 24] = [
+        let counters: [(&str, &str, u64); 27] = [
             (
                 "relink_kv_writes_total",
                 "Link records written to Workers KV.",
@@ -487,6 +498,21 @@ impl Metrics {
                 "relink_acme_challenges_served_total",
                 "HTTP-01 challenge requests answered with a key authorization.",
                 self.acme_challenges_served.get(),
+            ),
+            (
+                "relink_tls_handshakes_total",
+                "TLS handshakes completed on the TLS listener.",
+                self.tls_handshakes.get(),
+            ),
+            (
+                "relink_tls_handshake_failures_total",
+                "TLS handshakes that failed or timed out.",
+                self.tls_handshake_failures.get(),
+            ),
+            (
+                "relink_tls_certificate_errors_total",
+                "Stored certificates that could not be decrypted or parsed, so were not served.",
+                self.tls_certificate_errors.get(),
             ),
             (
                 "relink_visitors_dropped_total",
@@ -575,7 +601,7 @@ impl Metrics {
                 "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
             );
         }
-        let gauges: [(&str, &str, u64); 7] = [
+        let gauges: [(&str, &str, u64); 8] = [
             (
                 "relink_click_queue_depth",
                 "Clicks waiting in the in-memory queue.",
@@ -610,6 +636,11 @@ impl Metrics {
                 "relink_db_pool_idle_connections",
                 "Idle database connections.",
                 g.db_pool_idle as u64,
+            ),
+            (
+                "relink_tls_certificates",
+                "Custom-domain certificates loaded for the TLS listener.",
+                g.tls_certificates as u64,
             ),
         ];
         for (name, help, value) in gauges {
@@ -648,6 +679,7 @@ mod tests {
             leases: 1,
             db_pool_size: 2,
             db_pool_idle: 1,
+            tls_certificates: 2,
         }
     }
 

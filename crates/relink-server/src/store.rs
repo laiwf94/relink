@@ -67,7 +67,8 @@ pub const WORKSPACE_SETTING: &str = "relink.workspace_id";
 
 /// Channel for change notifications. Payload: `<id>:<key>` for a link,
 /// where the key is [`link_key`]; [`DOMAINS_CHANGED`] when the set of
-/// verified domains changed.
+/// verified domains changed; `acme_challenges` and `certificates`
+/// (src/acme.rs, src/tls.rs) for pending challenges and stored certificates.
 pub const CHANGES_CHANNEL: &str = "relink_link_changes";
 
 /// The [`CHANGES_CHANNEL`] payload sent when a domain is verified or deleted.

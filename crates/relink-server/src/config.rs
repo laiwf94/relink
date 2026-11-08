@@ -15,6 +15,7 @@ use crate::code::{MAX_CODE_LEN, MIN_CODE_LEN};
 use crate::destination::Policy;
 use crate::oidc::OidcConfig;
 use crate::ratelimit::Rate;
+use crate::tls::TlsConfig;
 use crate::trust::TrustedProxies;
 use crate::util::hex_decode;
 
@@ -115,6 +116,11 @@ pub struct Config {
     /// Certificates for custom domains from an ACME CA; `None` when not
     /// configured.
     pub acme: Option<AcmeConfig>,
+    /// Encrypts certificate and ACME account keys before they are stored;
+    /// required with `acme`.
+    pub key_encryption_key: Option<[u8; 32]>,
+    /// Terminating TLS; `None` when not configured.
+    pub tls: Option<TlsConfig>,
 }
 
 impl fmt::Debug for Config {
@@ -157,6 +163,11 @@ impl fmt::Debug for Config {
             .field("dns_servers", &self.dns_servers)
             .field("dns_timeout", &self.dns_timeout)
             .field("acme", &self.acme)
+            .field(
+                "key_encryption_key",
+                &self.key_encryption_key.map(|_| "<redacted>"),
+            )
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -392,6 +403,61 @@ impl Config {
                 Some(acme)
             }
         };
+        let key_encryption_key = match v.raw("RELINK_KEY_ENCRYPTION_KEY") {
+            None => None,
+            Some(hex) => {
+                let bytes = hex_decode(hex.trim())
+                    .filter(|b| b.len() == 32)
+                    .ok_or("RELINK_KEY_ENCRYPTION_KEY must be 64 hex characters (32 bytes)")?;
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Some(key)
+            }
+        };
+        if acme.is_some() && key_encryption_key.is_none() {
+            return Err(
+                "RELINK_ACME_DIRECTORY needs RELINK_KEY_ENCRYPTION_KEY: certificate \
+                        keys are stored encrypted (64 hex characters, e.g. from \
+                        `openssl rand -hex 32`)"
+                    .into(),
+            );
+        }
+        let tls = match v.raw("RELINK_TLS_ADDR") {
+            None => {
+                for name in ["RELINK_TLS_CERT_FILE", "RELINK_TLS_KEY_FILE"] {
+                    if v.raw(name).is_some() {
+                        return Err(format!("{name} needs RELINK_TLS_ADDR"));
+                    }
+                }
+                None
+            }
+            Some(_) => {
+                let file = |name: &str| v.raw(name).map(|p| p.trim().into());
+                let tls = TlsConfig {
+                    addr: v.addr("RELINK_TLS_ADDR", "0.0.0.0:8443")?,
+                    cert_file: file("RELINK_TLS_CERT_FILE"),
+                    key_file: file("RELINK_TLS_KEY_FILE"),
+                    handshake_timeout: v.millis(
+                        "RELINK_TLS_HANDSHAKE_TIMEOUT_MS",
+                        10_000,
+                        100,
+                        120_000,
+                    )?,
+                };
+                if tls.cert_file.is_some() != tls.key_file.is_some() {
+                    return Err(
+                        "set both RELINK_TLS_CERT_FILE and RELINK_TLS_KEY_FILE, or neither".into(),
+                    );
+                }
+                if tls.cert_file.is_none() && key_encryption_key.is_none() {
+                    return Err("RELINK_TLS_ADDR has no certificate to serve: set \
+                                RELINK_TLS_CERT_FILE and RELINK_TLS_KEY_FILE, or \
+                                RELINK_KEY_ENCRYPTION_KEY to serve custom domains' certificates"
+                        .into());
+                }
+                Some(tls)
+            }
+        };
         let ttl = v.millis("RELINK_CACHE_TTL_MS", 30_000, 0, 86_400_000)?;
         let cfg = Config {
             database_url,
@@ -480,6 +546,8 @@ impl Config {
             dns_servers,
             dns_timeout: v.millis("RELINK_DNS_TIMEOUT_MS", 2_000, 50, 30_000)?,
             acme,
+            key_encryption_key,
+            tls,
         };
         if (cfg.country_header.is_some() || cfg.client_ip_header.is_some())
             && cfg.trusted_proxies.is_empty()
@@ -554,13 +622,80 @@ mod tests {
             ("RELINK_ACME_DIRECTORY", " https://acme.example.com/dir "),
             ("RELINK_ACME_EMAIL", "ops@example.com"),
             ("RELINK_ACME_INTERVAL_MS", "500"),
+            ("RELINK_KEY_ENCRYPTION_KEY", &"0F".repeat(32)),
         ])
         .unwrap();
+        assert_eq!(c.key_encryption_key, Some([0x0f; 32]));
+        assert!(!format!("{c:?}").contains("0f0f"));
+        assert!(format!("{c:?}").contains("key_encryption_key: Some(\"<redacted>\")"));
         let a = c.acme.unwrap();
         assert_eq!(a.directory_url, "https://acme.example.com/dir");
         assert_eq!(a.email.as_deref(), Some("ops@example.com"));
         assert_eq!(a.interval, Duration::from_millis(500));
         assert_eq!(a.order_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn tls_settings() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let kek = "ab".repeat(32);
+        let c = from(&[base]).unwrap();
+        assert_eq!((c.tls, c.key_encryption_key), (None, None));
+        // Custom domains' certificates only.
+        let c = from(&[
+            base,
+            ("RELINK_TLS_ADDR", "127.0.0.1:0"),
+            ("RELINK_KEY_ENCRYPTION_KEY", &kek),
+        ])
+        .unwrap();
+        let t = c.tls.unwrap();
+        assert_eq!(t.addr.to_string(), "127.0.0.1:0");
+        assert_eq!((t.cert_file, t.key_file), (None, None));
+        assert_eq!(t.handshake_timeout, Duration::from_secs(10));
+        // A default certificate only.
+        let c = from(&[
+            base,
+            ("RELINK_TLS_ADDR", "[::]:443"),
+            ("RELINK_TLS_CERT_FILE", " /etc/relink/cert.pem "),
+            ("RELINK_TLS_KEY_FILE", "/etc/relink/key.pem"),
+            ("RELINK_TLS_HANDSHAKE_TIMEOUT_MS", "2500"),
+        ])
+        .unwrap();
+        let t = c.tls.unwrap();
+        assert_eq!(t.cert_file, Some("/etc/relink/cert.pem".into()));
+        assert_eq!(t.key_file, Some("/etc/relink/key.pem".into()));
+        assert_eq!(t.handshake_timeout, Duration::from_millis(2500));
+        for bad in [
+            // Nothing to serve.
+            vec![base, ("RELINK_TLS_ADDR", "0.0.0.0:443")],
+            vec![
+                base,
+                ("RELINK_TLS_ADDR", "nope"),
+                ("RELINK_KEY_ENCRYPTION_KEY", &kek),
+            ],
+            vec![
+                base,
+                ("RELINK_TLS_ADDR", "0.0.0.0:443"),
+                ("RELINK_TLS_CERT_FILE", "/etc/relink/cert.pem"),
+            ],
+            vec![base, ("RELINK_TLS_CERT_FILE", "/etc/relink/cert.pem")],
+            vec![base, ("RELINK_TLS_KEY_FILE", "/etc/relink/key.pem")],
+            vec![
+                base,
+                ("RELINK_TLS_ADDR", "0.0.0.0:443"),
+                ("RELINK_KEY_ENCRYPTION_KEY", &kek),
+                ("RELINK_TLS_HANDSHAKE_TIMEOUT_MS", "10"),
+            ],
+            vec![base, ("RELINK_KEY_ENCRYPTION_KEY", "abcd")],
+            vec![base, ("RELINK_KEY_ENCRYPTION_KEY", &"ab".repeat(33))],
+            // Keys are never stored unencrypted.
+            vec![
+                base,
+                ("RELINK_ACME_DIRECTORY", "https://acme.example.com/dir"),
+            ],
+        ] {
+            assert!(from(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -656,6 +791,8 @@ mod tests {
     #[test]
     fn rejects_bad_values() {
         let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let hex = "cd".repeat(32);
+        let kek = ("RELINK_KEY_ENCRYPTION_KEY", hex.as_str());
         for bad in [
             vec![],
             vec![base, ("RELINK_CODE_LENGTH", "3")],
@@ -674,15 +811,18 @@ mod tests {
             vec![base, ("RELINK_ACME_EMAIL", "ops@example.com")],
             vec![
                 base,
+                kek,
                 ("RELINK_ACME_DIRECTORY", "http://acme.example.com/dir"),
             ],
             vec![
                 base,
+                kek,
                 ("RELINK_ACME_DIRECTORY", "https://acme.example.com/dir"),
                 ("RELINK_ACME_EMAIL", "nobody"),
             ],
             vec![
                 base,
+                kek,
                 ("RELINK_ACME_DIRECTORY", "https://acme.example.com/dir"),
                 ("RELINK_ACME_INTERVAL_MS", "10"),
             ],

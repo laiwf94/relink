@@ -46,6 +46,7 @@ use crate::metrics::{DbOp, Metrics};
 use crate::oidc::is_loopback_http;
 use crate::server::App;
 use crate::store::{CHANGES_CHANNEL, Db, DbError};
+use crate::tls::{CERTIFICATES_CHANGED, Sealer, account_context, certificate_context};
 use crate::util::{BoxFuture, b64url_encode, stopped};
 
 /// The change notification payload sent when a challenge is published.
@@ -907,7 +908,7 @@ fn clip(s: &str) -> String {
 }
 
 impl Db {
-    /// The stored account for a directory: (URL, PKCS#8 key).
+    /// The stored account for a directory: (URL, sealed PKCS#8 key).
     pub async fn acme_account(
         &self,
         directory: &str,
@@ -915,33 +916,33 @@ impl Db {
         let row = self
             .timed(
                 sqlx::query(
-                    "SELECT account_url, key_pkcs8 FROM acme_accounts WHERE directory_url = $1",
+                    "SELECT account_url, key_sealed FROM acme_accounts WHERE directory_url = $1",
                 )
                 .bind(directory)
                 .fetch_optional(self.pool()),
             )
             .await?;
-        row.map(|r| Ok((r.try_get("account_url")?, r.try_get("key_pkcs8")?)))
+        row.map(|r| Ok((r.try_get("account_url")?, r.try_get("key_sealed")?)))
             .transpose()
             .map_err(|e: sqlx::Error| DbError::from(e))
     }
 
-    /// Stores an account unless another instance stored one first; returns
-    /// the one stored either way.
+    /// Stores an account, its key sealed with [`account_context`], unless
+    /// another instance stored one first; returns the one stored either way.
     pub async fn save_acme_account(
         &self,
         directory: &str,
         url: &str,
-        key_pkcs8: &[u8],
+        key_sealed: &[u8],
     ) -> Result<(String, Vec<u8>), DbError> {
         self.timed(
             sqlx::query(
-                "INSERT INTO acme_accounts (directory_url, account_url, key_pkcs8)
+                "INSERT INTO acme_accounts (directory_url, account_url, key_sealed)
                  VALUES ($1, $2, $3) ON CONFLICT (directory_url) DO NOTHING",
             )
             .bind(directory)
             .bind(url)
-            .bind(key_pkcs8)
+            .bind(key_sealed)
             .execute(self.pool()),
         )
         .await?;
@@ -1093,23 +1094,30 @@ impl Db {
             .map_err(DbError::from)
     }
 
-    /// Stores a newly issued certificate for a domain, replacing the old
-    /// one, and clears its failures.
-    pub async fn store_certificate(&self, domain_id: i64, cert: &Issued) -> Result<(), DbError> {
+    /// Stores a newly issued certificate for a domain, its key sealed with
+    /// [`certificate_context`], replacing the old one; clears its failures
+    /// and tells every instance to serve it.
+    pub async fn store_certificate(
+        &self,
+        domain_id: i64,
+        cert: &Issued,
+        sealer: &Sealer,
+    ) -> Result<(), DbError> {
+        let key_sealed = sealer.seal(&cert.key_pkcs8, &certificate_context(domain_id));
         self.timed(async {
             let mut tx = self.pool().begin().await?;
             sqlx::query(
                 "INSERT INTO domain_certificates
-                        (domain_id, chain_pem, key_pkcs8, not_before, not_after, renew_at)
+                        (domain_id, chain_pem, key_sealed, not_before, not_after, renew_at)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (domain_id) DO UPDATE
-                    SET chain_pem = EXCLUDED.chain_pem, key_pkcs8 = EXCLUDED.key_pkcs8,
+                    SET chain_pem = EXCLUDED.chain_pem, key_sealed = EXCLUDED.key_sealed,
                         not_before = EXCLUDED.not_before, not_after = EXCLUDED.not_after,
                         renew_at = EXCLUDED.renew_at, issued_at = now()",
             )
             .bind(domain_id)
             .bind(&cert.chain_pem)
-            .bind(&cert.key_pkcs8)
+            .bind(&key_sealed)
             .bind(cert.not_before)
             .bind(cert.not_after)
             .bind(cert.renew_at)
@@ -1125,6 +1133,11 @@ impl Db {
             .bind(cert.renew_at)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(CHANGES_CHANNEL)
+                .bind(CERTIFICATES_CHANGED)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await
         })
         .await
@@ -1153,18 +1166,18 @@ impl Db {
         .map(|_| ())
     }
 
-    /// A domain's stored certificate: (chain PEM, PKCS#8 key).
+    /// A domain's stored certificate: (chain PEM, sealed PKCS#8 key).
     pub async fn certificate(&self, domain_id: i64) -> Result<Option<(String, Vec<u8>)>, DbError> {
         let row = self
             .timed(
                 sqlx::query(
-                    "SELECT chain_pem, key_pkcs8 FROM domain_certificates WHERE domain_id = $1",
+                    "SELECT chain_pem, key_sealed FROM domain_certificates WHERE domain_id = $1",
                 )
                 .bind(domain_id)
                 .fetch_optional(self.pool()),
             )
             .await?;
-        row.map(|r| Ok((r.try_get("chain_pem")?, r.try_get("key_pkcs8")?)))
+        row.map(|r| Ok((r.try_get("chain_pem")?, r.try_get("key_sealed")?)))
             .transpose()
             .map_err(|e: sqlx::Error| DbError::from(e))
     }
@@ -1342,6 +1355,7 @@ pub struct AcmeWorker {
     db: Db,
     metrics: Arc<Metrics>,
     wake: Arc<Notify>,
+    sealer: Arc<Sealer>,
     account: tokio::sync::Mutex<Option<Arc<Account>>>,
 }
 
@@ -1351,12 +1365,14 @@ impl AcmeWorker {
         db: Db,
         metrics: Arc<Metrics>,
         wake: Arc<Notify>,
+        sealer: Arc<Sealer>,
     ) -> Result<Self, String> {
         Ok(AcmeWorker {
             acme: Acme::new(cfg)?,
             db,
             metrics,
             wake,
+            sealer,
             account: tokio::sync::Mutex::new(None),
         })
     }
@@ -1368,7 +1384,8 @@ impl AcmeWorker {
             return Ok(a.clone());
         }
         let directory = &self.acme.config().directory_url;
-        let (url, pkcs8) = match self
+        let context = account_context(directory);
+        let (url, sealed) = match self
             .db
             .acme_account(directory)
             .await
@@ -1382,11 +1399,15 @@ impl AcmeWorker {
                 // If another instance stored one meanwhile, theirs is kept
                 // and this registration is simply never used.
                 self.db
-                    .save_acme_account(directory, &url, key.pkcs8())
+                    .save_acme_account(directory, &url, &self.sealer.seal(key.pkcs8(), &context))
                     .await
                     .map_err(|e| e.to_string())?
             }
         };
+        let pkcs8 = self
+            .sealer
+            .open(&sealed, &context)
+            .map_err(|e| format!("ACME account key: {e}"))?;
         let account = Arc::new(Account {
             key: AccountKey::from_pkcs8(&pkcs8)?,
             url,
@@ -1418,7 +1439,7 @@ impl AcmeWorker {
             match result {
                 Ok(cert) => {
                     self.db
-                        .store_certificate(item.domain_id, &cert)
+                        .store_certificate(item.domain_id, &cert, &self.sealer)
                         .await
                         .map_err(|e| e.to_string())?;
                     self.metrics.certificates_issued.inc();

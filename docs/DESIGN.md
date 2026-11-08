@@ -44,8 +44,8 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `workspace_members` | Member, workspace and role (`owner`, `admin`, `editor` or `viewer`). |
 | `links` | Code, workspace, custom domain (none for the default domain), owner (its creator), destinations as a JSON array of `{url, weight}`, options, `clicks_reserved`, per-destination health failure counts. |
 | `domains` | Custom domains: workspace, hostname, verification token, who added it, when it was verified, and the outcome of the last check; the certificate's expiry and renewal time, and the last issuance attempt's outcome, failure count and next attempt. |
-| `domain_certificates` | Each domain's current certificate chain, PEM, its private key, validity and renewal time. Server role only. |
-| `acme_accounts` | The ACME account per CA directory: its URL and key. Server role only. |
+| `domain_certificates` | Each domain's current certificate chain, PEM, its private key sealed with AES-256-GCM, validity, renewal time and when it was issued. Server role only. |
+| `acme_accounts` | The ACME account per CA directory: its URL and sealed key. Server role only. |
 | `acme_challenges` | HTTP-01 challenges being validated: token, hostname, key authorization, expiry. |
 | `api_keys` | Workspace, owner, name, SHA-256 of the key, scopes, expiry, the key that replaced it on rotation, revocation time. |
 | `click_daily` | Click counts per link, UTC day, country, device class and referrer host. |
@@ -543,9 +543,57 @@ Tenants see a verified domain's certificate state in `GET
 its error while the certificate is still valid) or `failed`, with the
 error and the next attempt. They cannot read `domain_certificates`,
 `acme_accounts` or `acme_challenges`, which have no grants for the tenant
-role. Private keys are stored as PKCS#8 in Postgres and readable only by
-the server's own role; they are encrypted at rest when relink terminates
-TLS itself, the next step.
+role. Private keys are stored sealed, as the next section describes.
+
+### Terminating TLS
+
+With `RELINK_TLS_ADDR` set, relink serves the public routes over TLS too
+(`src/tls.rs`), with rustls on the aws-lc-rs provider: TLS 1.2 and 1.3,
+HTTP/1.1 by ALPN. Each custom domain gets its own certificate, chosen by
+the SNI name in the client's hello (without case or a final dot) from a
+map in memory; the server's own host, clients that send no SNI and names
+without a certificate get the default certificate from
+`RELINK_TLS_CERT_FILE` and `RELINK_TLS_KEY_FILE`, or no handshake at all
+when there is none. A chain is served only if its leaf certifies the key
+it is stored with.
+
+Certificates are swapped in without a restart. Storing a certificate sends
+a `certificates` change notification in the same transaction, and every
+instance then reloads: one query lists each verified domain's certificate
+by issue time, without the certificate, and only those that differ from
+the map are read, opened and parsed, so a renewal costs one row however
+many domains there are. Handshakes in progress keep the certificate they
+started with; the next one gets the new. A certificate that cannot be
+opened or parsed is logged and counted, and its domain keeps serving the
+one it had. Reloads also run when a domain is verified or deleted (its
+certificate goes with it), when the change listener reconnects and once a
+minute, which also re-reads the default certificate files and keeps the
+old ones if the new ones do not load.
+
+Private keys, the certificates' and the ACME account's, are sealed before
+they reach Postgres, with AES-256-GCM under `RELINK_KEY_ENCRYPTION_KEY`
+(`ring`). The key encryption key is configuration, never stored, and the
+same on every instance; ACME requires it. A sealed key is a 4-byte header
+(`rlk` and a version), a random 96-bit nonce, the ciphertext and the
+128-bit tag. The associated data names the row (`relink certificate key`
+and the domain's id, or `relink acme account key` and the directory URL),
+so a key copied to another row, altered or sealed under another key does
+not open. Check constraints on both tables refuse any key without the
+header, whatever role writes it. A database dump therefore holds no usable
+key. Migration 0012 deleted the plaintext keys stored before it; the
+worker registers a new account and orders every domain a new certificate.
+Changing the key encryption key leaves stored keys unreadable in the same
+way: delete the rows of `acme_accounts`, and set `tls_renew_at` to now on
+the domains, and they are ordered again.
+
+The listener accepts connections and runs each handshake in its own task,
+at most 1,024 at once (the rest wait in the kernel's accept queue), each
+bounded by `RELINK_TLS_HANDSHAKE_TIMEOUT_MS` (10 s), so a client that
+opens a connection and says nothing holds one slot for that long and
+nobody else up. Finished connections go to axum like a plain listener's,
+with the peer's address, so trusted proxies, rate limits and click
+counting work the same on both. On shutdown the listener closes with the
+others and its requests drain within the same budget.
 
 ### A management request, start to finish
 
@@ -888,6 +936,9 @@ and counts the clicks it could not write.
 | Verified domains not loaded | Possible only when Postgres went away between migrations and start; requests whose host could be a custom domain get 503 until the change listener connects and loads them. |
 | DNS resolver down | Verification answers 200 with the resolver error in `check_error`; verified domains are unaffected. |
 | ACME CA down or refusing | The domain keeps its current certificate; the error is stored on the domain and retried after 5 minutes, doubling to a day, or after the CA's `Retry-After`. A first certificate stays `pending` or `failed` meanwhile. |
+| Stored certificate unreadable (another key encryption key, corrupt row) | Logged and counted in `relink_tls_certificate_errors_total`; the domain keeps the certificate in memory, or gets the default one after a restart. |
+| Default certificate files replaced with a bad pair | The old certificate keeps being served; the reload logs why. |
+| Slow or stalled TLS clients | Each handshake is cut off after 10 s; at most 1,024 run at once, the rest wait in the accept queue. |
 | Instance dies mid-order | Its claim lapses after 15 minutes and another instance orders again; its challenges expire after an hour. |
 | Health target hangs | 5 s timeout, counted as a failure. |
 
@@ -918,6 +969,7 @@ and counts the clicks it could not write.
 | Custom domains | 1,000 per workspace whatever the plan; hostnames up to 253 characters |
 | DNS answer | 2 s per resolver (`RELINK_DNS_TIMEOUT_MS`); 4 KiB over UDP, 64 KiB over TCP |
 | ACME | 4 domains claimed per round; an order within 300 s (`RELINK_ACME_ORDER_TIMEOUT_S`); responses up to 1 MiB; 16 spare nonces; 3 attempts on a bad nonce; retries 5 min doubling to a day; challenge database lookups 20/s per instance |
+| TLS | 1,024 handshakes at once, 10 s each (`RELINK_TLS_HANDSHAKE_TIMEOUT_MS`); sealed keys up to 16 KiB |
 
 ## Observability
 
@@ -928,7 +980,9 @@ the admin listener cover redirect latency, redirects by outcome, cache results
 lookups, click queue depth, backlog, drops by reason, late visitor hashes,
 database errors by operation, lease grants, health probes, KV writes, deletes,
 errors and reconciled drift, edge clicks, API requests and refusals, link creations refused per plan
-limit, certificates issued and failed orders, HTTP-01 answers served, and pool usage.
+limit, certificates issued and failed orders, HTTP-01 answers served, TLS
+handshakes completed and failed, certificates loaded and those that could
+not be, and pool usage.
 
 ## Dependencies
 
@@ -947,7 +1001,8 @@ audit` known advisories.
 | `reqwest` | HTTP client for health probes, the KV API, the OpenID Connect provider and the ACME CA. It accepts a custom DNS resolver, which the SSRF defence depends on. |
 | `serde`, `serde_json` | JSON for the API, the KV record and the edge wire format. |
 | `url` | WHATWG URL parsing and IDNA; not something to hand-roll when the result decides where a server sends requests. |
-| `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens, and P-256 key generation and ES256 signing for ACME requests and certificate requests. RSA and ECDSA are not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
+| `rustls`, `tokio-rustls` | TLS termination: the handshake, record layer and certificate selection by SNI, on the aws-lc-rs provider. TLS is not code to hand-roll, and both are already in the tree through reqwest at these versions, so they add no new code to the build. |
+| `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens, and P-256 key generation and ES256 signing for ACME requests and certificate requests, and AES-256-GCM for keys at rest. RSA and ECDSA are not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
 | `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys and the audit chain, constant-time comparison. |
 | `getrandom` | The OS CSPRNG for codes, keys and salts. |
 | `chrono` | Timestamps and UTC dates; the core uses it without its clock so it stays wasm-friendly. |

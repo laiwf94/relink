@@ -8,7 +8,8 @@
 //! [`quota`] holds plans, limits and usage; [`domains`] adds custom
 //! domains, verified through [`dns`], and routes redirects by `Host`;
 //! [`acme`] gets their certificates from an ACME CA, with [`der`] for the
-//! certificate request;
+//! certificate request, and [`tls`] serves them, by SNI, with their keys
+//! encrypted at rest;
 //! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
 //! decides which forwarding headers to believe; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
@@ -43,6 +44,7 @@ pub mod session;
 pub mod singleflight;
 pub mod store;
 pub mod tenant;
+pub mod tls;
 pub mod trust;
 pub mod util;
 

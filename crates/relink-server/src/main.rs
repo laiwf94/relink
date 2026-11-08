@@ -90,6 +90,10 @@
 //! | `RELINK_ACME_EMAIL` | unset | Contact address given to the CA for the account (expiry notices) |
 //! | `RELINK_ACME_INTERVAL_MS` | `60000` | How often to look for domains that need a certificate or a renewal, 100 ms to a day; a newly verified domain is ordered at once |
 //! | `RELINK_ACME_ORDER_TIMEOUT_S` | `300` | Longest one order may take, validation and issuance included, 5 to 3600 seconds |
+//! | `RELINK_KEY_ENCRYPTION_KEY` | unset | 64 hex characters (32 bytes, e.g. `openssl rand -hex 32`): certificate and ACME account keys are stored encrypted under it. Required with `RELINK_ACME_DIRECTORY`; the same on every instance. Changing it makes stored keys unreadable |
+//! | `RELINK_TLS_ADDR` | unset | Terminate TLS on this address (e.g. `0.0.0.0:8443`, which the image exposes, published as 443) and serve the public routes there, each custom domain with its own certificate by SNI. Needs `RELINK_KEY_ENCRYPTION_KEY` or a default certificate |
+//! | `RELINK_TLS_CERT_FILE`, `RELINK_TLS_KEY_FILE` | unset | Default certificate chain and key (PEM), for the server's own host, clients without SNI and hosts without a certificate; both or neither. Re-read every minute |
+//! | `RELINK_TLS_HANDSHAKE_TIMEOUT_MS` | `10000` | Longest a client may take to finish its TLS handshake, 100 ms to 2 minutes |
 //! | `RELINK_LOG` | `info,sqlx::postgres::notice=warn` | Log filter (`tracing` env-filter syntax) |
 
 use std::process::ExitCode;
