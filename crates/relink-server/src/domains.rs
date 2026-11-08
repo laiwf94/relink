@@ -49,6 +49,7 @@ use crate::server::App;
 use crate::store::{Db, DbError};
 use crate::tenant::{Allowed, LinksRead, LinksWrite, Tenant};
 use crate::util::{hex_encode, secure_random};
+use relink_core::host::custom_host;
 
 /// The label in front of a hostname where its verification record lives.
 pub const CHALLENGE_LABEL: &str = "_relink-challenge";
@@ -60,8 +61,7 @@ pub const RECORD_PREFIX: &str = "relink-domain-verification=";
 /// always one bounded answer.
 pub const MAX_DOMAINS: i64 = 1_000;
 
-/// Longest hostname (RFC 1035 section 2.3.4, without the final dot).
-pub const MAX_HOSTNAME: usize = 253;
+pub use relink_core::host::{MAX_HOSTNAME, host_part, is_valid_hostname};
 
 /// Validates a hostname a workspace wants to add and returns its stored
 /// form: lowercase, IDNA applied (`bücher.example.com` becomes
@@ -115,64 +115,6 @@ pub fn parse_hostname(raw: &str, default_host: &str) -> Result<String, String> {
         ));
     }
     Ok(host)
-}
-
-/// Whether `host` (lowercase, no final dot) is a hostname the `domains`
-/// table accepts: at least two labels of `[a-z0-9-]`, 1 to 63 characters,
-/// no hyphen at either end, 253 characters in all, and a top-level label
-/// that is not all digits (that would be an IPv4 address).
-pub fn is_valid_hostname(host: &str) -> bool {
-    !host.bytes().any(|b| b.is_ascii_uppercase()) && could_be_domain(host)
-}
-
-/// [`is_valid_hostname`] ignoring case: whether a `Host` could name a
-/// verified domain at all. IP addresses and single labels never can.
-fn could_be_domain(host: &str) -> bool {
-    if host.is_empty() || host.len() > MAX_HOSTNAME {
-        return false;
-    }
-    let mut labels = 0;
-    let mut last = "";
-    for l in host.split('.') {
-        let ok = !l.is_empty()
-            && l.len() <= 63
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-        if !ok {
-            return false;
-        }
-        labels += 1;
-        last = l;
-    }
-    labels >= 2 && !last.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// The host part of a `Host` header value: without the port and the final
-/// dot, case preserved. `None` for an IP literal in brackets, a malformed
-/// port, or anything that cannot be a hostname; those requests can only be
-/// for the default domain.
-pub fn host_part(raw: &[u8]) -> Option<&str> {
-    if raw.is_empty() || raw.len() > MAX_HOSTNAME + 7 || raw[0] == b'[' {
-        return None;
-    }
-    let s = std::str::from_utf8(raw).ok()?;
-    let host = match s.rsplit_once(':') {
-        Some((h, port)) => {
-            if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            h
-        }
-        None => s,
-    };
-    let host = host.strip_suffix('.').unwrap_or(host);
-    let ok = !host.is_empty()
-        && host.len() <= MAX_HOSTNAME
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
-    ok.then_some(host)
 }
 
 /// Which domain a redirect request is for.
@@ -260,12 +202,9 @@ impl DomainMap {
     /// cannot name a verified domain (an IP address, a single label), is the
     /// default domain, whether or not the domains have loaded.
     pub fn route(&self, host_header: Option<&[u8]>, default_host: &str) -> Route {
-        let Some(host) = host_header.and_then(host_part) else {
+        let Some(host) = custom_host(host_header, default_host) else {
             return Route::Default;
         };
-        if host.eq_ignore_ascii_case(default_host) || !could_be_domain(host) {
-            return Route::Default;
-        }
         if !self.is_loaded() {
             return Route::Unavailable;
         }
@@ -630,7 +569,7 @@ impl Tenant<'_> {
                         after: Some(domain_state(&domain)),
                     };
                     audit::record(&mut tx, self.actor(), change).await?;
-                    self.db().domains_changed(&mut tx).await?;
+                    self.db().domains_changed(&mut tx, &domain.hostname).await?;
                 }
                 tx.commit().await?;
                 Ok(domain)
@@ -670,7 +609,7 @@ impl Tenant<'_> {
                 };
                 audit::record(&mut tx, self.actor(), change).await?;
                 if domain.verified_at.is_some() {
-                    self.db().domains_changed(&mut tx).await?;
+                    self.db().domains_changed(&mut tx, &domain.hostname).await?;
                 }
                 tx.commit().await?;
                 Ok(Ok(domain))

@@ -216,6 +216,47 @@ async fn a_verified_domain_serves_its_own_codes() {
         assert_eq!(visit_as(&h, &base, "localhost", &random_code).await.0, 404);
     }
 
+    // Behind a trusted proxy (the edge Worker cannot set Host), the
+    // visitor's host arrives in x-forwarded-host; the first value counts.
+    let forwarded = |base: String, fwd: &'static str| {
+        let h = &h;
+        async move {
+            let r = h
+                .http
+                .get(format!("{base}/promo"))
+                .header("host", "localhost")
+                .header("x-forwarded-host", fwd)
+                .send()
+                .await
+                .unwrap();
+            r.headers()
+                .get("location")
+                .map(|v| v.to_str().unwrap().to_owned())
+        }
+    };
+    for fwd in [
+        "go.relink-docs.net",
+        "Go.Relink-Docs.net:443, proxy.example.org",
+    ] {
+        assert_eq!(forwarded(h.base.clone(), fwd).await, b_loc, "{fwd}");
+    }
+    for fwd in ["other.example.org", " , go.relink-docs.net", "127.0.0.1"] {
+        assert_eq!(forwarded(h.base.clone(), fwd).await, a_loc, "{fwd}");
+    }
+    // From a peer that is not a trusted proxy it is ignored.
+    let untrusted = h
+        .second_instance(&[("RELINK_TRUSTED_PROXIES", "10.9.9.9")])
+        .await;
+    let untrusted_base = format!("http://{}", untrusted.addr);
+    assert!(
+        eventually(Duration::from_secs(5), || {
+            let (h, base, want) = (&h, untrusted_base.clone(), b_loc.clone());
+            async move { visit_as(h, &base, HOST, "promo").await.1 == want }
+        })
+        .await
+    );
+    assert_eq!(forwarded(untrusted_base, "go.relink-docs.net").await, a_loc);
+
     // The API finds a link on a domain with ?domain=.
     let get = |q: &'static str| {
         let h = &h;

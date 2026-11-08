@@ -132,7 +132,7 @@ async fn at_edge(cookie: Option<&str>, random: u64) -> (String, Option<String>) 
         random,
         ..EdgeRequest::default()
     };
-    let out = handle(&kv, &Unreachable, &settings, &req).await;
+    let out = handle(&kv, &Unreachable, &settings, "", &req).await;
     assert_eq!(out.served, Served::Edge);
     (
         out.response.header("location").unwrap().to_owned(),
@@ -188,7 +188,7 @@ async fn a_different_key_does_not_carry_over() {
         random: 7,
         ..EdgeRequest::default()
     };
-    let out = handle(&kv, &Unreachable, &settings, &req).await;
+    let out = handle(&kv, &Unreachable, &settings, "", &req).await;
     let cookie = pair(out.response.header("set-cookie").unwrap());
     let (_, reassigned) = at_origin(&app, Some(&cookie)).await;
     assert!(

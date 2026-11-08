@@ -46,8 +46,10 @@ database write.
 The edge is a Cloudflare Worker that reads the link from Workers KV and applies
 the same `relink-core` rules, so a visitor's A/B variant survives moving
 between edge and origin. Links with a click limit, links KV does not have yet,
-and KV errors go to the origin. Edge clicks are batched per isolate and posted
-to the origin in the background.
+and KV errors go to the origin. Links on custom domains are served at the edge
+too, keyed by host and code, with the same routing by `Host` as the origin.
+Edge clicks are batched per isolate and posted to the origin in the
+background.
 
 On the origin, clicks go through a bounded queue into daily aggregates. Client
 addresses are never stored, and unique visitors are counted with a keyed hash
@@ -75,8 +77,11 @@ Configuration is by environment variable, listed with defaults at the top of
 [crates/relink-server/src/main.rs](crates/relink-server/src/main.rs). Two
 deserve a mention here. `RELINK_TRUSTED_PROXIES` lists the addresses of your
 CDN or load balancer; the country and client-address headers are read only
-from those peers, so a visitor cannot pick their own country. `RELINK_KV_*`
-turns on publishing to Workers KV; without it the origin works alone.
+from those peers, so a visitor cannot pick their own country (and so is
+`x-forwarded-host`, which the edge uses to name a custom domain). `RELINK_KV_*`
+turns on publishing to Workers KV; without it the origin works alone. With
+`RELINK_KV_ZONE_ID` as well, each verified domain is registered as a custom
+hostname of that Cloudflare zone, so its traffic reaches the Worker.
 `RELINK_ACME_DIRECTORY` turns on certificates for custom domains, and
 `RELINK_TLS_ADDR` serves them.
 
@@ -177,6 +182,10 @@ $ curl -si localhost:8080/spring -H 'Host: go.example.com' | grep -i ^location
 location: https://example.com/spring
 ```
 
+With edge publishing on, the domain is published to KV as `host:go.example.com`
+and its links as `link:go.example.com/<code>`; set the Worker's `DEFAULT_HOST`
+to the host of `RELINK_PUBLIC_BASE_URL`.
+
 With `RELINK_ACME_DIRECTORY` set (for example
 `https://acme-v02.api.letsencrypt.org/directory`, which accepts that CA's
 terms of service), relink orders a certificate for each domain as soon as
@@ -249,7 +258,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 | Workspaces end to end | One test walks week 1 as a team would: three people sign in through a fake OpenID Connect provider; the owner invites one by email as an editor and one by member name as a viewer, and each accepts only their own link, once; the editor creates links in the team workspace, the viewer only reads, and a stranger is refused; scoped, rotated and expiring keys are made with the binary; a plan's link and click limits refuse new links while redirects continue; the tenant role sees no rows in any tenant table without a workspace; every change is attributed in the team's audit chain, which the binary verifies with and without an anchor; signing out ends the session. |
 | Custom domains | Against real Postgres over HTTP with a local DNS resolver: a domain verifies only with its own token published, and only the first workspace to prove a hostname gets it; the same code on the default and a custom domain are two links, routed by `Host` on two instances, including after an update; unknown hosts keep the default domain; a domain with links cannot be deleted, and once deleted both instances stop routing it; 12 concurrent adds against a 3-domain plan with one domain taken create exactly 2; editors and viewers cannot manage domains; the database refuses a link on another workspace's domain. The DNS client is tested against crafted answers (compression, CNAME chains, truncation, NXDOMAIN, forged IDs, random bytes) and a resolver that answers over UDP and TCP. |
 | Certificates | The ACME client against a local CA that checks what a real one does (JWS signatures over its own nonces and the requested URL, HTTP-01 fetched with the domain as `Host`, a certificate request signed by its key and naming exactly the order's identifiers) and signs real X.509 certificates: issuance, a stale nonce retried but not forever, why validation failed, a rate limit's `Retry-After`, a certificate for another key refused, an order that never finishes, URLs that leave https, a lost account. In two running servers on Postgres: a domain gets a certificate once verified, with the CA's request answered by the other instance, and is renewed at two thirds of its lifetime with a fresh key; the instances never order the same domain at once and keep one account; failures back off (5 then 10 minutes) and show in the domain until an attempt succeeds; the challenge answer is per host, reaches every instance by notification or a database lookup, and is withdrawn after use. Tenants cannot read certificate keys. TLS: both instances serve the domain's certificate by SNI (any case, a final dot) to a client that checks it against the CA, redirect on it and count the click; a renewal on either instance is served by both on the next connection; a name without a certificate gets no handshake; keys are sealed for their row and Postgres refuses one that is not; an instance with another encryption key counts the certificate it cannot open and serves its default certificate from files to clients without SNI, picks up new files and keeps the old ones when the new key does not match; a stalled handshake is cut off; a default certificate that cannot be read stops the start. The sealing rejects every flipped byte, another row and another key. The DER reader and base64 are property-tested on random bytes, and the request was checked with `openssl req -verify`. |
-| Edge | Handler logic against an in-memory KV and a fake origin; a local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV API, including retries while it fails and reconciliation of drift. |
+| Edge | Handler logic against an in-memory KV and a fake origin, including custom domains: a domain's own code in one read whatever the case, port or final dot; unknown hosts fall back to the default domain; a verified domain never serves a default-domain code; limited, broken and unreadable records go to the origin with the host forwarded. A local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV and custom hostname APIs, including retries while either fails, domain records and links on a domain published once it is verified and removed with it, an operator's own hostnames left alone, and reconciliation of drift in links, domain records and hostnames. The origin routes by `x-forwarded-host` from trusted proxies only. |
 | Health checks | Local HTTP servers flip between healthy and failing; private, loopback and metadata addresses are refused; redirects are not followed; probes to one host are paced. |
 | The binary | Admin commands, config errors, and a real process stopped with SIGTERM whose log never contains the API key or database URL. |
 | Parsers | cargo-fuzz targets for URLs, aliases, request headers and proxy lists, request bodies, edge click batches, KV records, cursors and change notifications. |

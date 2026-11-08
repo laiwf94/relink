@@ -28,7 +28,7 @@ use crate::dns::{DnsClient, parse_resolv_conf};
 use crate::domains::{self, DomainMap};
 use crate::health::HealthWorker;
 use crate::invite;
-use crate::kvsync::{CloudflareKv, KvSync};
+use crate::kvsync::{CloudflareHostnames, CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
 use crate::metrics::{DbOp, Gauges, Metrics};
 use crate::oidc::{self, Oidc};
@@ -404,7 +404,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         Some(kv_cfg) => {
             let api = CloudflareKv::new(kv_cfg)
                 .map_err(|e| format!("cannot build the KV client: {e}"))?;
-            let sync = KvSync::new(
+            let mut sync = KvSync::new(
                 db.clone(),
                 Arc::new(api),
                 metrics.clone(),
@@ -412,6 +412,11 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
                 kv_cfg.reconcile,
                 app.kv_wake.clone(),
             );
+            if let Some(hostnames) = CloudflareHostnames::new(kv_cfg)
+                .map_err(|e| format!("cannot build the custom hostname client: {e}"))?
+            {
+                sync = sync.with_hostnames(Arc::new(hostnames));
+            }
             Some(tokio::spawn(sync.run(bg_rx.clone())))
         }
         None => None,

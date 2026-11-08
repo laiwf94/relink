@@ -28,6 +28,10 @@ pub struct KvConfig {
     pub account_id: String,
     pub namespace_id: String,
     pub api_token: String,
+    /// The Cloudflare zone whose custom hostnames (Cloudflare for SaaS)
+    /// route verified custom domains to the Worker; `None` leaves custom
+    /// hostnames to the operator.
+    pub zone_id: Option<String>,
     /// How often the outbox is checked when no change notification arrives.
     pub poll: Duration,
     /// How often KV is compared with the database in full.
@@ -41,6 +45,7 @@ impl fmt::Debug for KvConfig {
             .field("account_id", &self.account_id)
             .field("namespace_id", &self.namespace_id)
             .field("api_token", &"<redacted>")
+            .field("zone_id", &self.zone_id)
             .field("poll", &self.poll)
             .field("reconcile", &self.reconcile)
             .finish()
@@ -326,11 +331,19 @@ impl Config {
                             .into(),
                     );
                 }
+                let zone_id = v
+                    .raw("RELINK_KV_ZONE_ID")
+                    .map(|z| z.trim().to_owned())
+                    .filter(|z| !z.is_empty());
+                if zone_id.as_deref().is_some_and(|z| !safe_id(z)) {
+                    return Err("RELINK_KV_ZONE_ID must be a plain identifier".into());
+                }
                 Some(KvConfig {
                     api_base,
                     account_id: account_id.trim().to_owned(),
                     namespace_id: namespace_id.trim().to_owned(),
                     api_token: api_token.trim().to_owned(),
+                    zone_id,
                     poll: Duration::from_millis(v.parse("RELINK_KV_POLL_MS", 1_000, 50, 60_000)?),
                     reconcile: Duration::from_secs(v.parse(
                         "RELINK_KV_RECONCILE_S",
@@ -612,6 +625,34 @@ mod tests {
                 "1.1.1.1:53".parse().unwrap(),
                 "127.0.0.1:5353".parse().unwrap()
             ])
+        );
+    }
+
+    #[test]
+    fn kv_settings() {
+        let base = [
+            ("RELINK_DATABASE_URL", "postgres://x/y"),
+            ("RELINK_KV_ACCOUNT_ID", "acct"),
+            ("RELINK_KV_NAMESPACE_ID", "ns"),
+            ("RELINK_KV_API_TOKEN", "token"),
+        ];
+        let kv = from(&base).unwrap().kv.unwrap();
+        assert_eq!(kv.zone_id, None);
+        assert_eq!(kv.api_base, DEFAULT_KV_API_BASE);
+        let with_zone = |zone: &str| {
+            let mut vars = base.to_vec();
+            vars.push(("RELINK_KV_ZONE_ID", zone));
+            from(&vars)
+        };
+        let kv = with_zone(" zone-1 ").unwrap().kv.unwrap();
+        assert_eq!(kv.zone_id.as_deref(), Some("zone-1"));
+        assert!(format!("{kv:?}").contains("zone-1"));
+        assert!(!format!("{kv:?}").contains("token\""));
+        assert_eq!(with_zone("  ").unwrap().kv.unwrap().zone_id, None);
+        assert!(
+            with_zone("zone/../x")
+                .unwrap_err()
+                .contains("RELINK_KV_ZONE_ID")
         );
     }
 

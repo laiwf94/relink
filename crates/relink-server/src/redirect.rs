@@ -85,10 +85,9 @@ pub async fn handle(
             Outcome::NotFound,
         );
     }
-    let route = app.domains.route(
-        headers.get(header::HOST).map(HeaderValue::as_bytes),
-        &app.cfg.default_host,
-    );
+    let route = app
+        .domains
+        .route(request_host(app, headers, peer), &app.cfg.default_host);
     let key = match route {
         Route::Default => None,
         Route::Domain(id) => Some(link_key(Some(id), code)),
@@ -201,6 +200,25 @@ fn location(
         h.insert(header::SET_COOKIE, c);
     }
     resp
+}
+
+/// The header a trusted proxy names the visitor's host in. The edge Worker
+/// sends it, because a Worker cannot set `Host` on a fetch to the origin.
+pub const FORWARDED_HOST: &str = "x-forwarded-host";
+
+/// The host a redirect request is for: the first `x-forwarded-host` value
+/// when the peer is a trusted proxy and sent one, otherwise `Host`.
+pub fn request_host<'a>(app: &App, headers: &'a HeaderMap, peer: IpAddr) -> Option<&'a [u8]> {
+    let forwarded = headers
+        .get(FORWARDED_HOST)
+        .filter(|_| app.cfg.trusted_proxies.contains(peer))
+        .map(|v| {
+            let raw = v.as_bytes();
+            let first = raw.split(|&b| b == b',').next().unwrap_or(raw);
+            first.trim_ascii()
+        })
+        .filter(|h| !h.is_empty());
+    forwarded.or_else(|| headers.get(header::HOST).map(HeaderValue::as_bytes))
 }
 
 /// The client address: from the configured header when the peer is a

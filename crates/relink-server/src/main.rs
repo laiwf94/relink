@@ -77,6 +77,7 @@
 //! | `RELINK_EDGE_TOKEN` | unset | Shared secret (32+ characters) the edge worker uses for `POST /v1/edge/clicks`; unset disables the endpoint |
 //! | `RELINK_KV_ACCOUNT_ID`, `RELINK_KV_NAMESPACE_ID`, `RELINK_KV_API_TOKEN` | unset | Publish link records to Workers KV for the edge; all three or none |
 //! | `RELINK_KV_API_BASE` | `https://api.cloudflare.com/client/v4` | KV API endpoint; must be https |
+//! | `RELINK_KV_ZONE_ID` | unset | Cloudflare zone whose custom hostnames route custom domains to the Worker: each verified domain is registered there and removed when deleted (same API token, which then needs custom hostname edit rights) |
 //! | `RELINK_KV_POLL_MS` / `RELINK_KV_RECONCILE_S` | `1000` / `3600` | Outbox poll interval when no change notification arrives / full KV reconciliation interval |
 //! | `RELINK_OIDC_ISSUER`, `RELINK_OIDC_CLIENT_ID` | unset | Sign people in with this OpenID Connect provider; both or neither. The issuer must be https |
 //! | `RELINK_OIDC_CLIENT_SECRET` | unset | Client secret, sent with HTTP basic authentication; unset for a public client (PKCE only) |

@@ -480,8 +480,8 @@ the same code could send a visitor somewhere the domain's owner never
 chose. IP addresses and single-label hosts can never be one, so they are
 always the default domain.
 
-The edge serves the default domain only for now: links on custom domains
-are not published to KV, so the KV records keyed by code stay unambiguous.
+The edge serves custom domains too, keyed by host and code; see "Custom
+domains at the edge".
 
 ### Certificates
 
@@ -744,14 +744,70 @@ cannot set; the visitor's address from `CF-Connecting-IP`. Both are passed to
 the origin, which believes them because the edge is in its
 `RELINK_TRUSTED_PROXIES`.
 
+### Custom domains at the edge
+
+Both sides read the host the same way, with `relink_core::host`:
+`custom_host` drops the port and a final dot and returns `None`, meaning
+the default domain whatever domains exist, for a missing `Host`, an IP
+address, a single label, a malformed port or the default host itself
+(`RELINK_PUBLIC_BASE_URL`'s host at the origin, `DEFAULT_HOST` in the
+Worker). Anything else might be a verified domain, compared in lowercase.
+
+KV holds three kinds of record (`relink_core::wire`):
+
+| Key | Value | Written while |
+|---|---|---|
+| `link:<code>` | the link | the link exists on the default domain |
+| `link:<host>/<code>` | the link | the link exists on the verified domain `<host>` |
+| `host:<host>` | `{"id": <domain id>}` | `<host>` is a verified domain |
+
+Hostnames and codes never contain `/`, so no two records share a key, and
+only canonical keys parse (`KvKey::parse`): lowercase hostnames the
+`domains` table accepts and plausible codes.
+
+For a host that might be a custom domain the Worker reads
+`link:<host>/<code>` first. When it is missing, `host:<host>` decides: a
+verified domain without that code goes to the origin (KV may not have the
+link yet, and a custom domain must never fall back to the default domain's
+link of the same code), while a host that is not a domain is the default
+domain, read from `link:<code>`, exactly as the origin routes it. A failed
+read or a record that will not parse goes to the origin. So a link on a
+custom domain costs one KV read, the same as a default-domain link
+requested on `DEFAULT_HOST`; only default-domain links requested on other
+hostnames cost three. The record for the host is read only on a miss
+because a hit already proves the domain is verified: domain links are
+published only while their domain is.
+
+A Worker cannot set `Host` on a fetch, so when it forwards to the origin
+it names the visitor's host in `x-forwarded-host`. The origin routes by the
+first value of that header when the peer is in `RELINK_TRUSTED_PROXIES`,
+and by `Host` otherwise. A visitor gains nothing by sending it: `Host` is
+theirs to choose anyway.
+
+With `RELINK_KV_ZONE_ID` set, the sync also manages the zone's custom
+hostnames (Cloudflare for SaaS), which is what routes a domain's traffic to
+the Worker and gives it Cloudflare's certificate. Syncing `host:<host>` for
+a verified domain first makes sure the hostname is registered (looked up by
+name, created with HTTP validation if absent), then writes the record; for
+a domain that is gone it deletes the record, then removes the hostname. A
+failure at either step fails the whole entry, which is retried. The same
+API token is used, so it then needs custom hostname edit rights on that
+zone. Without a zone ID the operator routes custom domains to the Worker
+by other means, and the KV records work the same.
+
 ### Getting records into KV
 
 The origin publishes through a transactional outbox (Chris Richardson,
 ["Pattern: Transactional outbox"](https://microservices.io/patterns/data/transactional-outbox.html)).
-Every link change inserts the code into `kv_outbox` in the same transaction,
-so a committed change cannot be forgotten. A worker claims due entries with
-`FOR UPDATE SKIP LOCKED`, reads the current row, and PUTs its JSON to the
-Cloudflare KV REST API, or DELETEs the key if the link is gone. The entry is
+Every link change inserts the link's KV key into `kv_outbox` in the same
+transaction, and verifying or deleting a domain inserts its `host:` key, so a
+committed change cannot be forgotten. Migration 0013 turned the outbox from
+codes into whole KV keys (and prefixed the entries already queued), with a
+check that every entry is a `link:` or `host:` key. A worker claims due
+entries with `FOR UPDATE SKIP LOCKED`, reads the current state (the link by
+domain and code through the redirect role's lookup, or the verified domain
+by hostname), and PUTs its JSON to the Cloudflare KV REST API, or DELETEs
+the key if the record is gone. A key relink would never write is deleted. The entry is
 removed only after KV accepted the write and only if it was not re-queued in
 the meantime. A failed write pushes the entry's next attempt back
 exponentially, from 1 s up to 10 minutes. The worker wakes on the same change
@@ -759,9 +815,17 @@ notifications the caches use, and polls once a second as a fallback.
 
 An outbox only covers changes made through relink. Keys deleted by hand, or a
 namespace restored from an old copy, are caught by a reconciliation that runs
-at start and hourly: it lists every KV key and every link code and queues the
+at start and hourly: it lists every `link:` and `host:` key in KV, walks every
+published link (default domain and verified domains, 5,000 at a time in
+domain and code order) and every verified domain, and queues the
 differences. It compares key sets, not values; stale values are the outbox's
-job.
+job. With a zone configured it also lists the zone's custom hostnames and
+queues every verified domain missing there, so a hostname deleted in the
+dashboard comes back. It never removes a hostname on its own: the zone may
+hold names relink did not add. If the hostname list fails, the whole
+reconciliation fails and runs again on the next tick, rather than queueing
+every domain. Domains verified before migration 0013 are published by the
+first reconciliation after it.
 
 Disabled links are published with `enabled: false` rather than deleted, so
 the edge answers 404 itself instead of asking the origin every time. Publishing
@@ -932,6 +996,8 @@ and counts the clicks it could not write.
 | Instance crash | Up to one flush interval of clicks and one lease per limited link are lost; no limit is exceeded. |
 | KV API failing | Changes wait in the outbox and are retried with backoff; the edge serves the last records it has. |
 | KV missing a record | The edge forwards to the origin. |
+| KV missing a `host:` record | Until the outbox or reconciliation writes it, the edge serves that host's codes from the default domain where the domain's own link is not in KV either; links that are in KV are still served correctly. |
+| Custom hostname API failing | The domain's `host:` entry waits in the outbox; links already in KV keep being served. |
 | Worker isolate evicted | Up to 50 unsent edge clicks are lost. |
 | Verified domains not loaded | Possible only when Postgres went away between migrations and start; requests whose host could be a custom domain get 503 until the change listener connects and loads them. |
 | DNS resolver down | Verification answers 200 with the resolver error in `check_error`; verified domains are unaffected. |
@@ -964,6 +1030,7 @@ and counts the clicks it could not write.
 | Uncached key lookups | 5/s per address, 200/s overall |
 | API rate | 10/s, burst 20, per key and instance |
 | KV outbox retry | 1 s doubling to 10 min |
+| Custom hostnames listed per reconciliation | 1,000 pages of 50 |
 | Edge click batch | 50 clicks or 5 s |
 | Plan limits | 0 to 10¹⁵ links, domains and monthly clicks, or unlimited (the default plan) |
 | Custom domains | 1,000 per workspace whatever the plan; hostnames up to 253 characters |
@@ -979,6 +1046,7 @@ the admin listener cover redirect latency, redirects by outcome, cache results
 (`hit`, `negative_hit`, `stale`, `stale_on_error`, `miss`), coalesced and shed
 lookups, click queue depth, backlog, drops by reason, late visitor hashes,
 database errors by operation, lease grants, health probes, KV writes, deletes,
+custom hostnames added and removed,
 errors and reconciled drift, edge clicks, API requests and refusals, link creations refused per plan
 limit, certificates issued and failed orders, HTTP-01 answers served, TLS
 handshakes completed and failed, certificates loaded and those that could

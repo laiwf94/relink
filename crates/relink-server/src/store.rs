@@ -24,6 +24,7 @@ use crate::auth::{Role, Scopes};
 use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
+use relink_core::wire::{domain_kv_key, host_kv_key, kv_key};
 
 /// Columns read into a [`Link`], as a literal so queries stay `&'static str`.
 macro_rules! columns {
@@ -643,9 +644,8 @@ impl Db {
 
     /// Records that link `code` on `domain_id` changed, inside the caller's
     /// transaction: other instances are told to drop their cached copy, and,
-    /// when edge publishing is on, a default-domain code joins the KV
-    /// outbox. The edge serves only the default domain so far, so links on
-    /// custom domains are not published.
+    /// when edge publishing is on, the link's KV key joins the outbox
+    /// (`link:<code>`, or `link:<host>/<code>` on a custom domain).
     pub(crate) async fn changed(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -654,25 +654,44 @@ impl Db {
         code: &str,
     ) -> Result<(), sqlx::Error> {
         notify(tx, &format!("{id}:{}", link_key(domain_id, code))).await?;
-        if self.outbox && domain_id.is_none() {
-            enqueue(tx, code).await?;
+        if self.outbox {
+            let key = match domain_id {
+                None => kv_key(code),
+                Some(d) => {
+                    // The link's own workspace's domain, so visible to the
+                    // tenant role too; hostnames never change.
+                    let host: String =
+                        sqlx::query_scalar("SELECT hostname FROM domains WHERE id = $1")
+                            .bind(d)
+                            .fetch_one(&mut **tx)
+                            .await?;
+                    domain_kv_key(&host, code)
+                }
+            };
+            enqueue(tx, &key).await?;
         }
         Ok(())
     }
 
     /// Tells every instance, when `tx` commits, that the set of verified
-    /// domains changed.
+    /// domains changed because `hostname` was verified or deleted, and,
+    /// when edge publishing is on, queues the domain's KV record.
     pub(crate) async fn domains_changed(
         &self,
         tx: &mut Transaction<'_, Postgres>,
+        hostname: &str,
     ) -> Result<(), sqlx::Error> {
-        notify(tx, DOMAINS_CHANGED).await
+        notify(tx, DOMAINS_CHANGED).await?;
+        if self.outbox {
+            enqueue(tx, &host_kv_key(hostname)).await?;
+        }
+        Ok(())
     }
 
     /// Claims up to `limit` outbox entries that are due and pushes their next
     /// attempt back with exponential backoff (1 s doubling to 10 min), so a
     /// failed or crashed sync is retried later without coordination.
-    /// Returns `(code, enqueued_at)` pairs.
+    /// Returns `(KV key, enqueued_at)` pairs.
     pub async fn claim_outbox(&self, limit: i64) -> Result<Vec<(String, DateTime<Utc>)>, DbError> {
         let rows = self
             .timed(
@@ -681,30 +700,30 @@ impl Db {
                         SET attempts = o.attempts + 1,
                             next_attempt_at = now() + LEAST(interval '10 minutes',
                                 interval '1 second' * power(2, LEAST(o.attempts, 20)))
-                      WHERE o.code IN (SELECT code FROM kv_outbox WHERE next_attempt_at <= now()
-                                       ORDER BY next_attempt_at LIMIT $1 FOR UPDATE SKIP LOCKED)
-                  RETURNING o.code, o.enqueued_at",
+                      WHERE o.key IN (SELECT key FROM kv_outbox WHERE next_attempt_at <= now()
+                                      ORDER BY next_attempt_at LIMIT $1 FOR UPDATE SKIP LOCKED)
+                  RETURNING o.key, o.enqueued_at",
                 )
                 .bind(limit)
                 .fetch_all(&self.pool),
             )
             .await?;
         rows.iter()
-            .map(|r| Ok((r.try_get("code")?, r.try_get("enqueued_at")?)))
+            .map(|r| Ok((r.try_get("key")?, r.try_get("enqueued_at")?)))
             .collect::<Result<_, sqlx::Error>>()
             .map_err(DbError::from)
     }
 
-    /// Removes an outbox entry after a successful sync, unless the link
+    /// Removes an outbox entry after a successful sync, unless the record
     /// changed again meanwhile (then the newer entry stays).
     pub async fn finish_outbox(
         &self,
-        code: &str,
+        key: &str,
         enqueued_at: DateTime<Utc>,
     ) -> Result<(), DbError> {
         self.timed(
-            sqlx::query("DELETE FROM kv_outbox WHERE code = $1 AND enqueued_at = $2")
-                .bind(code)
+            sqlx::query("DELETE FROM kv_outbox WHERE key = $1 AND enqueued_at = $2")
+                .bind(key)
                 .bind(enqueued_at)
                 .execute(&self.pool),
         )
@@ -712,18 +731,18 @@ impl Db {
         .map(|_| ())
     }
 
-    /// Adds codes to the outbox outside any change (reconciliation).
-    pub async fn enqueue_outbox(&self, codes: &[String]) -> Result<(), DbError> {
-        if codes.is_empty() {
+    /// Adds KV keys to the outbox outside any change (reconciliation).
+    pub async fn enqueue_outbox(&self, keys: &[String]) -> Result<(), DbError> {
+        if keys.is_empty() {
             return Ok(());
         }
         self.timed(
             sqlx::query(
-                "INSERT INTO kv_outbox (code) SELECT * FROM UNNEST($1::text[])
-                 ON CONFLICT (code) DO UPDATE SET enqueued_at = clock_timestamp(), attempts = 0,
-                                                  next_attempt_at = now()",
+                "INSERT INTO kv_outbox (key) SELECT * FROM UNNEST($1::text[])
+                 ON CONFLICT (key) DO UPDATE SET enqueued_at = clock_timestamp(), attempts = 0,
+                                                 next_attempt_at = now()",
             )
-            .bind(codes)
+            .bind(keys)
             .execute(&self.pool),
         )
         .await
@@ -736,17 +755,57 @@ impl Db {
             .await
     }
 
-    /// Default-domain link codes after `after`, in code order, `limit` at a
-    /// time (reconciliation walks every link the edge serves this way).
-    pub async fn codes_after(&self, after: &str, limit: i64) -> Result<Vec<String>, DbError> {
+    /// The KV keys of the links the edge serves, `limit` links at a time in
+    /// (domain, code) order after `after` (start with `(0, "")`), and the
+    /// cursor for the next page, `None` after the last. Links on the
+    /// default domain and on verified custom domains are published; a page
+    /// may hold fewer keys than links when some are on unverified domains.
+    /// Reconciliation walks every published link this way.
+    pub async fn published_links_after(
+        &self,
+        after: &(i64, String),
+        limit: i64,
+    ) -> Result<(Vec<String>, Option<(i64, String)>), DbError> {
+        let rows = self
+            .timed(
+                sqlx::query(
+                    "SELECT COALESCE(l.domain_id, 0) AS d, l.code,
+                            CASE WHEN dm.verified_at IS NOT NULL THEN dm.hostname END AS host
+                       FROM links l LEFT JOIN domains dm ON dm.id = l.domain_id
+                      WHERE (COALESCE(l.domain_id, 0), l.code) > ($1, $2)
+                      ORDER BY COALESCE(l.domain_id, 0), l.code LIMIT $3",
+                )
+                .bind(after.0)
+                .bind(&after.1)
+                .bind(limit)
+                .fetch_all(&self.pool),
+            )
+            .await?;
+        let mut keys = Vec::with_capacity(rows.len());
+        let mut last = None;
+        for r in &rows {
+            let d: i64 = r.try_get("d")?;
+            let code: String = r.try_get("code")?;
+            let host: Option<String> = r.try_get("host")?;
+            match (d, host) {
+                (0, _) => keys.push(kv_key(&code)),
+                (_, Some(h)) => keys.push(domain_kv_key(&h, &code)),
+                (_, None) => {}
+            }
+            last = Some((d, code));
+        }
+        let next = last.filter(|_| rows.len() as i64 == limit);
+        Ok((keys, next))
+    }
+
+    /// The ID of the verified domain with this hostname, if any.
+    pub async fn verified_domain_id(&self, hostname: &str) -> Result<Option<i64>, DbError> {
         self.timed(
             sqlx::query_scalar(
-                "SELECT code FROM links WHERE COALESCE(domain_id, 0) = 0 AND code > $1
-                  ORDER BY code LIMIT $2",
+                "SELECT id FROM domains WHERE hostname = $1 AND verified_at IS NOT NULL",
             )
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&self.pool),
+            .bind(hostname)
+            .fetch_optional(&self.pool),
         )
         .await
     }
@@ -1446,13 +1505,13 @@ pub(crate) async fn personal_workspace(
     }
 }
 
-async fn enqueue(tx: &mut Transaction<'_, Postgres>, code: &str) -> Result<(), sqlx::Error> {
+async fn enqueue(tx: &mut Transaction<'_, Postgres>, key: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO kv_outbox (code) VALUES ($1)
-         ON CONFLICT (code) DO UPDATE SET enqueued_at = clock_timestamp(), attempts = 0,
-                                          next_attempt_at = now()",
+        "INSERT INTO kv_outbox (key) VALUES ($1)
+         ON CONFLICT (key) DO UPDATE SET enqueued_at = clock_timestamp(), attempts = 0,
+                                         next_attempt_at = now()",
     )
-    .bind(code)
+    .bind(key)
     .execute(&mut **tx)
     .await
     .map(|_| ())

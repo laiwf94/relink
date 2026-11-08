@@ -286,6 +286,8 @@ pub struct Metrics {
     pub kv_deletes: Counter,
     pub kv_errors: Counter,
     pub kv_reconciled: Counter,
+    pub edge_hostnames_added: Counter,
+    pub edge_hostnames_removed: Counter,
     pub edge_clicks: Counter,
     /// Certificates issued or renewed through ACME.
     pub certificates_issued: Counter,
@@ -334,6 +336,8 @@ impl Default for Metrics {
             kv_deletes: Counter::default(),
             kv_errors: Counter::default(),
             kv_reconciled: Counter::default(),
+            edge_hostnames_added: Counter::default(),
+            edge_hostnames_removed: Counter::default(),
             edge_clicks: Counter::default(),
             certificates_issued: Counter::default(),
             certificate_failures: Counter::default(),
@@ -458,15 +462,15 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 27] = [
+        let counters: [(&str, &str, u64); 29] = [
             (
                 "relink_kv_writes_total",
-                "Link records written to Workers KV.",
+                "Link and domain records written to Workers KV.",
                 self.kv_writes.get(),
             ),
             (
                 "relink_kv_deletes_total",
-                "Link records deleted from Workers KV.",
+                "Link and domain records deleted from Workers KV.",
                 self.kv_deletes.get(),
             ),
             (
@@ -476,8 +480,18 @@ impl Metrics {
             ),
             (
                 "relink_kv_reconciled_total",
-                "Links queued for KV sync because KV and the database disagreed.",
+                "KV records queued for sync because KV and the database disagreed.",
                 self.kv_reconciled.get(),
+            ),
+            (
+                "relink_edge_hostnames_added_total",
+                "Custom domains registered as custom hostnames of the edge zone.",
+                self.edge_hostnames_added.get(),
+            ),
+            (
+                "relink_edge_hostnames_removed_total",
+                "Custom hostnames removed from the edge zone after their domain went.",
+                self.edge_hostnames_removed.get(),
             ),
             (
                 "relink_edge_clicks_total",

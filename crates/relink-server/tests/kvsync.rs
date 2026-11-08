@@ -13,9 +13,10 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, put};
-use common::{Harness, admin_url, config, eventually};
+use common::{FakeDns, Harness, admin_url, config, eventually};
+use relink_core::wire::{EdgeDomain, domain_kv_key, host_kv_key};
 use relink_server::config::KvConfig;
-use relink_server::kvsync::{CloudflareKv, KvSync};
+use relink_server::kvsync::{CloudflareHostnames, CloudflareKv, KvSync};
 use relink_server::metrics::Metrics;
 use relink_server::model::Link;
 use reqwest::Method;
@@ -29,6 +30,10 @@ struct FakeKv {
     values: Mutex<BTreeMap<String, String>>,
     down: AtomicBool,
     unauthorized: AtomicUsize,
+    /// Custom hostnames of zone `zone1`, by ID.
+    hostnames: Mutex<BTreeMap<String, String>>,
+    next_hostname: AtomicUsize,
+    hostnames_down: AtomicBool,
 }
 
 type Shared = Arc<FakeKv>;
@@ -107,6 +112,102 @@ async fn list_keys(
     ))
 }
 
+fn zone_authorized(kv: &FakeKv, headers: &HeaderMap, zone: &str) -> Result<(), StatusCode> {
+    if kv.hostnames_down.load(Ordering::SeqCst) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    authorized(kv, headers, "acct1", "ns1")?;
+    if zone != "zone1" {
+        kv.unauthorized.fetch_add(1, Ordering::SeqCst);
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+/// Lists custom hostnames, filtered by a substring of `hostname` (looser
+/// than equality, as the client must expect), two per page.
+async fn list_hostnames(
+    State(kv): State<Shared>,
+    Path(zone): Path<String>,
+    Query(q): Query<BTreeMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
+    zone_authorized(&kv, &headers, &zone)?;
+    let per_page: usize = q.get("per_page").and_then(|p| p.parse().ok()).unwrap_or(50);
+    assert_eq!(per_page, 50, "the client asks for full pages");
+    let page: usize = q.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let all: Vec<(String, String)> = kv
+        .hostnames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, h)| q.get("hostname").is_none_or(|f| h.contains(f.as_str())))
+        .map(|(id, h)| (id.clone(), h.clone()))
+        .collect();
+    // Pages of two, so paging is exercised; the client must not stop at a
+    // short page count alone.
+    let pages = all.len().div_ceil(2).max(1);
+    let result: Vec<Value> = all
+        .iter()
+        .skip((page - 1) * 2)
+        .take(2)
+        .map(|(id, h)| json!({"id": id, "hostname": h, "ssl": {"status": "pending_validation"}}))
+        .collect();
+    let body = json!({"success": true, "result": result,
+                      "result_info": {"page": page, "per_page": 2, "total_pages": pages}});
+    Ok(axum::response::IntoResponse::into_response(
+        body.to_string(),
+    ))
+}
+
+async fn create_hostname(
+    State(kv): State<Shared>,
+    Path(zone): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<axum::response::Response, StatusCode> {
+    zone_authorized(&kv, &headers, &zone)?;
+    let body: Value = serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    assert_eq!(body["ssl"]["method"], "http");
+    let host = body["hostname"].as_str().unwrap().to_owned();
+    let mut all = kv.hostnames.lock().unwrap();
+    if all.values().any(|h| *h == host) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let id = format!("ch-{}", kv.next_hostname.fetch_add(1, Ordering::SeqCst));
+    all.insert(id.clone(), host.clone());
+    let body = json!({"success": true, "result": {"id": id, "hostname": host}});
+    Ok(axum::response::IntoResponse::into_response(
+        body.to_string(),
+    ))
+}
+
+async fn delete_hostname(
+    State(kv): State<Shared>,
+    Path((zone, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> StatusCode {
+    if let Err(s) = zone_authorized(&kv, &headers, &zone) {
+        return s;
+    }
+    match kv.hostnames.lock().unwrap().remove(&id) {
+        Some(_) => StatusCode::OK,
+        None => StatusCode::NOT_FOUND,
+    }
+}
+
+impl FakeKv {
+    fn hostnames(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.hostnames.lock().unwrap().values().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.values.lock().unwrap().keys().cloned().collect()
+    }
+}
+
 async fn fake_kv() -> (SocketAddr, Shared) {
     let kv: Shared = Arc::default();
     let app = Router::new()
@@ -117,6 +218,14 @@ async fn fake_kv() -> (SocketAddr, Shared) {
         .route(
             "/client/v4/accounts/{account}/storage/kv/namespaces/{ns}/keys",
             get(list_keys),
+        )
+        .route(
+            "/client/v4/zones/{zone}/custom_hostnames",
+            get(list_hostnames).post(create_hostname),
+        )
+        .route(
+            "/client/v4/zones/{zone}/custom_hostnames/{id}",
+            axum::routing::delete(delete_hostname),
         )
         .with_state(kv.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -299,4 +408,321 @@ async fn reconciliation_repairs_drift() {
     let raw: Value = serde_json::from_str(&kv.values.lock().unwrap()["link:keep-a"]).unwrap();
     assert_eq!(raw["code"], "keep-a");
     assert!(raw.get("owner").is_none(), "owners stay in the database");
+}
+
+const HOST: &str = "go.relink-docs.net";
+
+#[tokio::test]
+async fn custom_domains_are_published_with_their_hostnames() {
+    let Some(admin) = admin_url() else { return };
+    let (addr, kv) = fake_kv().await;
+    let dns = FakeDns::start().await;
+    let base = format!("http://{addr}/client/v4");
+    let dns_addr = dns.addr.to_string();
+    let mut h = Harness::start(
+        &admin,
+        &[
+            ("RELINK_KV_ACCOUNT_ID", "acct1"),
+            ("RELINK_KV_NAMESPACE_ID", "ns1"),
+            ("RELINK_KV_API_TOKEN", TOKEN),
+            ("RELINK_KV_API_BASE", &base),
+            ("RELINK_KV_ZONE_ID", "zone1"),
+            ("RELINK_KV_POLL_MS", "50"),
+            ("RELINK_DNS_SERVERS", &dns_addr),
+        ],
+    )
+    .await;
+    // A hostname the operator added by hand stays whatever relink does.
+    kv.hostnames
+        .lock()
+        .unwrap()
+        .insert("manual".into(), "www.relink-docs.net".into());
+
+    let (status, d) = h
+        .api(
+            Method::POST,
+            "/v1/domains",
+            &h.alice,
+            Some(json!({"hostname": HOST})),
+        )
+        .await;
+    assert_eq!(status, 201, "{d}");
+    let txt = d["verification"]["value"].as_str().unwrap().to_owned();
+    dns.set_txt(&format!("_relink-challenge.{HOST}"), &[&txt]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !kv.keys().iter().any(|k| k.contains(HOST)),
+        "nothing is published before the domain is verified"
+    );
+    let (_, d) = h
+        .api(
+            Method::POST,
+            &format!("/v1/domains/{HOST}/verify"),
+            &h.alice,
+            None,
+        )
+        .await;
+    assert_eq!(d["verified"], true, "{d}");
+    let domain_id = h.store.verified_domain_id(HOST).await.unwrap().unwrap();
+    let host_key = host_kv_key(HOST);
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            kv.values.lock().unwrap().contains_key(&host_key)
+        })
+        .await,
+        "verifying publishes the domain record"
+    );
+    let rec: EdgeDomain = serde_json::from_str(&kv.values.lock().unwrap()[&host_key]).unwrap();
+    assert_eq!(rec, EdgeDomain { id: domain_id });
+    assert_eq!(kv.hostnames(), [HOST, "www.relink-docs.net"]);
+
+    // The same code on both domains: two records, each under its own key.
+    h.create(json!({"url": "https://a.example.org/", "alias": "promo"}))
+        .await;
+    let (status, b) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(json!({"url": "https://b.example.org/", "alias": "promo", "domain": HOST})),
+        )
+        .await;
+    assert_eq!(status, 201, "{b}");
+    let link_key = domain_kv_key(HOST, "promo");
+    assert_eq!(link_key, "link:go.relink-docs.net/promo");
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            let v = kv.values.lock().unwrap();
+            v.contains_key(&link_key) && v.contains_key("link:promo")
+        })
+        .await
+    );
+    let on_domain: Link = serde_json::from_str(&kv.values.lock().unwrap()[&link_key]).unwrap();
+    assert_eq!(on_domain.destinations[0].url, "https://b.example.org/");
+    assert_eq!(
+        record(&kv, "promo").unwrap().destinations[0].url,
+        "https://a.example.org/"
+    );
+
+    // Changes to the domain's link reach its key only.
+    let (status, _) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/links/promo?domain={HOST}"),
+            &h.alice,
+            Some(json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            kv.values
+                .lock()
+                .unwrap()
+                .get(&link_key)
+                .is_some_and(|v| !serde_json::from_str::<Link>(v).unwrap().enabled)
+        })
+        .await
+    );
+    assert!(record(&kv, "promo").unwrap().enabled);
+
+    // Deleting the link and then the domain removes both records and the
+    // custom hostname, but not the operator's.
+    let (status, _) = h
+        .api(
+            Method::DELETE,
+            &format!("/v1/links/promo?domain={HOST}"),
+            &h.alice,
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    // Removal fails for a while; the entry is retried.
+    kv.hostnames_down.store(true, Ordering::SeqCst);
+    let (status, _) = h
+        .api(
+            Method::DELETE,
+            &format!("/v1/domains/{HOST}"),
+            &h.alice,
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            !kv.values.lock().unwrap().contains_key(&host_key)
+                && !kv.values.lock().unwrap().contains_key(&link_key)
+        })
+        .await
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        kv.hostnames(),
+        [HOST, "www.relink-docs.net"],
+        "the zone is down"
+    );
+    kv.hostnames_down.store(false, Ordering::SeqCst);
+    assert!(
+        eventually(Duration::from_secs(10), || async {
+            kv.hostnames() == ["www.relink-docs.net"]
+        })
+        .await,
+        "the retry removes the hostname"
+    );
+    assert_eq!(kv.keys(), ["link:promo"]);
+    assert_eq!(kv.unauthorized.load(Ordering::SeqCst), 0);
+    let m = h.metrics().await;
+    assert!(m.contains("relink_edge_hostnames_added_total 1"), "{m}");
+    assert!(m.contains("relink_edge_hostnames_removed_total 1"), "{m}");
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconciliation_repairs_domain_drift() {
+    let Some(admin) = admin_url() else { return };
+    let (addr, kv) = fake_kv().await;
+    let db = common::TestDb::create(&admin).await;
+    let cfg = config(
+        &db.url,
+        &[
+            ("RELINK_KV_ACCOUNT_ID", "acct1"),
+            ("RELINK_KV_NAMESPACE_ID", "ns1"),
+            ("RELINK_KV_API_TOKEN", TOKEN),
+            ("RELINK_KV_API_BASE", &format!("http://{addr}/client/v4")),
+            ("RELINK_KV_ZONE_ID", "zone1"),
+        ],
+    );
+    let store = relink_server::server::open_db(&cfg).unwrap();
+    relink_server::server::migrate_with_retry(&store, Duration::from_secs(10))
+        .await
+        .unwrap();
+    // Two verified domains and one that is not, straight in the database.
+    let ws = store.personal_workspace("alice").await.unwrap();
+    let mut ids = Vec::new();
+    for (host, verified) in [
+        ("a.relink-docs.net", true),
+        ("b.relink-docs.net", true),
+        ("c.relink-docs.net", false),
+    ] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO domains (workspace_id, hostname, verification_token, created_by, verified_at)
+             VALUES ($1, $2, repeat('ab', 16), 'alice', CASE WHEN $3 THEN now() END) RETURNING id",
+        )
+        .bind(ws)
+        .bind(host)
+        .bind(verified)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    // Links on each, and on the default domain; the unverified domain's
+    // link (only possible by hand) is never published.
+    for (i, domain) in [None, Some(ids[0]), Some(ids[0]), Some(ids[1]), Some(ids[2])]
+        .into_iter()
+        .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO links (code, owner, workspace_id, domain_id, destinations)
+             VALUES ($1, 'alice', $2, $3, '[{\"url\":\"https://example.com/\",\"weight\":1}]')",
+        )
+        .bind(if i == 2 { "other" } else { "promo" })
+        .bind(ws)
+        .bind(domain)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    let kv_cfg: KvConfig = cfg.kv.clone().unwrap();
+    let metrics = Arc::new(Metrics::default());
+    let sync = KvSync::new(
+        store.clone(),
+        Arc::new(CloudflareKv::new(&kv_cfg).unwrap()),
+        metrics.clone(),
+        Duration::from_millis(50),
+        Duration::from_secs(60),
+        Arc::new(Notify::new()),
+    )
+    .with_hostnames(Arc::new(
+        CloudflareHostnames::new(&kv_cfg).unwrap().unwrap(),
+    ));
+    // Nothing was queued (the rows went in by hand): reconciliation finds
+    // all of it.
+    assert_eq!(sync.reconcile_once().await.unwrap(), 6);
+    assert_eq!(sync.round().await, 6);
+    let all = [
+        "host:a.relink-docs.net",
+        "host:b.relink-docs.net",
+        "link:a.relink-docs.net/other",
+        "link:a.relink-docs.net/promo",
+        "link:b.relink-docs.net/promo",
+        "link:promo",
+    ];
+    assert_eq!(kv.keys(), all);
+    assert_eq!(kv.hostnames(), ["a.relink-docs.net", "b.relink-docs.net"]);
+    assert_eq!(sync.reconcile_once().await.unwrap(), 0);
+
+    // Drift: a domain record and a link deleted by hand, stray keys left
+    // behind (one not even a key relink writes), a custom hostname removed
+    // in the dashboard.
+    {
+        let mut v = kv.values.lock().unwrap();
+        v.remove("host:b.relink-docs.net");
+        v.remove("link:a.relink-docs.net/other");
+        v.insert("link:c.relink-docs.net/promo".into(), "{}".into());
+        v.insert("host:gone.relink-docs.net".into(), "{}".into());
+        v.insert("link:Bad/Key".into(), "{}".into());
+    }
+    kv.hostnames
+        .lock()
+        .unwrap()
+        .retain(|_, h| h != "a.relink-docs.net");
+    assert_eq!(sync.reconcile_once().await.unwrap(), 6);
+    assert_eq!(sync.round().await, 6);
+    assert_eq!(kv.keys(), all);
+    assert_eq!(kv.hostnames(), ["a.relink-docs.net", "b.relink-docs.net"]);
+    assert_eq!(sync.reconcile_once().await.unwrap(), 0);
+
+    // More hostnames than one page: listing pages through all of them.
+    for i in 0..5 {
+        kv.hostnames
+            .lock()
+            .unwrap()
+            .insert(format!("x{i}"), format!("x{i}.example.net"));
+    }
+    assert_eq!(sync.reconcile_once().await.unwrap(), 0);
+
+    // When the hostname API is down, reconciliation fails (and is retried
+    // on the next tick) rather than queueing every domain.
+    kv.hostnames_down.store(true, Ordering::SeqCst);
+    assert!(sync.reconcile_once().await.is_err());
+    assert_eq!(metrics.kv_reconciled.get(), 12);
+    assert_eq!(metrics.edge_hostnames_added.get(), 3);
+    assert_eq!(metrics.edge_hostnames_removed.get(), 0);
+}
+
+#[tokio::test]
+async fn outbox_entries_queued_before_the_migration_keep_working() {
+    let Some(admin) = admin_url() else { return };
+    let db = common::TestDb::create(&admin).await;
+    let store = common::open_store(&db.url).await;
+    // The outbox is keyed by whole KV keys now, and only those.
+    let err = sqlx::query("INSERT INTO kv_outbox (key) VALUES ('promo')")
+        .execute(store.pool())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("kv_outbox_key_shape"), "{err}");
+    store
+        .enqueue_outbox(&["link:promo".into(), "host:go.example.com".into()])
+        .await
+        .unwrap();
+    let mut due: Vec<String> = store
+        .claim_outbox(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    due.sort();
+    assert_eq!(due, ["host:go.example.com", "link:promo"]);
 }

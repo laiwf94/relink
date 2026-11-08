@@ -5,6 +5,14 @@
 //! no click limit. Everything else goes to the origin unchanged: unknown
 //! codes (KV may simply not have caught up), KV errors, and max-click links,
 //! whose limit only the origin's lease counter can enforce.
+//!
+//! Custom domains: a request whose `Host` could be a custom domain (see
+//! `relink_core::host::custom_host`) looks for `link:<host>/<code>` first.
+//! If that is missing, `host:<host>` says whether the host is a verified
+//! domain: if it is, the code is unknown on that domain and the origin
+//! answers; if it is not, the request is for the default domain, exactly as
+//! the origin routes it. So a link on a custom domain costs one KV read, as
+//! does a default-domain link requested on `default_host`.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -12,10 +20,11 @@ use std::net::IpAddr;
 use relink_core::classify::{UNKNOWN_COUNTRY, device_class, referrer_host};
 use relink_core::code::is_plausible_code;
 use relink_core::hex;
+use relink_core::host::custom_host;
 use relink_core::model::Link;
 use relink_core::rules::{Decision, Settings, Visit, evaluate};
 use relink_core::visitor::fingerprint;
-use relink_core::wire::{ClickBatch, WireClick, kv_key};
+use relink_core::wire::{ClickBatch, WireClick, domain_kv_key, host_kv_key, kv_key};
 
 /// A KV read failed or the origin could not be reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +46,9 @@ pub trait Origin {
 pub struct EdgeRequest {
     /// The path without the leading slash.
     pub code: String,
+    /// The `Host` the request was sent to, as received (port included). The
+    /// origin is told it in `x-forwarded-host`.
+    pub host: Option<Vec<u8>>,
     pub cookies: Vec<Vec<u8>>,
     /// Set by the CDN, so trusted.
     pub country: Option<[u8; 2]>,
@@ -94,22 +106,41 @@ pub struct Outcome {
 /// to a minute to arrive anyway, and caching longer would add to that.
 pub const EDGE_MAX_AGE: &str = "public, max-age=30";
 
+/// Answers `req`. `default_host` is the origin's own host (the one in
+/// `RELINK_PUBLIC_BASE_URL`): requests for it are on the default domain
+/// without asking KV about the host.
 pub async fn handle<K: Kv, O: Origin>(
     kv: &K,
     origin: &O,
     settings: &Settings<'_>,
+    default_host: &str,
     req: &EdgeRequest,
 ) -> Outcome {
     if !is_plausible_code(&req.code) {
         return edge(EdgeResponse::text(404, "not found\n"), None);
     }
-    let link = match kv.get(&kv_key(&req.code)).await {
-        Ok(Some(json)) => serde_json::from_str::<Link>(&json).ok(),
-        Ok(None) | Err(_) => None,
+    let link = match custom_host(req.host.as_deref(), default_host) {
+        None => read(kv, &kv_key(&req.code)).await,
+        Some(host) => {
+            let host = host.to_ascii_lowercase();
+            match read(kv, &domain_kv_key(&host, &req.code)).await {
+                Read::Missing => match kv.get(&host_kv_key(&host)).await {
+                    // Not a custom domain: the default domain's link.
+                    Ok(None) => read(kv, &kv_key(&req.code)).await,
+                    // A verified domain without this code in KV (or KV
+                    // failed): only the origin knows.
+                    Ok(Some(_)) | Err(_) => Read::Failed,
+                },
+                other => other,
+            }
+        }
     };
-    let Some(link) = link.filter(|l| l.max_clicks.is_none()) else {
+    let Read::Found(link) = link else {
         return from_origin(origin, req).await;
     };
+    if link.max_clicks.is_some() {
+        return from_origin(origin, req).await;
+    }
     let cookies: Vec<&[u8]> = req.cookies.iter().map(Vec::as_slice).collect();
     let visit = Visit {
         now_ms: req.now_ms,
@@ -135,6 +166,25 @@ pub async fn handle<K: Kv, O: Origin>(
             let response = redirect(r.status, r.location, cache, r.set_cookie);
             edge(response, Some(click_for(&link, req)))
         }
+    }
+}
+
+/// A link record read from KV.
+enum Read {
+    Found(Box<Link>),
+    Missing,
+    /// The read failed or the record would not parse.
+    Failed,
+}
+
+async fn read<K: Kv>(kv: &K, key: &str) -> Read {
+    match kv.get(key).await {
+        Ok(Some(json)) => match serde_json::from_str::<Link>(&json) {
+            Ok(link) => Read::Found(Box::new(link)),
+            Err(_) => Read::Failed,
+        },
+        Ok(None) => Read::Missing,
+        Err(_) => Read::Failed,
     }
 }
 
@@ -298,11 +348,14 @@ pub mod testing {
     pub struct FakeOrigin {
         pub calls: Cell<usize>,
         pub down: Cell<bool>,
+        /// The `host` of every request forwarded.
+        pub hosts: RefCell<Vec<Option<Vec<u8>>>>,
     }
 
     impl Origin for FakeOrigin {
         async fn redirect(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
             self.calls.set(self.calls.get() + 1);
+            self.hosts.borrow_mut().push(req.host.clone());
             if self.down.get() {
                 return Err(EdgeError("origin down".into()));
             }
@@ -328,6 +381,8 @@ mod tests {
         signer: &SIGNER,
         cookie_secure: true,
     };
+    const DEFAULT: &str = "s.relink.example";
+    const HOST: &str = "go.example.com";
 
     fn link(code: &str) -> Link {
         Link {
@@ -372,7 +427,7 @@ mod tests {
     fn served_from_kv_with_a_click() {
         let kv = MemoryKv::with(&link("promo"));
         let origin = FakeOrigin::default();
-        let out = run(handle(&kv, &origin, &SETTINGS, &req("promo")));
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req("promo")));
         assert_eq!(out.served, Served::Edge);
         assert_eq!(out.response.status, 301);
         assert_eq!(
@@ -395,7 +450,7 @@ mod tests {
     fn misses_errors_and_limited_links_go_to_the_origin() {
         let origin = FakeOrigin::default();
         let empty = MemoryKv::default();
-        let out = run(handle(&empty, &origin, &SETTINGS, &req("unknown")));
+        let out = run(handle(&empty, &origin, &SETTINGS, DEFAULT, &req("unknown")));
         assert_eq!(out.served, Served::Origin);
         assert_eq!(
             out.response.header("location"),
@@ -406,7 +461,7 @@ mod tests {
         let failing = MemoryKv::with(&link("promo"));
         failing.fail.set(true);
         assert_eq!(
-            run(handle(&failing, &origin, &SETTINGS, &req("promo"))).served,
+            run(handle(&failing, &origin, &SETTINGS, DEFAULT, &req("promo"))).served,
             Served::Origin
         );
 
@@ -414,7 +469,7 @@ mod tests {
         limited.max_clicks = Some(10);
         let kv = MemoryKv::with(&limited);
         assert_eq!(
-            run(handle(&kv, &origin, &SETTINGS, &req("limited"))).served,
+            run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req("limited"))).served,
             Served::Origin
         );
 
@@ -424,13 +479,13 @@ mod tests {
             .borrow_mut()
             .insert(kv_key("junk"), "{not json".into());
         assert_eq!(
-            run(handle(&garbage, &origin, &SETTINGS, &req("junk"))).served,
+            run(handle(&garbage, &origin, &SETTINGS, DEFAULT, &req("junk"))).served,
             Served::Origin
         );
         assert_eq!(origin.calls.get(), 4);
 
         origin.down.set(true);
-        let out = run(handle(&empty, &origin, &SETTINGS, &req("unknown")));
+        let out = run(handle(&empty, &origin, &SETTINGS, DEFAULT, &req("unknown")));
         assert_eq!(out.response.status, 502);
     }
 
@@ -443,6 +498,7 @@ mod tests {
             &MemoryKv::with(&l),
             &origin,
             &SETTINGS,
+            DEFAULT,
             &req("rules"),
         ));
         assert_eq!((out.response.status, out.served), (404, Served::Edge));
@@ -454,6 +510,7 @@ mod tests {
             &MemoryKv::with(&l),
             &origin,
             &SETTINGS,
+            DEFAULT,
             &req("rules"),
         ));
         assert_eq!(out.response.status, 410);
@@ -467,6 +524,7 @@ mod tests {
             &MemoryKv::with(&l),
             &origin,
             &SETTINGS,
+            DEFAULT,
             &req("rules"),
         ));
         assert_eq!(out.response.status, 451);
@@ -475,6 +533,7 @@ mod tests {
             &MemoryKv::with(&l),
             &origin,
             &SETTINGS,
+            DEFAULT,
             &req("rules"),
         ));
         assert_eq!(
@@ -488,6 +547,7 @@ mod tests {
             &MemoryKv::default(),
             &origin,
             &SETTINGS,
+            DEFAULT,
             &req("a/b"),
         ));
         assert_eq!((bad.response.status, bad.served), (404, Served::Edge));
@@ -512,6 +572,7 @@ mod tests {
             &kv,
             &origin,
             &SETTINGS,
+            DEFAULT,
             &EdgeRequest {
                 random: u64::MAX,
                 ..req("split")
@@ -527,6 +588,7 @@ mod tests {
             &kv,
             &origin,
             &SETTINGS,
+            DEFAULT,
             &EdgeRequest {
                 cookies: vec![pair],
                 random: 0,
@@ -548,9 +610,15 @@ mod tests {
             now_ms: 1,
             ..EdgeRequest::default()
         };
-        let click = run(handle(&kv, &FakeOrigin::default(), &SETTINGS, &bare))
-            .click
-            .unwrap();
+        let click = run(handle(
+            &kv,
+            &FakeOrigin::default(),
+            &SETTINGS,
+            DEFAULT,
+            &bare,
+        ))
+        .click
+        .unwrap();
         assert_eq!(
             (click.country.as_str(), click.device.as_str()),
             ("XX", "other")
@@ -564,6 +632,7 @@ mod tests {
             &MemoryKv::with(&link("promo")),
             &FakeOrigin::default(),
             &SETTINGS,
+            DEFAULT,
             &req("promo"),
         ))
         .click
@@ -580,5 +649,192 @@ mod tests {
         assert_eq!(b.take(), None);
         assert_eq!(b.push(click), Push::Schedule);
         assert_eq!(b.take().unwrap().clicks.len(), 1);
+    }
+
+    fn on(host: &str, code: &str) -> EdgeRequest {
+        EdgeRequest {
+            host: Some(host.as_bytes().to_vec()),
+            ..req(code)
+        }
+    }
+
+    fn put(kv: &MemoryKv, key: String, link: &Link) {
+        kv.values
+            .borrow_mut()
+            .insert(key, serde_json::to_string(link).unwrap());
+    }
+
+    fn mark_domain(kv: &MemoryKv, host: &str) {
+        kv.values.borrow_mut().insert(
+            host_kv_key(host),
+            serde_json::to_string(&relink_core::wire::EdgeDomain { id: 3 }).unwrap(),
+        );
+    }
+
+    /// A KV that counts reads, to hold the edge to its read budget.
+    #[derive(Default)]
+    struct CountingKv {
+        inner: MemoryKv,
+        reads: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Kv for CountingKv {
+        async fn get(&self, key: &str) -> Result<Option<String>, EdgeError> {
+            self.reads.borrow_mut().push(key.to_owned());
+            self.inner.get(key).await
+        }
+    }
+
+    #[test]
+    fn custom_domains_serve_their_own_codes_at_the_edge() {
+        let kv = CountingKv::default();
+        let mut default = link("promo");
+        default.destinations[0].url = "https://default.example.org/".into();
+        put(&kv.inner, kv_key("promo"), &default);
+        let mut on_domain = link("promo");
+        on_domain.id = 12;
+        on_domain.destinations[0].url = "https://domain.example.org/".into();
+        put(&kv.inner, domain_kv_key(HOST, "promo"), &on_domain);
+        mark_domain(&kv.inner, HOST);
+        let origin = FakeOrigin::default();
+
+        // The same code on the custom domain and on the default one, each
+        // in one read; case, port and a final dot do not matter.
+        for host in ["go.example.com", "Go.Example.COM:443", "go.example.com."] {
+            kv.reads.borrow_mut().clear();
+            let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(host, "promo")));
+            assert_eq!(out.served, Served::Edge, "{host}");
+            assert_eq!(
+                out.response.header("location"),
+                Some("https://domain.example.org/")
+            );
+            assert_eq!(out.click.unwrap().link_id, 12);
+            assert_eq!(*kv.reads.borrow(), ["link:go.example.com/promo"]);
+        }
+        for host in [
+            None,
+            Some("S.Relink.Example:8443"),
+            Some("203.0.113.9"),
+            Some("localhost"),
+        ] {
+            kv.reads.borrow_mut().clear();
+            let r = EdgeRequest {
+                host: host.map(|h| h.as_bytes().to_vec()),
+                ..req("promo")
+            };
+            let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &r));
+            assert_eq!(
+                out.response.header("location"),
+                Some("https://default.example.org/"),
+                "{host:?}"
+            );
+            assert_eq!(*kv.reads.borrow(), ["link:promo"], "{host:?}");
+        }
+        assert_eq!(origin.calls.get(), 0);
+    }
+
+    #[test]
+    fn unknown_hosts_fall_back_to_the_default_domain() {
+        let kv = CountingKv::default();
+        put(&kv.inner, kv_key("promo"), &link("promo"));
+        let origin = FakeOrigin::default();
+        // Not a verified domain: the origin would route it to the default
+        // domain, and so does the edge.
+        let out = run(handle(
+            &kv,
+            &origin,
+            &SETTINGS,
+            DEFAULT,
+            &on("other.example.net", "promo"),
+        ));
+        assert_eq!(out.served, Served::Edge);
+        assert_eq!(out.response.status, 301);
+        assert_eq!(
+            *kv.reads.borrow(),
+            [
+                "link:other.example.net/promo",
+                "host:other.example.net",
+                "link:promo"
+            ]
+        );
+        // Without a default host configured every hostname is asked about.
+        kv.reads.borrow_mut().clear();
+        let out = run(handle(&kv, &origin, &SETTINGS, "", &on(DEFAULT, "promo")));
+        assert_eq!(out.served, Served::Edge);
+        assert_eq!(kv.reads.borrow().len(), 3);
+        assert_eq!(origin.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_verified_domain_never_serves_default_domain_codes() {
+        let kv = MemoryKv::with(&link("promo"));
+        mark_domain(&kv, HOST);
+        let origin = FakeOrigin::default();
+        // The code exists only on the default domain. On the custom domain
+        // the edge must not guess: the origin answers (404, or the link if
+        // KV has not caught up).
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "promo")));
+        assert_eq!(out.served, Served::Origin);
+        assert!(out.click.is_none());
+        assert_eq!(origin.calls.get(), 1);
+        assert_eq!(
+            origin.hosts.borrow().as_slice(),
+            [Some(HOST.as_bytes().to_vec())]
+        );
+
+        // A host record that will not parse still marks a domain.
+        kv.values
+            .borrow_mut()
+            .insert(host_kv_key("x.example.org"), "{bad".into());
+        let out = run(handle(
+            &kv,
+            &origin,
+            &SETTINGS,
+            DEFAULT,
+            &on("x.example.org", "promo"),
+        ));
+        assert_eq!(out.served, Served::Origin);
+    }
+
+    #[test]
+    fn domain_links_follow_the_same_rules_and_failures() {
+        let origin = FakeOrigin::default();
+        // A limited link on a domain goes to the origin.
+        let kv = MemoryKv::default();
+        let mut limited = link("limited");
+        limited.max_clicks = Some(5);
+        put(&kv, domain_kv_key(HOST, "limited"), &limited);
+        let out = run(handle(
+            &kv,
+            &origin,
+            &SETTINGS,
+            DEFAULT,
+            &on(HOST, "limited"),
+        ));
+        assert_eq!(out.served, Served::Origin);
+        // A record that will not parse goes to the origin, without
+        // falling back to the default domain.
+        kv.values
+            .borrow_mut()
+            .insert(domain_kv_key(HOST, "junk"), "{".into());
+        put(&kv, kv_key("junk"), &link("junk"));
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "junk")));
+        assert_eq!(out.served, Served::Origin);
+        // KV down: the origin decides.
+        kv.fail.set(true);
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "promo")));
+        assert_eq!(out.served, Served::Origin);
+        assert_eq!(origin.calls.get(), 3);
+        // A disabled link on a domain is a 404 at the edge.
+        kv.fail.set(false);
+        let mut off = link("off");
+        off.enabled = false;
+        put(&kv, domain_kv_key(HOST, "off"), &off);
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "off")));
+        assert_eq!((out.response.status, out.served), (404, Served::Edge));
+        // Garbage paths never cost a read, whatever the host.
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "a.php")));
+        assert_eq!((out.response.status, out.served), (404, Served::Edge));
+        assert_eq!(origin.calls.get(), 3);
     }
 }

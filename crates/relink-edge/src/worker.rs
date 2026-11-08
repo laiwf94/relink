@@ -76,6 +76,14 @@ impl Origin for WorkerOrigin {
                 .set("x-forwarded-for", &ip.to_string())
                 .map_err(err)?;
         }
+        // Workers cannot set `Host` on a fetch, so the custom domain the
+        // visitor asked for travels in `x-forwarded-host`, which the origin
+        // believes from its trusted proxies only.
+        if let Some(h) = &req.host {
+            headers
+                .set("x-forwarded-host", &String::from_utf8_lossy(h))
+                .map_err(err)?;
+        }
         if let Some(c) = req.country {
             headers
                 .set("cf-ipcountry", &String::from_utf8_lossy(&c))
@@ -164,9 +172,20 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .to_string()
         .trim_end_matches('/')
         .to_owned();
+    // The origin's own host: requests for it skip the custom-domain lookup.
+    let default_host = env
+        .var("DEFAULT_HOST")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let url = req.url()?;
+    let host = url.host_str().map(|h| match url.port() {
+        Some(p) => format!("{h}:{p}").into_bytes(),
+        None => h.as_bytes().to_vec(),
+    });
     let headers = req.headers();
     let edge_req = EdgeRequest {
         code: code.to_owned(),
+        host,
         cookies: headers
             .get("cookie")?
             .map(String::into_bytes)
@@ -188,7 +207,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let origin = WorkerOrigin {
         base: origin_url.clone(),
     };
-    let out = logic::handle(&kv, &origin, &settings, &edge_req).await;
+    let out = logic::handle(&kv, &origin, &settings, default_host.trim(), &edge_req).await;
 
     if let Some(click) = out.click {
         let token = env.secret("EDGE_TOKEN")?.to_string();
