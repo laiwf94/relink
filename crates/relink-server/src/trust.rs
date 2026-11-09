@@ -101,21 +101,27 @@ impl TrustedProxies {
 
     /// The client address for a request from `peer` carrying `forwarded` (a
     /// comma-separated list, oldest hop first). Falls back to `peer` when the
-    /// peer is not trusted or the header has nothing usable.
+    /// peer is not trusted or the header cannot be read up to the first hop
+    /// that is not a trusted proxy.
     pub fn client_ip(&self, peer: IpAddr, forwarded: Option<&str>) -> IpAddr {
         let Some(list) = forwarded.filter(|_| self.contains(peer)) else {
             return peer;
         };
-        let hops: Vec<IpAddr> = list
-            .split(',')
-            .filter_map(|h| h.trim().parse::<IpAddr>().ok())
-            .collect();
-        hops.iter()
-            .rev()
-            .find(|ip| !self.contains(**ip))
-            .or(hops.first())
-            .copied()
-            .unwrap_or(peer)
+        // Scan from the right, where the trusted proxy wrote. An entry that
+        // is not an address (a port suffix, a token such as "unknown") cannot
+        // be shown to be a proxy of ours, and everything left of it was
+        // written by the client, so stop and use the peer.
+        let mut oldest = peer;
+        for hop in list.rsplit(',') {
+            let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+                return peer;
+            };
+            if !self.contains(ip) {
+                return ip;
+            }
+            oldest = ip;
+        }
+        oldest
     }
 }
 
@@ -212,6 +218,23 @@ mod tests {
         // Garbage or absent header: the socket peer.
         assert_eq!(t.client_ip(proxy, Some("nonsense")), proxy);
         assert_eq!(t.client_ip(proxy, None), proxy);
+        assert_eq!(t.client_ip(proxy, Some("")), proxy);
+        // An entry the proxy wrote that does not parse (a port suffix) must
+        // not let the client-chosen entry to its left through.
+        assert_eq!(
+            t.client_ip(proxy, Some("1.2.3.4, 203.0.113.9:51234")),
+            proxy
+        );
+        assert_eq!(
+            t.client_ip(proxy, Some("1.2.3.4, unknown, 10.2.2.2")),
+            proxy
+        );
+        assert_eq!(t.client_ip(proxy, Some("1.2.3.4, ")), proxy);
+        // Unreadable entries to the left of an untrusted hop are never reached.
+        assert_eq!(
+            t.client_ip(proxy, Some("garbage, 198.51.100.7")),
+            ip("198.51.100.7")
+        );
         // An untrusted peer's header is ignored entirely.
         let stranger = ip("198.51.100.99");
         assert_eq!(t.client_ip(stranger, Some("1.2.3.4")), stranger);
