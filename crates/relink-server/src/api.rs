@@ -1095,6 +1095,8 @@ pub async fn openapi() -> Response {
 
 /// Every route on the public listener, as (method, OpenAPI path). The
 /// OpenAPI test checks this list against the document and the router.
+/// `/` and `/{prefix}/{code}` are redirects on custom domains only and are
+/// described under `/{code}`.
 pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/{code}"),
     ("get", "/healthz"),
@@ -1111,6 +1113,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("post", "/v1/domains"),
     ("get", "/v1/domains"),
     ("get", "/v1/domains/{hostname}"),
+    ("patch", "/v1/domains/{hostname}"),
     ("delete", "/v1/domains/{hostname}"),
     ("post", "/v1/domains/{hostname}/verify"),
     ("get", "/v1/auth/login"),

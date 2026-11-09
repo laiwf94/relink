@@ -14,7 +14,7 @@
         "summary": "Follow a short link",
         "operationId": "redirect",
         "security": [],
-        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's.",
+        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's. A custom domain's settings also apply: / redirects to its root_url, /{prefix}/{code} serves a code behind one of its prefixes, codes ignore case when case_insensitive is set, and its not_found_page and gone_page replace the plain-text 404 and 410 (as text/html, under a Content-Security-Policy that allows no scripts). On the default domain / and two-segment paths are unknown paths.",
         "parameters": [{ "$ref": "#/components/parameters/Code" }],
         "responses": {
           "301": { "$ref": "#/components/responses/Redirect" },
@@ -220,6 +220,24 @@
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Change a custom domain's settings",
+        "operationId": "updateDomain",
+        "description": "Needs the admin or owner role. Absent fields keep their value; null (an empty list for prefixes, false for case_insensitive) returns one to the default. Turning case_insensitive on while a code on the domain has uppercase letters is refused with failed_precondition (409). Changes reach every instance and the edge like any domain change.",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchDomain" } } } },
+        "responses": {
+          "200": { "description": "The domain with its new settings.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Domain" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
         }
@@ -761,7 +779,7 @@
       },
       "Domain": {
         "type": "object",
-        "required": ["hostname", "verified", "verified_at", "verification", "checked_at", "check_error", "certificate", "created_by", "created_at"],
+        "required": ["hostname", "verified", "verified_at", "verification", "checked_at", "check_error", "certificate", "settings", "created_by", "created_at"],
         "properties": {
           "hostname": { "type": "string" },
           "verified": { "type": "boolean" },
@@ -787,8 +805,31 @@
               "next_attempt_at": { "type": ["string", "null"], "format": "date-time", "description": "After a failure, when the next attempt is due." }
             }
           },
+          "settings": {
+            "type": "object",
+            "required": ["root_url", "not_found_page", "gone_page", "prefixes", "case_insensitive"],
+            "description": "What the domain does besides serving its links; every field is shown, null or empty when unset.",
+            "properties": {
+              "root_url": { "type": ["string", "null"] },
+              "not_found_page": { "type": ["string", "null"] },
+              "gone_page": { "type": ["string", "null"] },
+              "prefixes": { "type": "array", "items": { "type": "string" } },
+              "case_insensitive": { "type": "boolean" }
+            }
+          },
           "created_by": { "type": "string" },
           "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PatchDomain": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "root_url": { "type": ["string", "null"], "maxLength": 2048, "description": "Where / redirects (302). Follows the rules destinations do." },
+          "not_found_page": { "type": ["string", "null"], "maxLength": 16384, "description": "HTML for 404: unknown codes, disabled links and paths that are not a code here. {{code}} and {{host}} are replaced, HTML-escaped." },
+          "gone_page": { "type": ["string", "null"], "maxLength": 16384, "description": "HTML for 410: expired links and links at their click limit. Same placeholders." },
+          "prefixes": { "type": "array", "maxItems": 8, "items": { "type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9_-]{0,30}[A-Za-z0-9])?$" }, "description": "Path segments accepted in front of a code, so /campaign/abc is the link abc. Stored lowercase; reserved words are refused." },
+          "case_insensitive": { "type": "boolean", "description": "Whether /ABC and /abc are the same link. Links created on the domain then get lowercase codes." }
         }
       },
       "DomainList": {

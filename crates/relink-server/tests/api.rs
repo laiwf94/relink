@@ -680,6 +680,8 @@ async fn openapi_matches_the_router_and_responses() {
                 r#"{"clicks":[]}"#
             } else if path == "/v1/domains" {
                 r#"{"hostname":"other.relink-docs.net"}"#
+            } else if path == "/v1/domains/{hostname}" {
+                r#"{"prefixes":["campaign"]}"#
             } else {
                 r#"{"enabled":true,"url":"https://example.com/"}"#
             };

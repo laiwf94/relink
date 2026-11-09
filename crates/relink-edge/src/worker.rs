@@ -103,6 +103,8 @@ impl Origin for WorkerOrigin {
             "cache-control",
             "retry-after",
             "content-type",
+            "content-security-policy",
+            "x-content-type-options",
         ] {
             if let Some(v) = resp.headers().get(name).map_err(err)? {
                 out.push((name.to_owned(), v));

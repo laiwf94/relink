@@ -473,8 +473,40 @@ async fn custom_domains_are_published_with_their_hostnames() {
         "verifying publishes the domain record"
     );
     let rec: EdgeDomain = serde_json::from_str(&kv.values.lock().unwrap()[&host_key]).unwrap();
-    assert_eq!(rec, EdgeDomain { id: domain_id });
+    assert_eq!(
+        rec,
+        EdgeDomain {
+            id: domain_id,
+            settings: Default::default()
+        }
+    );
     assert_eq!(kv.hostnames(), [HOST, "www.relink-docs.net"]);
+
+    // Changing the domain's settings republishes its record with them.
+    let (status, d) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/domains/{HOST}"),
+            &h.alice,
+            Some(json!({"prefixes": ["Campaign"], "gone_page": "<p>gone</p>"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{d}");
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            kv.values
+                .lock()
+                .unwrap()
+                .get(&host_key)
+                .and_then(|v| serde_json::from_str::<EdgeDomain>(v).ok())
+                .is_some_and(|r| r.settings.prefixes == ["campaign"])
+        })
+        .await,
+        "a settings change reaches the edge record"
+    );
+    let rec: EdgeDomain = serde_json::from_str(&kv.values.lock().unwrap()[&host_key]).unwrap();
+    assert_eq!(rec.id, domain_id);
+    assert_eq!(rec.settings.gone_page.as_deref(), Some("<p>gone</p>"));
 
     // The same code on both domains: two records, each under its own key.
     h.create(json!({"url": "https://a.example.org/", "alias": "promo"}))

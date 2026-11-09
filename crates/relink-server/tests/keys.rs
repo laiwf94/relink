@@ -77,6 +77,7 @@ async fn call(h: &Harness, method: &str, path: &str, code: &str, key: &str) -> (
         ("post", "/v1/domains") => Some(json!({
             "hostname": format!("d{}.relink-docs.net", relink_server::code::random_code(8).to_lowercase())
         })),
+        ("patch", "/v1/domains/{hostname}") => Some(json!({"prefixes": ["campaign"]})),
         ("post" | "patch", _) => Some(json!({"enabled": true, "url": "https://example.com/"})),
         _ => None,
     };
@@ -121,7 +122,7 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 12);
+    assert_eq!(routes.len(), 13);
     // Deletion last, so the other routes still find the link.
     routes.sort_by_key(|(m, _, _)| *m == "delete");
 

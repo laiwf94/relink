@@ -13,6 +13,13 @@
 //! answers; if it is not, the request is for the default domain, exactly as
 //! the origin routes it. So a link on a custom domain costs one KV read, as
 //! does a default-domain link requested on `default_host`.
+//!
+//! A verified domain's record carries its settings (`relink_core::site`):
+//! `/` and paths that are not a plain code (`/campaign/abc`, or `/ABC` on a
+//! case-insensitive domain) read it to learn where they go, then read the
+//! link they name. Its 404 and 410 pages are served here, and a link found
+//! by the one-read path reads the record only when it needs a page. The
+//! decisions are the same functions the origin calls.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -23,8 +30,11 @@ use relink_core::hex;
 use relink_core::host::custom_host;
 use relink_core::model::Link;
 use relink_core::rules::{Decision, Settings, Visit, evaluate};
+use relink_core::site::{
+    DomainSettings, EXPIRED_TEXT, HTML, NOT_FOUND_TEXT, PAGE_CSP, PageKind, Target, page, target,
+};
 use relink_core::visitor::fingerprint;
-use relink_core::wire::{ClickBatch, WireClick, domain_kv_key, host_kv_key, kv_key};
+use relink_core::wire::{ClickBatch, EdgeDomain, WireClick, domain_kv_key, host_kv_key, kv_key};
 
 /// A KV read failed or the origin could not be reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,28 +126,95 @@ pub async fn handle<K: Kv, O: Origin>(
     default_host: &str,
     req: &EdgeRequest,
 ) -> Outcome {
-    if !is_plausible_code(&req.code) {
-        return edge(EdgeResponse::text(404, "not found\n"), None);
-    }
-    let link = match custom_host(req.host.as_deref(), default_host) {
-        None => read(kv, &kv_key(&req.code)).await,
-        Some(host) => {
-            let host = host.to_ascii_lowercase();
-            match read(kv, &domain_kv_key(&host, &req.code)).await {
-                Read::Missing => match kv.get(&host_kv_key(&host)).await {
-                    // Not a custom domain: the default domain's link.
-                    Ok(None) => read(kv, &kv_key(&req.code)).await,
-                    // A verified domain without this code in KV (or KV
-                    // failed): only the origin knows.
-                    Ok(Some(_)) | Err(_) => Read::Failed,
-                },
-                other => other,
+    let Some(host) = custom_host(req.host.as_deref(), default_host) else {
+        return default_domain(kv, origin, settings, req).await;
+    };
+    let host = host.to_ascii_lowercase();
+    // A plain code is looked up as sent first: on a custom domain that is
+    // the one read a redirect costs.
+    let sent = is_plausible_code(&req.code).then_some(req.code.as_str());
+    if let Some(code) = sent {
+        match read(kv, &domain_kv_key(&host, code)).await {
+            Read::Found(link) => {
+                let pages = Pages::Unread(&host);
+                return serve(kv, origin, settings, req, &link, pages).await;
             }
+            Read::Failed => return from_origin(origin, req).await,
+            Read::Missing => {}
         }
+    }
+    let domain = match read_domain(kv, &host).await {
+        // Not a custom domain: the default domain's link.
+        Ok(None) => return default_domain(kv, origin, settings, req).await,
+        Ok(Some(d)) => d,
+        // KV failed or the record would not parse: only the origin knows.
+        Err(()) => return from_origin(origin, req).await,
     };
-    let Read::Found(link) = link else {
-        return from_origin(origin, req).await;
-    };
+    let site = &domain.settings;
+    match target(&req.code, Some(site)) {
+        Target::Root => match &site.root_url {
+            Some(url) => edge(redirect(302, url, None, None), None),
+            None => edge(error_page(PageKind::NotFound, Some(site), &host, req), None),
+        },
+        Target::Miss => edge(error_page(PageKind::NotFound, Some(site), &host, req), None),
+        // Already missing from KV: the code may not have arrived yet, so the
+        // origin answers.
+        Target::Code(code) if Some(&*code) == sent => from_origin(origin, req).await,
+        Target::Code(code) => match read(kv, &domain_kv_key(&host, &code)).await {
+            Read::Found(link) => {
+                let pages = Pages::Known(&host, site);
+                serve(kv, origin, settings, req, &link, pages).await
+            }
+            Read::Missing | Read::Failed => from_origin(origin, req).await,
+        },
+    }
+}
+
+/// A request for the default domain, which has no settings.
+async fn default_domain<K: Kv, O: Origin>(
+    kv: &K,
+    origin: &O,
+    settings: &Settings<'_>,
+    req: &EdgeRequest,
+) -> Outcome {
+    if !is_plausible_code(&req.code) {
+        return edge(EdgeResponse::text(404, NOT_FOUND_TEXT), None);
+    }
+    match read(kv, &kv_key(&req.code)).await {
+        Read::Found(link) => serve(kv, origin, settings, req, &link, Pages::Default).await,
+        Read::Missing | Read::Failed => from_origin(origin, req).await,
+    }
+}
+
+/// Where a link's error pages come from.
+enum Pages<'a> {
+    /// The default domain's built-in ones.
+    Default,
+    /// A custom domain whose record has been read.
+    Known(&'a str, &'a DomainSettings),
+    /// A custom domain whose record is read only if a page is needed.
+    Unread(&'a str),
+}
+
+/// The `host:` record of `host`: `Ok(None)` when it is not a verified
+/// domain, `Err` when KV failed or the record would not parse.
+async fn read_domain<K: Kv>(kv: &K, host: &str) -> Result<Option<EdgeDomain>, ()> {
+    match kv.get(&host_kv_key(host)).await {
+        Ok(None) => Ok(None),
+        Ok(Some(json)) => serde_json::from_str(&json).map(Some).map_err(|_| ()),
+        Err(_) => Err(()),
+    }
+}
+
+/// Answers with a link found in KV.
+async fn serve<K: Kv, O: Origin>(
+    kv: &K,
+    origin: &O,
+    settings: &Settings<'_>,
+    req: &EdgeRequest,
+    link: &Link,
+    pages: Pages<'_>,
+) -> Outcome {
     if link.max_clicks.is_some() {
         return from_origin(origin, req).await;
     }
@@ -148,24 +225,59 @@ pub async fn handle<K: Kv, O: Origin>(
         cookies: &cookies,
         random: req.random,
     };
-    match evaluate(&link, &visit, settings) {
-        Decision::NotFound => edge(EdgeResponse::text(404, "not found\n"), None),
-        Decision::Expired => edge(EdgeResponse::text(410, "this link has expired\n"), None),
+    let kind = match evaluate(link, &visit, settings) {
+        Decision::NotFound => PageKind::NotFound,
+        Decision::Expired => PageKind::Gone,
         Decision::GeoBlocked {
             fallback: Some(url),
-        } => edge(redirect(302, url, None, None), None),
-        Decision::GeoBlocked { fallback: None } => edge(
-            EdgeResponse::text(451, "this link is not available in your region\n"),
-            None,
-        ),
+        } => return edge(redirect(302, url, None, None), None),
+        Decision::GeoBlocked { fallback: None } => {
+            return edge(
+                EdgeResponse::text(451, "this link is not available in your region\n"),
+                None,
+            );
+        }
         // Unreachable while limited links are proxied, but if one ever got
         // here the origin is the only place that can admit it.
-        Decision::Redirect(r) if r.needs_admission => from_origin(origin, req).await,
+        Decision::Redirect(r) if r.needs_admission => return from_origin(origin, req).await,
         Decision::Redirect(r) => {
             let cache = r.cacheable.then_some(EDGE_MAX_AGE);
             let response = redirect(r.status, r.location, cache, r.set_cookie);
-            edge(response, Some(click_for(&link, req)))
+            return edge(response, Some(click_for(link, req)));
         }
+    };
+    match pages {
+        Pages::Default => edge(error_page(kind, None, "", req), None),
+        Pages::Known(host, site) => edge(error_page(kind, Some(site), host, req), None),
+        Pages::Unread(host) => match read_domain(kv, host).await {
+            Ok(Some(d)) => edge(error_page(kind, Some(&d.settings), host, req), None),
+            // A link on a domain KV no longer has: built-in pages.
+            Ok(None) => edge(error_page(kind, None, host, req), None),
+            Err(()) => from_origin(origin, req).await,
+        },
+    }
+}
+
+/// A 404 or 410 page: the domain's own when it has one.
+fn error_page(
+    kind: PageKind,
+    site: Option<&DomainSettings>,
+    host: &str,
+    req: &EdgeRequest,
+) -> EdgeResponse {
+    let p = page(kind, site, host, &req.code, EXPIRED_TEXT);
+    let mut headers = vec![
+        ("content-type".to_owned(), p.content_type.to_owned()),
+        ("cache-control".to_owned(), "no-store".to_owned()),
+    ];
+    if p.content_type == HTML {
+        headers.push(("content-security-policy".into(), PAGE_CSP.into()));
+        headers.push(("x-content-type-options".into(), "nosniff".into()));
+    }
+    EdgeResponse {
+        status: p.status,
+        headers,
+        body: p.body,
     }
 }
 
@@ -375,6 +487,7 @@ mod tests {
     use super::*;
     use relink_core::abtest::Signer;
     use relink_core::model::{Destination, GeoMode, GeoRule};
+    use relink_core::site::PLAIN;
 
     const SIGNER: Signer = Signer::new([5; 32]);
     const SETTINGS: Settings = Settings {
@@ -667,7 +780,11 @@ mod tests {
     fn mark_domain(kv: &MemoryKv, host: &str) {
         kv.values.borrow_mut().insert(
             host_kv_key(host),
-            serde_json::to_string(&relink_core::wire::EdgeDomain { id: 3 }).unwrap(),
+            serde_json::to_string(&EdgeDomain {
+                id: 3,
+                settings: DomainSettings::default(),
+            })
+            .unwrap(),
         );
     }
 
@@ -832,9 +949,203 @@ mod tests {
         put(&kv, domain_kv_key(HOST, "off"), &off);
         let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "off")));
         assert_eq!((out.response.status, out.served), (404, Served::Edge));
-        // Garbage paths never cost a read, whatever the host.
+        // Garbage paths never reach the origin, whatever the host; on a
+        // custom domain they cost the read of its record, for its 404 page.
         let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, "a.php")));
         assert_eq!((out.response.status, out.served), (404, Served::Edge));
         assert_eq!(origin.calls.get(), 3);
+    }
+
+    fn site() -> DomainSettings {
+        DomainSettings {
+            root_url: Some("https://www.example.com/".into()),
+            not_found_page: Some("<h1>{{code}} not on {{host}}</h1>".into()),
+            gone_page: Some("<p>{{code}} gone</p>".into()),
+            prefixes: vec!["campaign".into()],
+            case_insensitive: true,
+        }
+    }
+
+    fn with_site(kv: &MemoryKv, host: &str, settings: DomainSettings) {
+        kv.values.borrow_mut().insert(
+            host_kv_key(host),
+            serde_json::to_string(&EdgeDomain { id: 3, settings }).unwrap(),
+        );
+    }
+
+    #[test]
+    fn domain_settings_apply_at_the_edge() {
+        let kv = CountingKv::default();
+        with_site(&kv.inner, HOST, site());
+        put(&kv.inner, domain_kv_key(HOST, "summer"), &link("summer"));
+        let origin = FakeOrigin::default();
+        let get = |path: &str| {
+            kv.reads.borrow_mut().clear();
+            run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, path)))
+        };
+
+        let out = get("");
+        assert_eq!((out.response.status, out.served), (302, Served::Edge));
+        assert_eq!(
+            out.response.header("location"),
+            Some("https://www.example.com/")
+        );
+        assert!(out.click.is_none());
+        assert_eq!(*kv.reads.borrow(), ["host:go.example.com"]);
+
+        // The plain code costs one read; prefixed or folded ones two more.
+        assert_eq!(get("summer").response.status, 301);
+        assert_eq!(kv.reads.borrow().len(), 1);
+        for path in ["SUMMER", "campaign/summer", "Campaign/SUMMER"] {
+            let out = get(path);
+            assert_eq!(
+                (out.response.status, out.served),
+                (301, Served::Edge),
+                "{path}"
+            );
+            assert_eq!(out.click.unwrap().link_id, 11);
+            assert_eq!(
+                kv.reads.borrow().last().unwrap(),
+                "link:go.example.com/summer"
+            );
+        }
+        assert_eq!(get("campaign/summer").response.status, 301);
+        assert_eq!(
+            *kv.reads.borrow(),
+            ["host:go.example.com", "link:go.example.com/summer"],
+            "a path with a prefix reads the domain first"
+        );
+
+        // The domain's own 404 page, escaped and confined, without the
+        // origin; codes it might not have yet still go to the origin.
+        for (path, code) in [
+            ("other/summer", "summer"),
+            ("a.php", "a.php"),
+            ("x/y/z<", "z<"),
+        ] {
+            let out = get(path);
+            assert_eq!(
+                (out.response.status, out.served),
+                (404, Served::Edge),
+                "{path}"
+            );
+            assert_eq!(out.response.header("content-type"), Some(HTML));
+            assert_eq!(
+                out.response.header("content-security-policy"),
+                Some(PAGE_CSP)
+            );
+            assert_eq!(
+                out.response.header("x-content-type-options"),
+                Some("nosniff")
+            );
+            let code = code.replace('<', "&lt;");
+            assert_eq!(
+                out.response.body,
+                format!("<h1>{code} not on go.example.com</h1>")
+            );
+        }
+        assert_eq!(origin.calls.get(), 0);
+        assert_eq!(get("unknown").served, Served::Origin);
+        assert_eq!(get("campaign/unknown").served, Served::Origin);
+        assert_eq!(origin.calls.get(), 2);
+
+        // Disabled and expired links found by the one-read path read the
+        // domain for its pages.
+        let mut off = link("off");
+        off.enabled = false;
+        put(&kv.inner, domain_kv_key(HOST, "off"), &off);
+        let out = get("off");
+        assert_eq!(out.response.status, 404);
+        assert_eq!(out.response.body, "<h1>off not on go.example.com</h1>");
+        assert_eq!(
+            *kv.reads.borrow(),
+            ["link:go.example.com/off", "host:go.example.com"]
+        );
+        let mut old = link("old");
+        old.expires_at = Some(chrono::DateTime::from_timestamp(0, 0).unwrap());
+        put(&kv.inner, domain_kv_key(HOST, "old"), &old);
+        let out = get("campaign/OLD");
+        assert_eq!((out.response.status, out.served), (410, Served::Edge));
+        assert_eq!(out.response.body, "<p>OLD gone</p>");
+        assert_eq!(kv.reads.borrow().len(), 2, "the record read once");
+    }
+
+    #[test]
+    fn domains_without_settings_or_records_keep_the_built_in_pages() {
+        let kv = MemoryKv::default();
+        with_site(&kv, HOST, DomainSettings::default());
+        let mut old = link("old");
+        old.expires_at = Some(chrono::DateTime::from_timestamp(0, 0).unwrap());
+        put(&kv, domain_kv_key(HOST, "old"), &old);
+        put(&kv, domain_kv_key(HOST, "ABC"), &link("ABC"));
+        let origin = FakeOrigin::default();
+        let get = |path: &str| run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, path)));
+        for path in ["", "campaign/abc", "a.php"] {
+            let out = get(path);
+            assert_eq!(
+                (out.response.status, out.served),
+                (404, Served::Edge),
+                "{path}"
+            );
+            assert_eq!(out.response.header("content-type"), Some(PLAIN));
+            assert_eq!(out.response.body, NOT_FOUND_TEXT);
+            assert!(out.response.header("content-security-policy").is_none());
+        }
+        let out = get("old");
+        assert_eq!(
+            (out.response.status, out.response.body.as_str()),
+            (410, EXPIRED_TEXT)
+        );
+        // Case matters without the setting.
+        assert_eq!(get("ABC").response.status, 301);
+        assert_eq!(get("abc").served, Served::Origin);
+
+        // A link whose domain record is gone gets the built-in page; a
+        // failing read lets the origin decide.
+        kv.values.borrow_mut().remove(&host_kv_key(HOST));
+        let out = get("old");
+        assert_eq!(
+            (out.response.status, out.response.body.as_str()),
+            (410, EXPIRED_TEXT)
+        );
+        let failing = FailAfter {
+            inner: MemoryKv::default(),
+            left: std::cell::Cell::new(1),
+        };
+        put(&failing.inner, domain_kv_key(HOST, "old"), &old);
+        let out = run(handle(
+            &failing,
+            &origin,
+            &SETTINGS,
+            DEFAULT,
+            &on(HOST, "old"),
+        ));
+        assert_eq!(out.served, Served::Origin);
+        // A host record that will not parse sends prefixed paths there too.
+        kv.values.borrow_mut().insert(host_kv_key(HOST), "{".into());
+        assert_eq!(get("campaign/abc").served, Served::Origin);
+
+        // The default domain keeps `/` and prefixes meaningless.
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req("")));
+        assert_eq!((out.response.status, out.served), (404, Served::Edge));
+        assert_eq!(out.response.body, NOT_FOUND_TEXT);
+    }
+
+    /// A KV that answers `left` reads, then fails.
+    struct FailAfter {
+        inner: MemoryKv,
+        left: std::cell::Cell<usize>,
+    }
+
+    impl Kv for FailAfter {
+        async fn get(&self, key: &str) -> Result<Option<String>, EdgeError> {
+            match self.left.get() {
+                0 => Err(EdgeError("kv down".into())),
+                n => {
+                    self.left.set(n - 1);
+                    self.inner.get(key).await
+                }
+            }
+        }
     }
 }

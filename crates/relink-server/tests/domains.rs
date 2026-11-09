@@ -688,3 +688,259 @@ async fn hostnames_dns_failures_roles_and_plan_limits() {
     assert_eq!(after["max_domains"], 3);
     h.shutdown().await;
 }
+
+/// GET `/{path}` as `host`: status, Location, Content-Type, whether the
+/// page CSP was sent, and the body.
+async fn fetch_as(
+    h: &Harness,
+    host: &str,
+    path: &str,
+) -> (u16, Option<String>, String, bool, String) {
+    let r = h
+        .http
+        .get(format!("{}/{path}", h.base))
+        .header("host", host)
+        .send()
+        .await
+        .unwrap();
+    let header = |n: &str| r.headers().get(n).map(|v| v.to_str().unwrap().to_owned());
+    let (location, ctype) = (
+        header("location"),
+        header("content-type").unwrap_or_default(),
+    );
+    let csp = header("content-security-policy").is_some();
+    (
+        r.status().as_u16(),
+        location,
+        ctype,
+        csp,
+        r.text().await.unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn domain_settings_shape_what_its_paths_serve() {
+    let dns = FakeDns::start().await;
+    let Some(mut h) = harness(&dns).await else {
+        return;
+    };
+    let (_, d) = add(&h, &h.alice, HOST).await;
+    assert_eq!(
+        d["settings"],
+        json!({"root_url": null, "not_found_page": null, "gone_page": null,
+               "prefixes": [], "case_insensitive": false})
+    );
+    let record = d["verification"]["value"].as_str().unwrap().to_owned();
+    dns.set_txt("_relink-challenge.go.relink-docs.net", &[&record]);
+    assert_eq!(verify(&h, &h.alice, HOST).await.1["verified"], true);
+    let path = format!("/v1/domains/{HOST}");
+    let patch = |body: Value| {
+        let (h, path) = (&h, path.clone());
+        async move { h.api(Method::PATCH, &path, &h.alice, Some(body)).await }
+    };
+
+    // A code with uppercase letters blocks case-insensitivity: it could
+    // never be reached again.
+    let on_domain = |alias: &str, extra: Value| {
+        let mut body = json!({"url": "https://b.example.org/", "alias": alias, "domain": HOST});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let (status, _) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(on_domain("Mixed", json!({}))),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let (status, body) = patch(json!({"case_insensitive": true})).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "failed_precondition");
+    assert!(body["error"]["message"].as_str().unwrap().contains("Mixed"));
+    let del = format!("/v1/links/Mixed?domain={HOST}");
+    assert_eq!(h.api(Method::DELETE, &del, &h.alice, None).await.0, 204);
+
+    // Invalid settings name their field; nothing is stored.
+    for (bad, field) in [
+        (json!({"root_url": "http://10.0.0.1/"}), "root_url"),
+        (json!({"root_url": "javascript:alert(1)"}), "root_url"),
+        (json!({"prefixes": ["v1"]}), "prefixes"),
+        (json!({"prefixes": ["a/b"]}), "prefixes"),
+        (json!({"not_found_page": ""}), "not_found_page"),
+        (json!({"gone_page": "x".repeat(16 * 1024 + 1)}), "gone_page"),
+    ] {
+        let (status, body) = patch(bad.clone()).await;
+        assert_eq!(status, 400, "{bad}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(field),
+            "{bad}: {body}"
+        );
+    }
+    assert_eq!(patch(json!({"other": 1})).await.0, 400);
+    let (status, _) = h
+        .api(
+            Method::PATCH,
+            "/v1/domains/nope.relink-docs.net",
+            &h.alice,
+            Some(json!({"prefixes": []})),
+        )
+        .await;
+    assert_eq!(status, 404);
+
+    let (status, d) = patch(json!({
+        "root_url": "HTTPS://WWW.relink-docs.net",
+        "not_found_page": "<h1>{{code}} is not on {{host}}</h1>",
+        "gone_page": "<p>{{code}} has gone</p>",
+        "prefixes": ["Campaign", "promo"],
+        "case_insensitive": true,
+    }))
+    .await;
+    assert_eq!(status, 200, "{d}");
+    assert_eq!(
+        d["settings"],
+        json!({"root_url": "https://www.relink-docs.net/",
+               "not_found_page": "<h1>{{code}} is not on {{host}}</h1>",
+               "gone_page": "<p>{{code}} has gone</p>",
+               "prefixes": ["campaign", "promo"], "case_insensitive": true})
+    );
+    // Links created on the domain now get lowercase codes.
+    let (status, l) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(on_domain("Summer", json!({}))),
+        )
+        .await;
+    assert_eq!(status, 201, "{l}");
+    assert_eq!(l["code"], "summer");
+    assert_eq!(l["short_url"], "http://go.relink-docs.net/summer");
+    let (status, _) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(on_domain("SUMMER", json!({}))),
+        )
+        .await;
+    assert_eq!(status, 409, "the same code ignoring case is taken");
+    let (_, r) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(json!({"url": "https://r.example.org/", "domain": HOST})),
+        )
+        .await;
+    let random = r["code"].as_str().unwrap();
+    assert_eq!(random, random.to_ascii_lowercase());
+    let (status, _) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(on_domain("once", json!({"max_clicks": 1}))),
+        )
+        .await;
+    assert_eq!(status, 201);
+
+    // `/` is the root redirect; prefixes and case lead to the same link.
+    let (status, loc, ..) = fetch_as(&h, HOST, "").await;
+    assert_eq!(
+        (status, loc.as_deref()),
+        (302, Some("https://www.relink-docs.net/"))
+    );
+    for p in [
+        "summer",
+        "SUMMER",
+        "campaign/Summer",
+        "CAMPAIGN/summer",
+        "promo/summer",
+    ] {
+        let (status, loc, ..) = fetch_as(&h, HOST, p).await;
+        assert_eq!(
+            (status, loc.as_deref()),
+            (302, Some("https://b.example.org/")),
+            "{p}"
+        );
+    }
+    assert_eq!(fetch_as(&h, HOST, &random.to_uppercase()).await.0, 302);
+
+    // Anything else is the domain's own 404 page, escaped and confined.
+    for (p, code) in [
+        ("other/summer", "summer"),
+        ("nope", "nope"),
+        ("a.php", "a.php"),
+        ("campaign/a%3Cb", "a%3Cb"),
+        ("campaign/x/y", "y"),
+    ] {
+        let (status, _, ctype, csp, body) = fetch_as(&h, HOST, p).await;
+        assert_eq!(status, 404, "{p}");
+        assert_eq!(ctype, "text/html; charset=utf-8", "{p}");
+        assert!(csp, "{p}");
+        assert_eq!(
+            body,
+            format!("<h1>{code} is not on go.relink-docs.net</h1>"),
+            "{p}"
+        );
+    }
+    // A link at its click limit is the domain's 410 page.
+    assert_eq!(fetch_as(&h, HOST, "once").await.0, 302);
+    let (status, _, ctype, _, body) = fetch_as(&h, HOST, "campaign/ONCE").await;
+    assert_eq!((status, ctype.as_str()), (410, "text/html; charset=utf-8"));
+    assert_eq!(body, "<p>ONCE has gone</p>");
+
+    // The default domain is untouched: no root redirect, no prefixes, no
+    // case folding, plain pages.
+    for p in ["", "campaign/summer"] {
+        let (status, _, ctype, csp, _) = fetch_as(&h, "localhost", p).await;
+        assert_eq!(
+            (status, ctype.as_str(), csp),
+            (404, "application/json", false),
+            "{p}"
+        );
+    }
+    let (status, _, ctype, _, body) = fetch_as(&h, "localhost", "nope").await;
+    assert_eq!(
+        (status, ctype.as_str(), body.as_str()),
+        (404, "text/plain; charset=utf-8", "not found\n")
+    );
+
+    // Back to the defaults, field by field.
+    let (status, d) = patch(json!({"root_url": null, "not_found_page": null})).await;
+    assert_eq!(status, 200);
+    assert_eq!(d["settings"]["gone_page"], "<p>{{code}} has gone</p>");
+    let (status, _, ctype, _, body) = fetch_as(&h, HOST, "").await;
+    assert_eq!(
+        (status, ctype.as_str(), body.as_str()),
+        (404, "text/plain; charset=utf-8", "not found\n")
+    );
+    let (status, d) = patch(json!({"prefixes": [], "case_insensitive": false})).await;
+    assert_eq!(status, 200);
+    assert_eq!(d["settings"]["prefixes"], json!([]));
+    assert_eq!(fetch_as(&h, HOST, "campaign/summer").await.0, 404);
+    assert_eq!(fetch_as(&h, HOST, "SUMMER").await.0, 404);
+    assert_eq!(fetch_as(&h, HOST, "summer").await.0, 302);
+
+    // Every change is audited once.
+    let ws = workspace_of(&h.store, "alice").await;
+    let changes: Vec<Value> = sqlx::query_scalar(
+        "SELECT after FROM audit_log WHERE workspace_id = $1 AND action = 'domain.update' \
+         ORDER BY seq",
+    )
+    .bind(ws)
+    .fetch_all(h.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(changes.len(), 3);
+    assert_eq!(changes[0]["settings"]["case_insensitive"], true);
+    assert!(changes[2].get("settings").is_some());
+    h.shutdown().await;
+}

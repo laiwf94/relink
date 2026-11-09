@@ -187,7 +187,9 @@ pub fn public_router(app: Arc<App>) -> Router {
         )
         .route(
             "/v1/domains/{hostname}",
-            get(domains::get_domain).delete(domains::delete_domain),
+            get(domains::get_domain)
+                .patch(domains::update_domain)
+                .delete(domains::delete_domain),
         )
         .route(
             "/v1/domains/{hostname}/verify",
@@ -219,7 +221,10 @@ pub fn public_router(app: Arc<App>) -> Router {
         .route("/openapi.json", get(api::openapi))
         .route("/.well-known/acme-challenge/{token}", get(acme::http01))
         .route("/{code}", get(redirect::redirect))
-        .fallback(api::not_found)
+        // Any other GET may be a custom domain's `/` or `/{prefix}/{code}`
+        // or its 404 page (src/redirect.rs); on the default domain, and for
+        // other methods, it is an unknown path as before.
+        .fallback(redirect::fallback)
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             api::request_context,

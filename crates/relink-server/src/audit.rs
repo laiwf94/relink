@@ -129,6 +129,7 @@ pub enum Action {
     InvitationRevoke,
     DomainCreate,
     DomainVerify,
+    DomainUpdate,
     DomainDelete,
 }
 
@@ -151,6 +152,7 @@ impl Action {
             Action::InvitationRevoke => "invitation.revoke",
             Action::DomainCreate => "domain.create",
             Action::DomainVerify => "domain.verify",
+            Action::DomainUpdate => "domain.update",
             Action::DomainDelete => "domain.delete",
         }
     }
@@ -820,6 +822,7 @@ mod tests {
             Action::InvitationRevoke,
             Action::DomainCreate,
             Action::DomainVerify,
+            Action::DomainUpdate,
             Action::DomainDelete,
         ] {
             let s = a.as_str();

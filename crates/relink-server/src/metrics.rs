@@ -87,16 +87,19 @@ pub enum Outcome {
     Gone,
     GeoBlocked,
     Unavailable,
+    /// A custom domain's `/` sent to its root URL.
+    Root,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 6] = [
+    const ALL: [Outcome; 7] = [
         Outcome::Redirect,
         Outcome::Fallback,
         Outcome::NotFound,
         Outcome::Gone,
         Outcome::GeoBlocked,
         Outcome::Unavailable,
+        Outcome::Root,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -106,6 +109,7 @@ impl Outcome {
             Outcome::Gone => "gone",
             Outcome::GeoBlocked => "geo_blocked",
             Outcome::Unavailable => "unavailable",
+            Outcome::Root => "root",
         }
     }
 }
@@ -255,7 +259,7 @@ pub struct Gauges {
 pub struct Metrics {
     pub redirect_latency: Histogram,
     pub api_latency: Histogram,
-    outcomes: [Counter; 6],
+    outcomes: [Counter; 7],
     cache: [Counter; 5],
     db_errors: [Counter; 8],
     drops: [Counter; 4],

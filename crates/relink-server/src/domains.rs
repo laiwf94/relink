@@ -22,6 +22,14 @@
 //! requests for hosts that could be custom domains are answered 503 rather
 //! than guessed at.
 //!
+//! Settings: `PATCH /v1/domains/{hostname}` sets a domain's root redirect,
+//! its own 404 and 410 pages, the path prefixes it accepts and whether its
+//! codes ignore case (`relink_core::site`). They travel with the domain in
+//! [`DomainMap`] and in its edge record, so the origin and the edge make
+//! the same decisions with the same code. Turning case-insensitivity on is
+//! refused while the domain has a code with uppercase letters, and links
+//! created on such a domain get lowercase codes.
+//!
 //! Limits: the plan's `max_domains` and a hard [`MAX_DOMAINS`] per
 //! workspace, checked when a domain is added under the workspace row lock
 //! (src/quota.rs). Managing domains needs `links:write` (reading them
@@ -50,6 +58,8 @@ use crate::store::{Db, DbError};
 use crate::tenant::{Allowed, LinksRead, LinksWrite, Tenant};
 use crate::util::{hex_encode, secure_random};
 use relink_core::host::custom_host;
+use relink_core::site::DomainSettings;
+use sqlx::types::Json;
 
 /// The label in front of a hostname where its verification record lives.
 pub const CHALLENGE_LABEL: &str = "_relink-challenge";
@@ -118,15 +128,30 @@ pub fn parse_hostname(raw: &str, default_host: &str) -> Result<String, String> {
 }
 
 /// Which domain a redirect request is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
     /// The default domain: codes without a custom domain.
     Default,
-    /// The verified custom domain with this ID.
-    Domain(i64),
+    /// The verified custom domain with this ID and settings.
+    Domain(Arc<Site>),
     /// The verified domains have not been loaded yet, and the host is not
     /// the default one, so the answer could be wrong either way.
     Unavailable,
+}
+
+/// A verified domain as routing needs it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Site {
+    pub id: i64,
+    pub settings: DomainSettings,
+}
+
+/// A verified domain as [`Db::verified_domains`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDomain {
+    pub hostname: String,
+    pub id: i64,
+    pub settings: DomainSettings,
 }
 
 const SHARDS: usize = 16;
@@ -135,7 +160,7 @@ const SHARDS: usize = 16;
 /// into shards so requests for different domains rarely share a lock, and
 /// skipped entirely while no domain is verified.
 pub struct DomainMap {
-    shards: [RwLock<HashMap<Box<str>, i64>>; SHARDS],
+    shards: [RwLock<HashMap<Box<str>, Arc<Site>>>; SHARDS],
     loaded: AtomicBool,
     len: AtomicUsize,
 }
@@ -175,21 +200,25 @@ impl DomainMap {
         self.len() == 0
     }
 
-    /// The ID of a verified domain by its lowercase hostname.
-    pub fn get(&self, host: &str) -> Option<i64> {
+    /// A verified domain by its lowercase hostname.
+    pub fn get(&self, host: &str) -> Option<Arc<Site>> {
         self.shards[shard_of(host)]
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(host)
-            .copied()
+            .cloned()
     }
 
-    /// Replaces the contents with `domains` (hostname, ID).
-    pub fn replace(&self, domains: Vec<(String, i64)>) {
-        let mut fresh: [HashMap<Box<str>, i64>; SHARDS] = Default::default();
+    /// Replaces the contents with `domains`.
+    pub fn replace(&self, domains: Vec<VerifiedDomain>) {
+        let mut fresh: [HashMap<Box<str>, Arc<Site>>; SHARDS] = Default::default();
         let n = domains.len();
-        for (host, id) in domains {
-            fresh[shard_of(&host)].insert(host.into_boxed_str(), id);
+        for d in domains {
+            let site = Arc::new(Site {
+                id: d.id,
+                settings: d.settings,
+            });
+            fresh[shard_of(&d.hostname)].insert(d.hostname.into_boxed_str(), site);
         }
         for (shard, map) in self.shards.iter().zip(fresh) {
             *shard.write().unwrap_or_else(|e| e.into_inner()) = map;
@@ -212,7 +241,7 @@ impl DomainMap {
             return Route::Default;
         }
         match self.get(&host.to_ascii_lowercase()) {
-            Some(id) => Route::Domain(id),
+            Some(site) => Route::Domain(site),
             None => Route::Default,
         }
     }
@@ -273,6 +302,8 @@ pub struct Domain {
     pub check_error: Option<String>,
     /// The certificate's state (migration 0011, src/acme.rs).
     pub tls: TlsState,
+    /// Root redirect, pages, prefixes and case rule (migration 0015).
+    pub settings: DomainSettings,
 }
 
 /// Where a domain's certificate stands, as the ACME worker last left it.
@@ -291,7 +322,7 @@ macro_rules! domain_columns {
     () => {
         "id, hostname, verification_token, created_by, created_at, verified_at, checked_at, \
          check_error, tls_not_after, tls_renew_at, tls_next_attempt_at, tls_failures, \
-         tls_checked_at, tls_error"
+         tls_checked_at, tls_error, settings"
     };
 }
 
@@ -313,16 +344,22 @@ fn row_to_domain(r: &PgRow) -> Result<Domain, sqlx::Error> {
             checked_at: r.try_get("tls_checked_at")?,
             error: r.try_get("tls_error")?,
         },
+        settings: r.try_get::<Json<DomainSettings>, _>("settings")?.0,
     })
 }
 
-/// A domain as the audit log shows it.
+/// A domain as the audit log shows it. Settings appear once they are
+/// anything but the defaults.
 pub fn domain_state(d: &Domain) -> Value {
-    json!({
+    let mut v = json!({
         "id": d.id,
         "hostname": d.hostname,
         "verified_at": d.verified_at,
-    })
+    });
+    if !d.settings.is_default() {
+        v["settings"] = json!(d.settings);
+    }
+    v
 }
 
 /// The record to publish, as `GET /v1/domains` shows it.
@@ -345,8 +382,33 @@ pub struct DomainView {
     pub check_error: Option<String>,
     /// For a verified domain: its certificate's state.
     pub certificate: Option<CertificateView>,
+    /// Every setting, defaults included, so a client sees them all.
+    pub settings: SettingsView,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// A domain's settings as the API returns them: every field, null or empty
+/// when unset.
+#[derive(Debug, Serialize)]
+pub struct SettingsView {
+    pub root_url: Option<String>,
+    pub not_found_page: Option<String>,
+    pub gone_page: Option<String>,
+    pub prefixes: Vec<String>,
+    pub case_insensitive: bool,
+}
+
+impl From<&DomainSettings> for SettingsView {
+    fn from(s: &DomainSettings) -> SettingsView {
+        SettingsView {
+            root_url: s.root_url.clone(),
+            not_found_page: s.not_found_page.clone(),
+            gone_page: s.gone_page.clone(),
+            prefixes: s.prefixes.clone(),
+            case_insensitive: s.case_insensitive,
+        }
+    }
 }
 
 /// A verified domain's certificate, as the API returns it. `status` is
@@ -398,6 +460,7 @@ impl From<&Domain> for DomainView {
             checked_at: d.checked_at,
             check_error: d.check_error.clone(),
             certificate: d.verified_at.map(|_| CertificateView::from(&d.tls)),
+            settings: SettingsView::from(&d.settings),
             created_by: d.created_by.clone(),
             created_at: d.created_at,
         }
@@ -419,19 +482,45 @@ fn clip(mut s: String) -> String {
 }
 
 impl Db {
-    /// Every verified domain as (hostname, ID), for routing. Crosses
+    /// Every verified domain, for routing and edge reconciliation. Crosses
     /// workspaces by design, so it runs as the server's own role.
-    pub async fn verified_domains(&self) -> Result<Vec<(String, i64)>, DbError> {
+    pub async fn verified_domains(&self) -> Result<Vec<VerifiedDomain>, DbError> {
         let rows = self
             .timed(
-                sqlx::query("SELECT hostname, id FROM domains WHERE verified_at IS NOT NULL")
-                    .fetch_all(self.pool()),
+                sqlx::query(
+                    "SELECT hostname, id, settings FROM domains WHERE verified_at IS NOT NULL",
+                )
+                .fetch_all(self.pool()),
             )
             .await?;
         rows.iter()
-            .map(|r| Ok((r.try_get("hostname")?, r.try_get("id")?)))
+            .map(|r| {
+                Ok(VerifiedDomain {
+                    hostname: r.try_get("hostname")?,
+                    id: r.try_get("id")?,
+                    settings: r.try_get::<Json<DomainSettings>, _>("settings")?.0,
+                })
+            })
             .collect::<Result<_, sqlx::Error>>()
             .map_err(DbError::from)
+    }
+
+    /// The verified domain with this hostname, with its settings, if any.
+    pub async fn verified_domain(
+        &self,
+        hostname: &str,
+    ) -> Result<Option<(i64, DomainSettings)>, DbError> {
+        let row: Option<(i64, Json<DomainSettings>)> = self
+            .timed(
+                sqlx::query_as(
+                    "SELECT id, settings FROM domains \
+                     WHERE hostname = $1 AND verified_at IS NOT NULL",
+                )
+                .bind(hostname)
+                .fetch_optional(self.pool()),
+            )
+            .await?;
+        Ok(row.map(|(id, s)| (id, s.0)))
     }
 }
 
@@ -577,6 +666,73 @@ impl Tenant<'_> {
             .await
     }
 
+    /// Replaces a domain's settings with `settings` (already validated).
+    /// Turning case-insensitivity on is refused (`Precondition`) while a
+    /// code on the domain has uppercase letters: it could never be reached
+    /// again. The domain row is locked first, which waits for links being
+    /// created on it (they hold `FOR KEY SHARE` until they commit) and makes
+    /// later ones see the new rule.
+    pub async fn update_domain_settings(
+        &self,
+        hostname: &str,
+        settings: &DomainSettings,
+    ) -> Result<Domain, DbError> {
+        self.db()
+            .timed(async {
+                let mut tx = self.begin().await?;
+                let row = sqlx::query(concat!(
+                    "SELECT ",
+                    domain_columns!(),
+                    " FROM domains WHERE hostname = $1 FOR UPDATE"
+                ))
+                .bind(hostname)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
+                let before = row_to_domain(&row)?;
+                if settings.case_insensitive && !before.settings.case_insensitive {
+                    let mixed: Option<String> = sqlx::query_scalar(
+                        "SELECT code FROM links WHERE domain_id = $1 AND code <> lower(code) \
+                         ORDER BY code LIMIT 1",
+                    )
+                    .bind(before.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(code) = mixed {
+                        return Ok(Err(DbError::Precondition(format!(
+                            "case_insensitive: {hostname} has links whose codes have uppercase \
+                             letters, such as {code}; delete or recreate them first"
+                        ))));
+                    }
+                }
+                let row = sqlx::query(concat!(
+                    "UPDATE domains SET settings = $2 WHERE id = $1 RETURNING ",
+                    domain_columns!()
+                ))
+                .bind(before.id)
+                .bind(Json(settings))
+                .fetch_one(&mut *tx)
+                .await?;
+                let after = row_to_domain(&row)?;
+                if after.settings != before.settings {
+                    let change = Change {
+                        workspace_id: self.workspace_id(),
+                        action: Action::DomainUpdate,
+                        target: format!("domain:{}", after.id),
+                        before: Some(domain_state(&before)),
+                        after: Some(domain_state(&after)),
+                    };
+                    audit::record(&mut tx, self.actor(), change).await?;
+                    if after.verified_at.is_some() {
+                        self.db().domains_changed(&mut tx, &after.hostname).await?;
+                    }
+                }
+                tx.commit().await?;
+                Ok(Ok(after))
+            })
+            .await?
+    }
+
     /// Deletes a domain. One that still has links is refused
     /// (`Precondition`): their short URLs are out there, and deleting
     /// the domain would break them silently.
@@ -671,6 +827,52 @@ fn domain_error(e: DbError, hostname: &str) -> ApiError {
 #[serde(deny_unknown_fields)]
 pub struct CreateDomain {
     pub hostname: String,
+}
+
+/// `PATCH /v1/domains/{hostname}` body: the settings to change. An absent
+/// field keeps its value; `null` (or `[]` for prefixes, `false` for case)
+/// returns it to the default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateDomain {
+    #[serde(default, deserialize_with = "nullable")]
+    pub root_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub not_found_page: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub gone_page: Option<Option<String>>,
+    pub prefixes: Option<Vec<String>>,
+    pub case_insensitive: Option<bool>,
+}
+
+/// Distinguishes "absent" (outer None) from "null" (Some(None)).
+fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
+impl UpdateDomain {
+    /// `current` with this patch applied, not yet validated.
+    pub fn apply(self, current: &DomainSettings) -> DomainSettings {
+        let mut s = current.clone();
+        if let Some(v) = self.root_url {
+            s.root_url = v;
+        }
+        if let Some(v) = self.not_found_page {
+            s.not_found_page = v;
+        }
+        if let Some(v) = self.gone_page {
+            s.gone_page = v;
+        }
+        if let Some(v) = self.prefixes {
+            s.prefixes = v;
+        }
+        if let Some(v) = self.case_insensitive {
+            s.case_insensitive = v;
+        }
+        s
+    }
 }
 
 #[derive(Serialize)]
@@ -782,6 +984,38 @@ pub async fn verify_domain(
         tracing::info!(domain = checked.id, "domain verified");
     }
     Ok(json(StatusCode::OK, &DomainView::from(&checked)))
+}
+
+/// `PATCH /v1/domains/{hostname}`: changes the domain's settings. A root
+/// URL follows the rules destinations do.
+pub async fn update_domain(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksWrite>,
+    Path(hostname): Path<String>,
+    StrictJson(req): StrictJson<UpdateDomain>,
+) -> Result<Response, ApiError> {
+    require_admin(&app, ws.principal.role)?;
+    let hostname = path_hostname(&hostname);
+    let tenant = ws.tenant(&app.db);
+    let current = tenant
+        .domain(&hostname)
+        .await
+        .map_err(|e| domain_error(e, &hostname))?;
+    let settings = req
+        .apply(&current.settings)
+        .validated(app.cfg.destination_policy)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let domain = tenant
+        .update_domain_settings(&hostname, &settings)
+        .await
+        .map_err(|e| domain_error(e, &hostname))?;
+    if domain.verified_at.is_some()
+        && let Err(e) = app.reload_domains().await
+    {
+        tracing::warn!(error = %e, "could not reload verified domains");
+    }
+    tracing::info!(domain = domain.id, "domain settings changed");
+    Ok(json(StatusCode::OK, &DomainView::from(&domain)))
 }
 
 /// `DELETE /v1/domains/{hostname}`: only once it has no links.
@@ -927,18 +1161,28 @@ mod tests {
         map.replace(vec![]);
         assert!(map.is_loaded() && map.is_empty());
         assert_eq!(map.route(Some(b"go.example.com"), DEFAULT), Route::Default);
+        let ci = DomainSettings {
+            case_insensitive: true,
+            ..DomainSettings::default()
+        };
         map.replace(vec![
-            ("go.example.com".into(), 7),
-            ("x.example.org".into(), 9),
+            verified("go.example.com", 7, ci.clone()),
+            verified("x.example.org", 9, DomainSettings::default()),
         ]);
         assert_eq!(map.len(), 2);
         assert_eq!(
             map.route(Some(b"Go.Example.com:8443"), DEFAULT),
-            Route::Domain(7)
+            Route::Domain(Arc::new(Site {
+                id: 7,
+                settings: ci
+            }))
         );
         assert_eq!(
             map.route(Some(b"x.example.org."), DEFAULT),
-            Route::Domain(9)
+            Route::Domain(Arc::new(Site {
+                id: 9,
+                settings: DomainSettings::default()
+            }))
         );
         // Unknown hosts get the default domain, as before custom domains.
         assert_eq!(
@@ -947,15 +1191,80 @@ mod tests {
         );
         assert_eq!(map.route(Some(b"127.0.0.1:8080"), DEFAULT), Route::Default);
         // A reload drops what is no longer verified.
-        map.replace(vec![("x.example.org".into(), 9)]);
+        map.replace(vec![verified(
+            "x.example.org",
+            9,
+            DomainSettings::default(),
+        )]);
         assert_eq!(map.get("go.example.com"), None);
         assert_eq!(map.route(Some(b"go.example.com"), DEFAULT), Route::Default);
         // Many domains spread over the shards and are all found.
-        let many: Vec<(String, i64)> = (0..500).map(|i| (format!("d{i}.example.com"), i)).collect();
+        let many: Vec<VerifiedDomain> = (0..500)
+            .map(|i| verified(&format!("d{i}.example.com"), i, DomainSettings::default()))
+            .collect();
         map.replace(many.clone());
-        for (host, id) in many {
-            assert_eq!(map.get(&host), Some(id));
+        for d in many {
+            assert_eq!(map.get(&d.hostname).map(|s| s.id), Some(d.id));
         }
+    }
+
+    fn verified(hostname: &str, id: i64, settings: DomainSettings) -> VerifiedDomain {
+        VerifiedDomain {
+            hostname: hostname.into(),
+            id,
+            settings,
+        }
+    }
+
+    #[test]
+    fn patches_change_only_the_fields_they_name() {
+        let current = DomainSettings {
+            root_url: Some("https://a.example/".into()),
+            not_found_page: Some("nf".into()),
+            gone_page: Some("g".into()),
+            prefixes: vec!["p".into()],
+            case_insensitive: true,
+        };
+        let patch: UpdateDomain = serde_json::from_str(r#"{"root_url":null}"#).unwrap();
+        let s = patch.apply(&current);
+        assert_eq!(s.root_url, None);
+        assert_eq!(s.not_found_page.as_deref(), Some("nf"));
+        assert!(s.case_insensitive);
+        let patch: UpdateDomain = serde_json::from_str(
+            r#"{"not_found_page":"x","gone_page":null,"prefixes":[],"case_insensitive":false}"#,
+        )
+        .unwrap();
+        let s = patch.apply(&current);
+        assert_eq!(s.root_url.as_deref(), Some("https://a.example/"));
+        assert_eq!(s.not_found_page.as_deref(), Some("x"));
+        assert_eq!(
+            (s.gone_page, s.prefixes.len(), s.case_insensitive),
+            (None, 0, false)
+        );
+        assert_eq!(UpdateDomain::default().apply(&current), current);
+        assert!(serde_json::from_str::<UpdateDomain>(r#"{"x":1}"#).is_err());
+    }
+
+    #[test]
+    fn audit_state_shows_settings_once_set() {
+        let mut d = Domain {
+            id: 1,
+            hostname: "go.example.com".into(),
+            verification_token: "0".repeat(32),
+            created_by: "a".into(),
+            created_at: Utc::now(),
+            verified_at: None,
+            checked_at: None,
+            check_error: None,
+            tls: TlsState::default(),
+            settings: DomainSettings::default(),
+        };
+        assert!(domain_state(&d).get("settings").is_none());
+        d.settings.prefixes = vec!["p".into()];
+        assert_eq!(domain_state(&d)["settings"], json!({"prefixes": ["p"]}));
+        let view = serde_json::to_value(DomainView::from(&d)).unwrap();
+        assert_eq!(view["settings"]["prefixes"], json!(["p"]));
+        assert_eq!(view["settings"]["root_url"], Value::Null);
     }
 
     #[test]
@@ -1010,6 +1319,7 @@ mod tests {
             checked_at: None,
             check_error: Some("no TXT record found".into()),
             tls: TlsState::default(),
+            settings: DomainSettings::default(),
         };
         let v = serde_json::to_value(DomainView::from(&d)).unwrap();
         assert_eq!(v["verified"], false);

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::code::is_plausible_code;
 use crate::host::is_valid_hostname;
+use crate::site::DomainSettings;
 
 /// KV key for a link on the default domain. The value is the `model::Link`
 /// JSON.
@@ -78,6 +79,10 @@ impl std::fmt::Display for KvKey<'_> {
 pub struct EdgeDomain {
     /// The domain's ID at the origin.
     pub id: i64,
+    /// Its root redirect, pages, prefixes and case rule; left out when they
+    /// are the defaults.
+    #[serde(default, skip_serializing_if = "DomainSettings::is_default")]
+    pub settings: DomainSettings,
 }
 
 /// Most clicks in one batch sent from the edge.
@@ -175,8 +180,22 @@ mod tests {
 
     #[test]
     fn domain_records_ignore_fields_they_do_not_know() {
-        let d: EdgeDomain = serde_json::from_str(r#"{"id":7,"root_url":"https://x"}"#).unwrap();
-        assert_eq!(d, EdgeDomain { id: 7 });
+        let d: EdgeDomain = serde_json::from_str(r#"{"id":7,"later":"x"}"#).unwrap();
+        let plain = EdgeDomain {
+            id: 7,
+            settings: DomainSettings::default(),
+        };
+        assert_eq!(d, plain);
         assert_eq!(serde_json::to_string(&d).unwrap(), r#"{"id":7}"#);
+        let d = EdgeDomain {
+            id: 7,
+            settings: DomainSettings {
+                case_insensitive: true,
+                ..DomainSettings::default()
+            },
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, r#"{"id":7,"settings":{"case_insensitive":true}}"#);
+        assert_eq!(serde_json::from_str::<EdgeDomain>(&json).unwrap(), d);
     }
 }

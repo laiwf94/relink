@@ -20,6 +20,7 @@
 //! appends to the workspace's audit chain in the same transaction, as the
 //! [`Actor`] the `Tenant` was made for.
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -273,20 +274,28 @@ impl<'a> Tenant<'a> {
                     if let Err(q) = quota::admit_new_link(&mut tx, Utc::now().date_naive()).await? {
                         return Ok(Err(DbError::Quota(q)));
                     }
-                    let domain_id: Option<i64> = match &new.domain {
-                        None => None,
+                    let (domain_id, code): (Option<i64>, Cow<'_, str>) = match &new.domain {
+                        None => (None, Cow::Borrowed(&code)),
                         Some(host) => {
-                            // FOR KEY SHARE: the domain cannot be deleted
-                            // before this link commits.
-                            let id = sqlx::query_scalar(
-                                "SELECT id FROM domains WHERE hostname = $1 \
+                            // FOR KEY SHARE: the domain cannot be deleted,
+                            // nor its case rule changed, before this link
+                            // commits.
+                            let row: Option<(i64, bool)> = sqlx::query_as(
+                                "SELECT id, COALESCE((settings->>'case_insensitive')::boolean, \
+                                 false) FROM domains WHERE hostname = $1 \
                                  AND verified_at IS NOT NULL FOR KEY SHARE",
                             )
                             .bind(host)
                             .fetch_optional(&mut *tx)
                             .await?;
-                            match id {
-                                Some(id) => Some(id),
+                            match row {
+                                // A case-insensitive domain stores its
+                                // codes in lowercase, the form visitors'
+                                // paths are folded to.
+                                Some((id, true)) => {
+                                    (Some(id), Cow::Owned(code.to_ascii_lowercase()))
+                                }
+                                Some((id, false)) => (Some(id), Cow::Borrowed(&code)),
                                 None => {
                                     return Ok(Err(DbError::Invalid(format!(
                                         "domain: {host} is not a verified domain of this workspace"
@@ -303,7 +312,7 @@ impl<'a> Tenant<'a> {
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING ",
                         api_columns!()
                     ))
-                    .bind(&code)
+                    .bind(&*code)
                     .bind(&new.owner)
                     .bind(Json(&new.destinations))
                     .bind(new.redirect_status as i16)

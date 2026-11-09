@@ -2,18 +2,25 @@
 //! `relink_core::rules::evaluate`, shared with the edge worker; this module
 //! adds what only the origin has: routing by `Host` to a custom domain
 //! (src/domains.rs), the cache, the click limiter and the click queue.
+//!
+//! On a custom domain the path is read by `relink_core::site::target`, as
+//! at the edge: `/` is the domain's root redirect, `/{prefix}/{code}` a
+//! code behind one of its prefixes, and codes are lowercased on a
+//! case-insensitive domain. Its own 404 and 410 pages replace the built-in
+//! ones. On the default domain nothing changes: `/` and two-segment paths
+//! are unknown API paths, as before.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
+use crate::api::ApiError;
 use crate::classify::{UNKNOWN_COUNTRY, country, device_class, referrer_host};
 use crate::clicks::{ClickEvent, fingerprint};
-use crate::code::is_plausible_code;
 use crate::domains::Route;
 use crate::limiter::Admit;
 use crate::metrics::Outcome;
@@ -23,15 +30,21 @@ use crate::rules::{Decision, Settings, Visit, evaluate};
 use crate::server::App;
 use crate::store::link_key;
 use crate::util::{fast_random, now_ms, utc_day};
+use relink_core::site::{
+    DomainSettings, EXPIRED_TEXT, HTML, PAGE_CSP, PageKind, Target, page, target,
+};
 
 pub async fn redirect(
     State(app): State<Arc<App>>,
-    Path(code): Path<String>,
+    uri: Uri,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     let start = Instant::now();
-    let (response, outcome) = handle(&app, &code, &headers, peer.ip()).await;
+    // The path as sent, still percent-encoded, as the edge sees it: codes
+    // are plain ASCII, so an encoded path never names one.
+    let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
+    let (response, outcome) = handle(&app, path, &headers, peer.ip()).await;
     app.metrics.redirect_latency.observe(start.elapsed());
     app.metrics.outcome(outcome);
     response
@@ -71,35 +84,113 @@ pub fn visitor_country(app: &App, headers: &HeaderMap, peer: IpAddr) -> Option<[
     country(headers.get(name).map(HeaderValue::as_bytes))
 }
 
-/// Evaluates a request. Separate from the handler so tests and benchmarks
-/// can call it without a socket.
+/// The public router's fallback: a GET or HEAD is read as a redirect path
+/// (so a custom domain answers it as the edge would), anything else is an
+/// unknown path.
+pub async fn fallback(
+    State(app): State<Arc<App>>,
+    method: Method,
+    uri: Uri,
+    connect: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ConnectInfo(peer) = connect;
+    let host = request_host(&app, &headers, peer.ip());
+    // Only a custom domain gives these paths a meaning; elsewhere they are
+    // not counted as redirects.
+    let custom = !matches!(
+        app.domains.route(host, &app.cfg.default_host),
+        Route::Default
+    );
+    if custom && (method == Method::GET || method == Method::HEAD) {
+        redirect(State(app), uri, connect, headers).await
+    } else {
+        ApiError::not_found().into_response()
+    }
+}
+
+/// A 404 or 410 page: a custom domain's own when it has one. `site` is the
+/// request's host header and the domain's settings.
+fn error_page(
+    kind: PageKind,
+    site: Option<(Option<&[u8]>, &DomainSettings)>,
+    path: &str,
+    gone_text: &str,
+) -> (Response, Outcome) {
+    let outcome = match kind {
+        PageKind::NotFound => Outcome::NotFound,
+        PageKind::Gone => Outcome::Gone,
+    };
+    // The domain's lowercase hostname, worked out only for a page.
+    let (host, settings) = match site {
+        Some((h, s)) => (
+            h.and_then(relink_core::host::host_part)
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default(),
+            Some(s),
+        ),
+        None => (String::new(), None),
+    };
+    let p = page(kind, settings, &host, path, gone_text);
+    let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::NOT_FOUND);
+    let mut resp = (status, p.body).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(p.content_type),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if p.content_type == HTML {
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(PAGE_CSP),
+        );
+        h.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+    }
+    (resp, outcome)
+}
+
+/// Evaluates a request for `path` (without the leading `/`, as sent).
+/// Separate from the handler so tests and benchmarks can call it without
+/// a socket.
 pub async fn handle(
     app: &App,
-    code: &str,
+    path: &str,
     headers: &HeaderMap,
     peer: IpAddr,
 ) -> (Response, Outcome) {
-    if !is_plausible_code(code) {
-        return (
-            plain(StatusCode::NOT_FOUND, "not found\n"),
-            Outcome::NotFound,
-        );
-    }
-    let route = app
-        .domains
-        .route(request_host(app, headers, peer), &app.cfg.default_host);
-    let key = match route {
+    let host_header = request_host(app, headers, peer);
+    let route = app.domains.route(host_header, &app.cfg.default_host);
+    let site = match &route {
         Route::Default => None,
-        Route::Domain(id) => Some(link_key(Some(id), code)),
+        Route::Domain(site) => Some(site),
         Route::Unavailable => return (unavailable(), Outcome::Unavailable),
     };
-    let link = match app.resolver.resolve(key.as_deref().unwrap_or(code)).await {
+    let pages = site.map(|s| (host_header, &s.settings));
+    let code = match (target(path, site.map(|s| &s.settings)), site) {
+        (Target::Code(code), _) => code,
+        (Target::Root, Some(s)) => match &s.settings.root_url {
+            Some(url) => return (location(302, url, None, None), Outcome::Root),
+            None => return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT),
+        },
+        (Target::Miss, Some(_)) => {
+            return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
+        }
+        // The default domain: `/` and paths with a `/` were never
+        // redirects, and are answered as unknown paths, as before.
+        (_, None) if path.is_empty() || path.contains('/') => {
+            return (ApiError::not_found().into_response(), Outcome::NotFound);
+        }
+        (_, None) => return error_page(PageKind::NotFound, None, path, EXPIRED_TEXT),
+    };
+    let key = site.map(|s| link_key(Some(s.id), &code));
+    let link = match app.resolver.resolve(key.as_deref().unwrap_or(&code)).await {
         Resolved::Found(link) => link,
         Resolved::NotFound => {
-            return (
-                plain(StatusCode::NOT_FOUND, "not found\n"),
-                Outcome::NotFound,
-            );
+            return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
         }
         Resolved::Unavailable => return (unavailable(), Outcome::Unavailable),
     };
@@ -121,17 +212,9 @@ pub async fn handle(
     };
     let redirect = match evaluate(&link, &visit, &settings) {
         Decision::NotFound => {
-            return (
-                plain(StatusCode::NOT_FOUND, "not found\n"),
-                Outcome::NotFound,
-            );
+            return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
         }
-        Decision::Expired => {
-            return (
-                plain(StatusCode::GONE, "this link has expired\n"),
-                Outcome::Gone,
-            );
-        }
+        Decision::Expired => return error_page(PageKind::Gone, pages, path, EXPIRED_TEXT),
         Decision::GeoBlocked {
             fallback: Some(url),
         } => return (location(302, url, None, None), Outcome::GeoBlocked),
@@ -150,10 +233,7 @@ pub async fn handle(
         match app.limiter.admit(link.id).await {
             Admit::Yes => {}
             Admit::LimitReached => {
-                return (
-                    plain(StatusCode::GONE, "this link has reached its click limit\n"),
-                    Outcome::Gone,
-                );
+                return error_page(PageKind::Gone, pages, path, LIMIT_TEXT);
             }
             Admit::Unavailable => return (unavailable(), Outcome::Unavailable),
         }
@@ -174,6 +254,9 @@ pub async fn handle(
         outcome,
     )
 }
+
+/// Text of the built-in 410 page for a link at its click limit.
+pub const LIMIT_TEXT: &str = "this link has reached its click limit\n";
 
 /// A redirect response. Without a `Cache-Control` value it is `no-store`.
 fn location(

@@ -483,6 +483,46 @@ always the default domain.
 The edge serves custom domains too, keyed by host and code; see "Custom
 domains at the edge".
 
+### Per-domain settings
+
+Each domain has settings (`relink_core::site`, migration 0015, a `jsonb`
+column), changed with `PATCH /v1/domains/{hostname}` by an admin or owner
+and audited as `domain.update` with the settings before and after:
+
+| Setting | Effect |
+|---|---|
+| `root_url` | `/` redirects there (302, `no-store`); validated like a destination |
+| `not_found_page` | HTML served with 404 for unknown codes, disabled links and paths that cannot be a code here |
+| `gone_page` | HTML served with 410 for expired links and links at their click limit |
+| `prefixes` | up to 8 lowercase segments accepted in front of a code: `/campaign/abc` is `abc` |
+| `case_insensitive` | `/ABC` is `abc`; codes created on the domain are stored lowercase |
+
+The decisions are functions in `relink_core::site`, called by the origin
+and the Worker alike. `target(path, settings)` reads the path as sent,
+still percent-encoded (codes are plain ASCII, so an encoded path never
+names one): empty is the root, one segment is a code, two segments are a
+code behind one of the domain's prefixes, and anything else is a miss.
+`page(kind, ...)` picks the domain's page or the built-in plain text and
+fills in `{{code}}` and `{{host}}`, HTML-escaped. A domain's page is the
+workspace's HTML on the workspace's own hostname, but it is served with a
+`Content-Security-Policy` that allows no scripts, forms or framing (only
+images, styles and fonts), and `nosniff`. Prefixes may not be reserved
+words, so `/v1/links` on a custom domain is still the API. The default
+domain has no settings and is answered exactly as before: `/` and paths
+with a `/` are unknown paths there, with the API's JSON 404.
+
+Case-insensitivity is only sound if no stored code on the domain has an
+uppercase letter, so turning it on is refused while one does
+(`failed_precondition`, naming a code). The check runs under `FOR UPDATE`
+on the domain row; a link being created holds `FOR KEY SHARE` on it until
+it commits, so the two serialise, and a link created afterwards reads the
+new rule and stores its code in lowercase (a generated code too, which
+then retries on collision like any other).
+
+Settings travel with the domain: in the in-memory map every instance
+routes by (reloaded on the same change notification as verification), and
+inside the domain's `host:` record at the edge.
+
 ### Certificates
 
 With `RELINK_ACME_DIRECTORY` set, relink gets a certificate for every
@@ -769,7 +809,7 @@ KV holds three kinds of record (`relink_core::wire`):
 |---|---|---|
 | `link:<code>` | the link | the link exists on the default domain |
 | `link:<host>/<code>` | the link | the link exists on the verified domain `<host>` |
-| `host:<host>` | `{"id": <domain id>}` | `<host>` is a verified domain |
+| `host:<host>` | `{"id": <domain id>, "settings": {...}}` (settings left out while they are the defaults) | `<host>` is a verified domain |
 
 Hostnames and codes never contain `/`, so no two records share a key, and
 only canonical keys parse (`KvKey::parse`): lowercase hostnames the
@@ -787,6 +827,15 @@ requested on `DEFAULT_HOST`; only default-domain links requested on other
 hostnames cost three. The record for the host is read only on a miss
 because a hit already proves the domain is verified: domain links are
 published only while their domain is.
+
+A domain's settings are in its record. `/` and paths that are not a plain
+code read the record first (one read), then the link they name (a second):
+`/campaign/abc`, or `/ABC` on a case-insensitive domain. The root redirect
+and the domain's 404 page for paths that cannot be a code are answered at
+the edge from the record alone. A link found by the one-read path reads
+the record only if it needs the domain's 404 or 410 page. Codes the domain
+may have but KV does not still go to the origin, which answers with the
+same page.
 
 A Worker cannot set `Host` on a fetch, so when it forwards to the origin
 it names the visitor's host in `x-forwarded-host`. The origin routes by the

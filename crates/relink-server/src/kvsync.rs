@@ -486,15 +486,20 @@ impl KvSync {
 
     /// A domain's `host:` record and custom hostname.
     async fn sync_host(&self, key: &str, host: &str) -> Result<(), KvError> {
-        match self.domain_id(host).await? {
-            Some(id) => {
+        let domain = self
+            .db
+            .verified_domain(host)
+            .await
+            .map_err(|e| KvError(format!("reading domain {host}: {e}")))?;
+        match domain {
+            Some((id, settings)) => {
                 if let Some(h) = &self.hostnames
                     && h.ensure(host).await?
                 {
                     self.metrics.edge_hostnames_added.inc();
                     tracing::info!(%host, "registered custom hostname");
                 }
-                let json = serde_json::to_string(&EdgeDomain { id })
+                let json = serde_json::to_string(&EdgeDomain { id, settings })
                     .map_err(|e| KvError(format!("encoding {key}: {e}")))?;
                 self.write(key, Some(json)).await
             }
@@ -558,7 +563,8 @@ impl KvSync {
             Some(h) => Some(h.list().await?.into_iter().collect()),
             None => None,
         };
-        for (host, _) in verified {
+        for d in verified {
+            let host = d.hostname;
             let key = host_kv_key(&host);
             let in_zone = registered.as_ref().is_none_or(|r| r.contains(&host));
             if !in_kv.remove(&key) || !in_zone {
