@@ -22,5 +22,6 @@ worker = "=0.8.7"
 [dev-dependencies]
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { workspace = true }
+proptest = { workspace = true }
 relink-server = { path = "../relink-server" }
 tokio = { version = "=1.53.3", features = ["rt", "macros"] }

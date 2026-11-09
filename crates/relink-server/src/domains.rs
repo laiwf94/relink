@@ -81,8 +81,16 @@ pub use relink_core::host::{MAX_HOSTNAME, host_part, is_valid_hostname};
 /// hyphens, and not be `default_host`.
 pub fn parse_hostname(raw: &str, default_host: &str) -> Result<String, String> {
     let raw = raw.trim();
+    // One final dot, as a `Host` header may carry (see `host_part`), and no
+    // more: `2x.0x..` would get past the URL parser's check that a name
+    // does not end in a number and be stored as `2x.0x`, which that check
+    // refuses.
+    let raw = raw.strip_suffix('.').unwrap_or(raw);
     if raw.is_empty() {
         return Err("hostname is required".into());
+    }
+    if raw.ends_with('.') {
+        return Err("hostname must not end in more than one dot".into());
     }
     if raw.len() > 4 * MAX_HOSTNAME
         || raw
@@ -1057,6 +1065,16 @@ mod tests {
         assert_eq!(ok(&format!("{label}.com")), format!("{label}.com"));
         let err = |raw: &str| parse_hostname(raw, DEFAULT).unwrap_err();
         assert!(err("").contains("required"));
+        assert!(err(" . ").contains("required"));
+        for raw in ["go.example.com..", "2X.0X..", "a.b..."] {
+            assert!(
+                err(raw).contains("more than one dot"),
+                "{raw}: {}",
+                err(raw)
+            );
+        }
+        // Accepted only in a form that is accepted again unchanged.
+        assert!(err("2x.0x").contains("hostname"));
         for raw in [
             "https://go.example.com",
             "go.example.com/x",

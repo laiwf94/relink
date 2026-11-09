@@ -15,6 +15,9 @@ url = "=2.5.8"
 [dependencies.relink-core]
 path = "../crates/relink-core"
 
+[dependencies.relink-edge]
+path = "../crates/relink-edge"
+
 [dependencies.relink-server]
 path = "../crates/relink-server"
 
@@ -53,6 +56,13 @@ bench = false
 [[bin]]
 name = "id_token"
 path = "fuzz_targets/id_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host"
+path = "fuzz_targets/host.rs"
 test = false
 doc = false
 bench = false

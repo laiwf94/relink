@@ -14,7 +14,9 @@ use worker::{
     Response, Result, console_warn, event, js_sys, wasm_bindgen::JsValue,
 };
 
-use crate::logic::{self, ClickBatcher, EdgeError, EdgeRequest, EdgeResponse, Kv, Origin, Push};
+use crate::logic::{
+    self, ClickBatcher, EdgeError, EdgeRequest, EdgeResponse, Kv, Origin, Push, forwarded_host,
+};
 
 /// Clicks per batch, and the longest a click waits in an idle isolate.
 const BATCH_MAX: usize = 50;
@@ -79,10 +81,8 @@ impl Origin for WorkerOrigin {
         // Workers cannot set `Host` on a fetch, so the custom domain the
         // visitor asked for travels in `x-forwarded-host`, which the origin
         // believes from its trusted proxies only.
-        if let Some(h) = &req.host {
-            headers
-                .set("x-forwarded-host", &String::from_utf8_lossy(h))
-                .map_err(err)?;
+        if let Some(h) = forwarded_host(req) {
+            headers.set("x-forwarded-host", &h).map_err(err)?;
         }
         if let Some(c) = req.country {
             headers

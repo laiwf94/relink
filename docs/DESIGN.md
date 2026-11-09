@@ -841,7 +841,31 @@ A Worker cannot set `Host` on a fetch, so when it forwards to the origin
 it names the visitor's host in `x-forwarded-host`. The origin routes by the
 first value of that header when the peer is in `RELINK_TRUSTED_PROXIES`,
 and by `Host` otherwise. A visitor gains nothing by sending it: `Host` is
-theirs to choose anyway.
+theirs to choose anyway. The Worker forwards the host part it routed by
+itself (`relink_core::host::host_part`: no port, no final dot), not the
+raw header, and nothing when there is none. Forwarding the raw value let a
+`Host` of `a.example.com,b.example.com`, which the edge reads as the
+default domain, reach the origin as `a.example.com`; the property test
+below found it.
+
+`crates/relink-edge/tests/domains.rs` checks that the two agree on every
+domain decision. Each case generates verified domains with random settings
+(root redirect, pages, prefixes, case rule) and links on them and on the
+default domain (live, expired, disabled, click-limited), loads them into
+an origin `App` and into the KV records the sync would publish, and sends
+random `Host` values (any case, ports, final dots, IP literals, unknown,
+listed and malformed hosts) and paths (prefixes, mixed case,
+percent-encoding, junk) to both: to the origin directly, and to the edge,
+which forwards what it cannot answer to that same origin from a trusted
+address. Status, `Location`, content type, security headers and body must
+be equal. The one allowed difference is the default domain's `/` and
+multi-segment paths, which the origin answers as unknown API paths and the
+edge, which serves no API, with its plain 404. A second test pins the
+cases the edge must answer itself, so the property cannot pass by
+forwarding everything. The `host` fuzz target feeds arbitrary bytes to the
+`Host` reader, the forwarded value, the origin's routing, hostname
+validation for new domains and path reading on a custom domain, and checks
+that they agree.
 
 With `RELINK_KV_ZONE_ID` set, the sync also manages the zone's custom
 hostnames (Cloudflare for SaaS), which is what routes a domain's traffic to

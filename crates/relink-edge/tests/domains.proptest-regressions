@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0ed5150d15e5f63d12798849b0e1b0985036b3dca84703b6ff222a17b37fe37a # shrinks to world = World { domains: [], links: [] }, requests = [(None, "campaign/abc")]
+cc d0031f62fd9858067f56010234fc8836400e15a9664d1467dee60d7df4a5d856 # shrinks to world = World { domains: [VerifiedDomain { hostname: "go.example.com", id: 100, settings: DomainSettings { root_url: None, not_found_page: None, gone_page: None, prefixes: [], case_insensitive: false } }, VerifiedDomain { hostname: "links.example.org", id: 101, settings: DomainSettings { root_url: None, not_found_page: Some("<h1>{{code}} is not on {{host}}</h1>"), gone_page: None, prefixes: [], case_insensitive: false } }], links: [] }, requests = [(Some("links.example.org,go.example.com"), "abc")]

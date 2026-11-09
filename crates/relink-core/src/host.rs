@@ -37,8 +37,10 @@ pub fn could_be_domain(host: &str) -> bool {
 
 /// The host part of a `Host` header value: without the port and the final
 /// dot, case preserved. `None` for an IP literal in brackets, a malformed
-/// port, or anything that cannot be a hostname; those requests can only be
-/// for the default domain.
+/// port, more than one final dot, or anything that cannot be a hostname;
+/// those requests can only be for the default domain. Reading its own
+/// output gives the same host, so the edge can forward it to the origin
+/// and both route the request alike.
 pub fn host_part(raw: &[u8]) -> Option<&str> {
     if raw.is_empty() || raw.len() > MAX_HOSTNAME + 7 || raw[0] == b'[' {
         return None;
@@ -55,6 +57,7 @@ pub fn host_part(raw: &[u8]) -> Option<&str> {
     };
     let host = host.strip_suffix('.').unwrap_or(host);
     let ok = !host.is_empty()
+        && !host.ends_with('.')
         && host.len() <= MAX_HOSTNAME
         && host
             .bytes()
@@ -87,6 +90,14 @@ mod tests {
         assert_eq!(host_part(b"go.example.com:8x"), None);
         assert_eq!(host_part(b""), None);
         assert_eq!(host_part(b"."), None);
+        // Read again, `go.example.com.` would lose another dot and become
+        // a domain the first reading never was.
+        assert_eq!(host_part(b"go.example.com.."), None);
+        assert_eq!(host_part(b"go.example.com..:443"), None);
+        for raw in ["Go.Example.com.:8443", "a.b", "localhost.", "x-y.z:1"] {
+            let h = host_part(raw.as_bytes()).unwrap();
+            assert_eq!(host_part(h.as_bytes()), Some(h), "{raw}");
+        }
         assert_eq!(host_part(b"a b"), None);
         assert_eq!(host_part(&[0xff, b'a']), None);
         assert_eq!(host_part("x".repeat(300).as_bytes()), None);

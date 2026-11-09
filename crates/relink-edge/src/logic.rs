@@ -27,7 +27,7 @@ use std::net::IpAddr;
 use relink_core::classify::{UNKNOWN_COUNTRY, device_class, referrer_host};
 use relink_core::code::is_plausible_code;
 use relink_core::hex;
-use relink_core::host::custom_host;
+use relink_core::host::{custom_host, host_part};
 use relink_core::model::Link;
 use relink_core::rules::{Decision, Settings, Visit, evaluate};
 use relink_core::site::{
@@ -94,6 +94,19 @@ impl EdgeResponse {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// The `x-forwarded-host` the origin is told for `req`. Workers cannot set
+/// `Host` on a fetch, so this is how the origin learns which domain a
+/// forwarded request is for. It is the host part the edge itself routed by
+/// (`relink_core::host::host_part`), never the raw header: the origin reads
+/// the first entry of a comma-separated `x-forwarded-host`, so forwarding
+/// `a.example.com,b.example.com` (which the edge treats as the default
+/// domain) would have the origin answer for `a.example.com` instead. With
+/// no host part the header is left out and the origin, seeing its own
+/// `Host`, routes to the default domain, as the edge did.
+pub fn forwarded_host(req: &EdgeRequest) -> Option<String> {
+    req.host.as_deref().and_then(host_part).map(str::to_owned)
 }
 
 /// Where the answer came from.
@@ -848,6 +861,28 @@ mod tests {
             assert_eq!(*kv.reads.borrow(), ["link:promo"], "{host:?}");
         }
         assert_eq!(origin.calls.get(), 0);
+    }
+
+    #[test]
+    fn the_origin_is_told_only_the_host_the_edge_routed_by() {
+        let fwd = |h: &str| forwarded_host(&on(h, "abc"));
+        assert_eq!(
+            fwd("Go.Example.com.:443").as_deref(),
+            Some("Go.Example.com")
+        );
+        assert_eq!(fwd("localhost").as_deref(), Some("localhost"));
+        // A list, which the origin would read as its first entry, a space
+        // or an IP literal: the edge routed these to the default domain,
+        // so the origin is told nothing and routes by its own `Host`.
+        for h in [
+            "a.example.com,b.example.com",
+            "a.example.com b",
+            "[::1]:80",
+            "",
+        ] {
+            assert_eq!(fwd(h), None, "{h:?}");
+        }
+        assert_eq!(forwarded_host(&req("abc")), None);
     }
 
     #[test]
