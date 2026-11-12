@@ -23,6 +23,7 @@ use relink_server::metrics::Metrics;
 use relink_server::model::{Destination, Link};
 use relink_server::redirect::handle;
 use relink_server::resolver::LinkSource;
+use relink_server::rules_v2::{self, Rule};
 use relink_server::server::{App, public_router};
 use relink_server::store::{Db, DbConfig, DbError};
 use relink_server::util::BoxFuture;
@@ -197,6 +198,61 @@ fn components(c: &mut Criterion) {
             r = r.wrapping_add(0x9e37_79b9_7f4a_7c15);
             choose(&w, |_| true, r)
         })
+    });
+
+    rules(c);
+}
+
+/// Targeting rules: a typical one-leaf list, and the worst case the bound
+/// allows, where every one of 64 leaves is tested and each User-Agent,
+/// Accept-Language, Referer and query fact is read.
+fn rules(c: &mut Criterion) {
+    let compile = |json: &str| {
+        let list: Vec<Rule> = serde_json::from_str(json).expect("rules parse");
+        rules_v2::compile(&list, Policy::default()).expect("rules compile")
+    };
+    let req = rules_v2::Request {
+        now_ms: 1_794_832_200_000,
+        country: Some(*b"US"),
+        region: Some(b"CA"),
+        user_agent: Some(UA.as_bytes()),
+        accept_language: Some(b"en-US,en;q=0.9,de;q=0.8"),
+        referer: Some(b"https://news.example.org/story?id=1"),
+        query: Some(b"utm_source=newsletter&utm_medium=email&id=42"),
+    };
+    let one = compile(r#"[{"if": {"country": ["DE", "US"]}, "url": "https://a.example.com/"}]"#);
+    c.bench_function("rules_v2_one_country_leaf", |b| {
+        b.iter(|| one.evaluate(&req))
+    });
+
+    // Eight rules of eight leaves; the last leaf of each of the first seven
+    // fails, so all 64 are tested before the eighth rule matches.
+    let leaves = [
+        r#"{"country": ["US"]}"#,
+        r#"{"region": ["US-CA"]}"#,
+        r#"{"device": ["mobile"]}"#,
+        r#"{"os": ["ios"]}"#,
+        r#"{"language": ["en"]}"#,
+        r#"{"referrer": ["example.org"]}"#,
+        r#"{"time": {"days": ["mon"], "hours": ["09:00", "17:00"]}}"#,
+    ];
+    let mut list = Vec::new();
+    for r in 0..8 {
+        let last = if r < 7 {
+            r#"{"query": {"name": "utm_source", "values": ["ads"]}}"#
+        } else {
+            r#"{"query": {"name": "utm_source", "values": ["newsletter"]}}"#
+        };
+        let all = leaves.iter().copied().chain([last]).collect::<Vec<_>>();
+        list.push(format!(
+            r#"{{"if": {{"all": [{}]}}, "url": "https://r{r}.example.com/"}}"#,
+            all.join(",")
+        ));
+    }
+    let worst = compile(&format!("[{}]", list.join(",")));
+    assert_eq!(worst.evaluate_counted(&req), (Some(7), 64));
+    c.bench_function("rules_v2_64_conditions_worst_case", |b| {
+        b.iter(|| worst.evaluate(&req))
     });
 }
 

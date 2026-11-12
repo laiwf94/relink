@@ -11,6 +11,7 @@ pub mod host;
 pub mod model;
 pub mod netguard;
 pub mod rules;
+pub mod rules_v2;
 pub mod site;
 pub mod visitor;
 pub mod wire;

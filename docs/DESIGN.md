@@ -765,6 +765,29 @@ others, and, if the listener is down, until the entry is next used after its
 30 s TTL plus one refresh round trip. If the database is also down, cached
 entries are served as they were, by design, for up to a day.
 
+### Targeting rules
+
+`relink-core/src/rules_v2.rs` holds the rules engine both targets will run:
+an ordered list of `{"if": condition, "url": ...}` where conditions combine
+`all`, `any` and `not` over country, ISO 3166-2 region, device, OS, browser,
+preferred language, referrer host, a time window (instants, weekdays and
+hours at a UTC offset) and query parameters. The first rule that holds picks
+the destination; none falls through to the link's own destinations.
+
+`compile` validates a list and flattens it into a decision list: one step
+per leaf, each with a jump for true and one for false, so `all`, `any` and
+`not` become jumps (`not` swaps them) and evaluation short-circuits like the
+tree without a stack. Every jump goes forward, and a list holds at most 64
+leaves over all its rules, so no visit tests more than 64. Each test is
+bounded too: country lists are binary-searched, User-Agent and
+Accept-Language reads stop at 512 bytes, and query strings at 64 parameters
+within 2,048 bytes (a parameter crossing the limit is dropped, never seen
+cut short). Facts are gathered once per visit and only those some leaf
+reads, so a country-only list never classifies the User-Agent. On the
+benchmark machine a one-leaf list takes about 26 ns and the worst case, 64
+leaves all tested and every fact read, about 0.8 µs
+(`cargo bench --bench hot_path -- rules_v2`).
+
 ## Click limits without a write per click
 
 This is escrow (O'Neil, "The Escrow Transactional Method"). Each instance
@@ -1137,6 +1160,7 @@ and counts the clicks it could not write.
 | Destination URL | 2048 characters, before and after normalisation |
 | Destinations per link | 10, weights 1 to 1000 |
 | Countries per geo rule | 300 |
+| Targeting rules | 32 rules and 64 leaf conditions per link, nested 8 deep, 300 values per leaf; queries read up to 64 parameters within 2,048 bytes |
 | Alias | 3 to 64 of `[A-Za-z0-9_-]`, alphanumeric at both ends |
 | Generated code | 7 base62 characters by default (4 to 32); collisions retried 5 times |
 | `max_clicks` | 1 to 10¹² |
