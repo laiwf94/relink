@@ -95,6 +95,13 @@ jobs:
           tool: cargo-audit
       - name: Audit
         run: cargo audit
+      # .cargo/audit.toml ignores an advisory for libsqlite3-sys, which is in
+      # Cargo.lock only through sqlx's weak features (#78). Fail if it is
+      # ever actually built.
+      - name: SQLite stays out of the build
+        run: |
+          used=$(cargo tree --workspace --target all -e normal,build,dev -i libsqlite3-sys 2>/dev/null)
+          if [ -n "$used" ]; then echo "$used"; exit 1; fi
 
   docker:
     runs-on: ubuntu-latest

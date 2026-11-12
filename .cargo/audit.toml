@@ -1,0 +1,14 @@
+# cargo audit reads Cargo.lock as written. Cargo writes optional packages
+# reached through weak (`?`) features into the lockfile even when they are
+# off (rust-lang/cargo#10801), so sqlx's SQLite driver is listed although
+# relink never builds it. CI's supply-chain job checks that it stays out of
+# the build graph, and cargo deny, which walks that graph, still checks
+# every advisory.
+
+[advisories]
+ignore = [
+    # libsqlite3-sys 0.37 (C SQLite CVE-2026-119375): only in Cargo.lock,
+    # through sqlx 0.9.0, whose sqlx-sqlite needs libsqlite3-sys < 0.38.
+    # Remove once a sqlx release allows >= 0.39 (#78).
+    "RUSTSEC-2026-0459",
+]
