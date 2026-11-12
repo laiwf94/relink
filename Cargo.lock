@@ -1654,6 +1654,7 @@ dependencies = [
  "hmac",
  "proptest",
  "relink-core",
+ "relink-edge",
  "reqwest",
  "ring",
  "rustls",

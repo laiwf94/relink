@@ -635,6 +635,45 @@ with the peer's address, so trusted proxies, rate limits and click
 counting work the same on both. On shutdown the listener closes with the
 others and its requests drain within the same budget.
 
+### A custom domain, start to finish
+
+The domain pieces meet in this order for each branded domain:
+
+1. **Added.** An admin or owner adds the hostname (`POST /v1/domains`).
+   It is checked and stored with a verification token, unverified, and
+   counted against the plan's domain limit under the workspace row lock.
+   An unverified domain routes nothing and is published nowhere.
+2. **Proved.** `POST /v1/domains/{hostname}/verify` asks the configured
+   resolvers for `_relink-challenge.<hostname>` TXT. Once the token is
+   there, the first workspace to prove the hostname gets it, and the
+   `domains` notification puts it in every instance's domain map: from then
+   on `Host` (or `x-forwarded-host` from a trusted proxy) routes codes on
+   that domain only.
+3. **Certified.** Verifying wakes the ACME worker. One instance claims the
+   domain, orders the certificate, and any instance answers the CA's
+   HTTP-01 request. The sealed key and chain are stored, the
+   `certificates` notification makes every TLS listener serve them by SNI,
+   and the domain is due again at two thirds of the certificate's
+   lifetime.
+4. **Shaped.** `PATCH /v1/domains/{hostname}` sets the root redirect, the
+   404 and 410 pages, prefixes and case folding. `relink_core::site`
+   decides what a path means, the same code at the origin and in the
+   Worker.
+5. **Published.** The outbox queues `host:<hostname>` with the settings and
+   `link:<hostname>/<code>` for each link. The KV sync registers the
+   custom hostname in the zone before writing the domain record, so the
+   edge never routes a host its zone does not serve.
+6. **Removed.** A domain with links cannot be deleted. Deleting an empty
+   one drops it from the domain maps and the certificate store, deletes its
+   KV record and then its custom hostname. Its hostname is the default
+   domain again. Every step but the certificate is audited.
+
+`tests/custom_domains.rs` drives all six through the HTTP API, the binary,
+real TLS connections and the edge's request logic in front of the origin.
+Step 6 of `examples/demo.sh` shows steps 1, 2 and 4 from the command line,
+with a one-record DNS server (`examples/txt-dns.py`) standing in for the
+domain's zone.
+
 ### A management request, start to finish
 
 The pieces above meet on every management request, in this order:

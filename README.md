@@ -13,6 +13,13 @@ overlap. Each workspace is on a plan that limits its links and monthly
 clicks, and every change is written to a hash-chained audit log that
 `relink audit-verify` checks.
 
+Links can live on a workspace's own branded domains. A domain is proved
+with a DNS TXT record, keeps its own codes, gets its certificate from
+relink's own ACME client (renewed and swapped in without a restart, served
+by rustls with SNI), and has its own root redirect, 404 and 410 pages,
+path prefixes and optionally case-free codes, decided the same way at the
+origin and at the edge.
+
 ```console
 $ curl -s localhost:8080/v1/links -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
     -d '{"alias":"pricing","destinations":[{"url":"https://example.com/a","weight":3},
@@ -62,7 +69,7 @@ $ docker run -d --name pg -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16-alpin
 $ export RELINK_DATABASE_URL=postgres://postgres:pg@localhost:5432/postgres
 $ cargo run --release -p relink-server -- create-key alice   # prints id=1 owner=alice ... key=rlk_...
 $ cargo run --release -p relink-server                       # :8080, metrics on 127.0.0.1:9090
-$ ./examples/demo.sh          # the tour: links, workspaces, keys, a plan, the audit chain, then Postgres stopped mid-way
+$ ./examples/demo.sh          # the tour: links, workspaces, keys, a plan, the audit chain, a custom domain, then Postgres stopped mid-way
 $ ./examples/edge-local.sh    # the Worker under wrangler dev, in front of a local origin
 ```
 
@@ -256,6 +263,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 | Quotas | Against real Postgres: 20 concurrent creations racing for a workspace's last 3 link slots create exactly 3 (and 4 or 5 without the row lock); clicks are metered into the month of their own day and equal the statistics month by month; at the click allowance creation is refused while redirects continue; tenants cannot change their plan or read another workspace's usage; plan moves are audited. |
 | Invitations | Against real Postgres over HTTP: only the person invited joins (a verified address, or the member name); an unverified address, another person or an API key is refused; 20 concurrent acceptances of one link make one member; revoked, expired and used links are refused; admins cannot invite or revoke above their own role; 5 requests racing for the last 2 of 100 pending slots create exactly 2; tenants see only their own invitations and cannot delete any; each step is in the audit chain, which still verifies, and tokens are in neither the log nor the chain. |
 | Workspaces end to end | One test walks week 1 as a team would: three people sign in through a fake OpenID Connect provider; the owner invites one by email as an editor and one by member name as a viewer, and each accepts only their own link, once; the editor creates links in the team workspace, the viewer only reads, and a stranger is refused; scoped, rotated and expiring keys are made with the binary; a plan's link and click limits refuse new links while redirects continue; the tenant role sees no rows in any tenant table without a workspace; every change is attributed in the team's audit chain, which the binary verifies with and without an anchor; signing out ends the session. |
+| Custom domains end to end | One test walks week 2 as a customer would, on two instances: a workspace on a one-domain plan adds a domain and a second is refused; the domain verifies only once its TXT record is published (a local resolver), and nothing reaches the edge before; `promo` on the domain and `promo` on the default domain are two links and a third is refused; the ACME client gets a certificate from a local CA, both instances serve it by SNI to a client that checks it, and a renewal is served by both without a restart; the domain's root redirect, path prefix, case-free codes and its 404 and 410 pages are served over TLS, and the edge's own request logic, reading the KV records the sync published to a fake of the KV API and forwarding to the origin as the Worker does, gives the same responses, answering the root, codes, prefixes and pages without the origin; the domain is registered as a custom hostname; deleting it, refused while it has links, takes it off TLS, KV and the zone and gives its hostname back to the default domain; the steps are in the audit chain, which the binary verifies. |
 | Custom domains | Against real Postgres over HTTP with a local DNS resolver: a domain verifies only with its own token published, and only the first workspace to prove a hostname gets it; the same code on the default and a custom domain are two links, routed by `Host` on two instances, including after an update; unknown hosts keep the default domain; a domain with links cannot be deleted, and once deleted both instances stop routing it; 12 concurrent adds against a 3-domain plan with one domain taken create exactly 2; editors and viewers cannot manage domains; the database refuses a link on another workspace's domain. The DNS client is tested against crafted answers (compression, CNAME chains, truncation, NXDOMAIN, forged IDs, random bytes) and a resolver that answers over UDP and TCP. |
 | Certificates | The ACME client against a local CA that checks what a real one does (JWS signatures over its own nonces and the requested URL, HTTP-01 fetched with the domain as `Host`, a certificate request signed by its key and naming exactly the order's identifiers) and signs real X.509 certificates: issuance, a stale nonce retried but not forever, why validation failed, a rate limit's `Retry-After`, a certificate for another key refused, an order that never finishes, URLs that leave https, a lost account. In two running servers on Postgres: a domain gets a certificate once verified, with the CA's request answered by the other instance, and is renewed at two thirds of its lifetime with a fresh key; the instances never order the same domain at once and keep one account; failures back off (5 then 10 minutes) and show in the domain until an attempt succeeds; the challenge answer is per host, reaches every instance by notification or a database lookup, and is withdrawn after use. Tenants cannot read certificate keys. TLS: both instances serve the domain's certificate by SNI (any case, a final dot) to a client that checks it against the CA, redirect on it and count the click; a renewal on either instance is served by both on the next connection; a name without a certificate gets no handshake; keys are sealed for their row and Postgres refuses one that is not; an instance with another encryption key counts the certificate it cannot open and serves its default certificate from files to clients without SNI, picks up new files and keeps the old ones when the new key does not match; a stalled handshake is cut off; a default certificate that cannot be read stops the start. The sealing rejects every flipped byte, another row and another key. The DER reader and base64 are property-tested on random bytes, and the request was checked with `openssl req -verify`. |
 | Edge | Handler logic against an in-memory KV and a fake origin, including custom domains: a domain's own code in one read whatever the case, port or final dot; unknown hosts fall back to the default domain; a verified domain never serves a default-domain code; limited, broken and unreadable records go to the origin with the host forwarded. A property test sends random hosts and paths to the origin and to the edge in front of it, over random domains, settings and links, and requires the same response from both; it found a listed `Host` routed differently, now fixed. A local end-to-end run through `wrangler dev` (`examples/edge-local.sh`). KV publishing runs against a local fake of the Cloudflare KV and custom hostname APIs, including retries while either fails, domain records and links on a domain published once it is verified and removed with it, an operator's own hostnames left alone, and reconciliation of drift in links, domain records and hostnames. The origin routes by `x-forwarded-host` from trusted proxies only. |
@@ -266,7 +274,7 @@ The codes are `invalid_argument` 400, `unauthenticated` 401, `permission_denied`
 ```console
 $ docker run -d -e POSTGRES_PASSWORD=postgres -p 5439:5432 postgres:16-alpine
 $ export RELINK_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5439/postgres
-$ cargo test                         # 284 tests; database tests skip if the variable is unset
+$ cargo test                         # 356 tests; database tests skip if the variable is unset
 $ cargo llvm-cov --summary-only      # CI requires 90% of lines
 $ cargo build -p relink-core --target wasm32-unknown-unknown
 $ cargo +nightly fuzz run destination -- -max_total_time=60
@@ -315,7 +323,7 @@ The workspace has three crates, plus fuzz targets and example scripts:
 | `crates/relink-server/` | The origin: management API, Postgres, the in-memory redirect path, click analytics, health checks, and publishing link records to KV. Holds `src/`, `migrations/`, `tests/` and `benches/`. |
 | `crates/relink-edge/` | A Cloudflare Worker (workers-rs) that answers redirects from KV with the same rules and sends everything else to the origin. `src/logic.rs` is tested natively, `src/worker.rs` is the wasm glue, next to `wrangler.toml`. |
 | `fuzz/` | cargo-fuzz targets. |
-| `examples/` | `demo.sh`, `edge-local.sh`, `loadtest.sh`. |
+| `examples/` | `demo.sh`, `edge-local.sh`, `loadtest.sh`, and `txt-dns.py` (the one-record DNS server the demo proves its domain against). |
 
 [docs/DESIGN.md](docs/DESIGN.md) explains why the crates split where they do,
 the cache and its consistency, the click-lease algorithm and its bounds, what

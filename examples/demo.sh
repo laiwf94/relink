@@ -2,23 +2,30 @@
 # Walks through relink end to end: starts Postgres in Docker and a release
 # build of relink, creates links of every kind, follows them with curl, shows
 # stats, then workspace isolation, scoped and rotated API keys, a plan limit
-# and the audit chain, then stops Postgres to show redirects still being
+# and the audit chain, then a custom domain proved by a DNS TXT record (from
+# a one-record DNS server, examples/txt-dns.py) with its own codes, root
+# redirect, path prefix, case-free codes and 404 and 410 pages, then stops
+# Postgres to show redirects still being
 # served from memory while writes fail cleanly, and finally restarts Postgres
 # to show recovery.
 #
 # Needs: docker, cargo, curl, python3. Uses ports 18080, 19090 and 55432 by
-# default (RELINK_DEMO_PORT, RELINK_DEMO_ADMIN_PORT, RELINK_DEMO_PG_PORT).
+# default (RELINK_DEMO_PORT, RELINK_DEMO_ADMIN_PORT, RELINK_DEMO_PG_PORT),
+# and UDP port 15353 for DNS (RELINK_DEMO_DNS_PORT).
 set -euo pipefail
 
 PORT="${RELINK_DEMO_PORT:-18080}"
 ADMIN_PORT="${RELINK_DEMO_ADMIN_PORT:-19090}"
 PG_PORT="${RELINK_DEMO_PG_PORT:-55432}"
+DNS_PORT="${RELINK_DEMO_DNS_PORT:-15353}"
+DOMAIN="go.relink-demo.net"
 PG_NAME="relink-demo-pg"
 URL="http://127.0.0.1:$PORT"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/release/relink"
 LOG="$(mktemp -t relink-demo.XXXXXX)"
 RELINK_PID=""
+DNS_PID=""
 
 export RELINK_DATABASE_URL="postgres://postgres:demo@127.0.0.1:$PG_PORT/postgres"
 export RELINK_ADDR="127.0.0.1:$PORT"
@@ -30,9 +37,12 @@ export RELINK_DB_TIMEOUT_MS=1000
 # curl plays the CDN here, so loopback is the trusted proxy.
 export RELINK_TRUSTED_PROXIES="127.0.0.1,::1"
 export RELINK_COUNTRY_HEADER=cf-ipcountry
+# Custom domains are proved against the demo's own DNS server.
+export RELINK_DNS_SERVERS="127.0.0.1:$DNS_PORT"
 
 cleanup() {
   [ -n "$RELINK_PID" ] && kill "$RELINK_PID" 2>/dev/null && wait "$RELINK_PID" 2>/dev/null || true
+  [ -n "$DNS_PID" ] && kill "$DNS_PID" 2>/dev/null || true
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
   echo "(server log: $LOG)"
 }
@@ -45,6 +55,12 @@ api() { # method path [json]
 status() { # method path [json] -> HTTP status only
   curl -sS -o /dev/null -w '%{http_code}' -X "$1" "$URL$2" -H "Authorization: Bearer $KEY" \
     -H 'Content-Type: application/json' ${3:+-d "$3"}
+}
+on_domain() { # path -> "status location-or-body" as seen on $DOMAIN
+  curl -sS -w ' %{http_code} %{redirect_url}' -H "Host: $DOMAIN" "$URL/$1" | python3 -c '
+import sys
+out = sys.stdin.read().rsplit(" ", 2)
+print(out[1], out[2] or out[0])'
 }
 follow() { # code [curl args...] -> "status location"
   local code="$1"; shift
@@ -131,7 +147,30 @@ echo "   usage: $(api GET /v1/usage | python3 -c 'import sys, json; u = json.loa
 echo "   back on the unlimited plan"
 "$BIN" audit-verify --workspace "$WS" | sed 's/^/   audit chain /'
 
-echo "== 6. Stop Postgres"
+echo "== 6. A custom domain: DNS proof, its own codes and its own pages"
+api POST /v1/domains "{\"hostname\":\"$DOMAIN\"}" >/dev/null
+api POST "/v1/domains/$DOMAIN/verify" | field "['check_error']" | sed 's/^/   verify before the TXT record is served: /'
+PROOF=$(api GET "/v1/domains/$DOMAIN" | field "['verification']['value']")
+python3 "$ROOT/examples/txt-dns.py" "$DNS_PORT" "_relink-challenge.$DOMAIN" "$PROOF" &
+DNS_PID=$!
+sleep 0.5
+echo "   TXT _relink-challenge.$DOMAIN = ${PROOF:0:40}..."
+echo "   verify now: verified=$(api POST "/v1/domains/$DOMAIN/verify" | field "['verified']" | tr 'TF' 'tf')"
+api POST /v1/links "{\"url\":\"https://example.com/brand-sale\",\"alias\":\"summer-sale\",\"domain\":\"$DOMAIN\"}" | field "['short_url']" | sed 's/^/   same code, its own link: /'
+api PATCH "/v1/domains/$DOMAIN" '{"root_url":"https://example.com/","prefixes":["campaign"],
+  "case_insensitive":true,"not_found_page":"<h1>{{code}} is not on {{host}}</h1>",
+  "gone_page":"<p>{{code}} has ended</p>"}' >/dev/null
+api POST /v1/links "{\"url\":\"https://example.com/flash\",\"alias\":\"flash\",\"domain\":\"$DOMAIN\",\"max_clicks\":1}" >/dev/null
+echo "   /                      -> $(on_domain '')   (root redirect)"
+echo "   /summer-sale           -> $(on_domain summer-sale)"
+echo "   /campaign/SUMMER-SALE  -> $(on_domain campaign/SUMMER-SALE)   (prefix, any case)"
+echo "   default /summer-sale   -> $(follow summer-sale)"
+echo "   /nope                  -> $(on_domain nope)"
+on_domain flash >/dev/null
+echo "   /flash after its click -> $(on_domain flash)"
+echo "   certificate: $(api GET "/v1/domains/$DOMAIN" | field "['certificate']['status']") (set RELINK_ACME_DIRECTORY to have one issued)"
+
+echo "== 7. Stop Postgres"
 docker stop "$PG_NAME" >/dev/null
 echo "   $RANDOM_CODE          -> $(follow "$RANDOM_CODE")   (served from memory)"
 echo "   summer-sale      -> $(follow summer-sale)"
@@ -140,7 +179,7 @@ echo "   create link      -> HTTP $(status POST /v1/links '{"url":"https://examp
 echo "   not cached       -> $(follow never-seen)"
 echo "   readyz           -> $(curl -sS "$URL/readyz")"
 
-echo "== 7. Start Postgres again"
+echo "== 8. Start Postgres again"
 docker start "$PG_NAME" >/dev/null
 for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 0.5; done
 for _ in $(seq 1 40); do [ "$(status POST /v1/links '{"url":"https://example.com/new"}')" = 201 ] && break; sleep 0.5; done

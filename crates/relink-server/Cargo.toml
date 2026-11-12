@@ -39,6 +39,8 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 url = { workspace = true }
 
 [dev-dependencies]
+# The Worker's request logic, for the week 2 end-to-end test (tests/custom_domains.rs).
+relink-edge = { path = "../relink-edge" }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
 proptest = { workspace = true }
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
