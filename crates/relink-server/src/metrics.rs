@@ -89,10 +89,12 @@ pub enum Outcome {
     Unavailable,
     /// A custom domain's `/` sent to its root URL.
     Root,
+    /// Sent where a targeting rule said.
+    Rule,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 7] = [
+    const ALL: [Outcome; 8] = [
         Outcome::Redirect,
         Outcome::Fallback,
         Outcome::NotFound,
@@ -100,6 +102,7 @@ impl Outcome {
         Outcome::GeoBlocked,
         Outcome::Unavailable,
         Outcome::Root,
+        Outcome::Rule,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -110,6 +113,7 @@ impl Outcome {
             Outcome::GeoBlocked => "geo_blocked",
             Outcome::Unavailable => "unavailable",
             Outcome::Root => "root",
+            Outcome::Rule => "rule",
         }
     }
 }
@@ -259,7 +263,7 @@ pub struct Gauges {
 pub struct Metrics {
     pub redirect_latency: Histogram,
     pub api_latency: Histogram,
-    outcomes: [Counter; 7],
+    outcomes: [Counter; Outcome::ALL.len()],
     cache: [Counter; 5],
     db_errors: [Counter; 8],
     drops: [Counter; 4],

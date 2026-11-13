@@ -15,6 +15,21 @@ fuzz_target!(|data: &[u8]| {
         let again: relink_core::model::Link =
             serde_json::from_str(&serde_json::to_string(&link).unwrap()).unwrap();
         assert_eq!(again, link);
+        // A loaded decision list keeps the compiler's promises, so running
+        // it never panics and never tests more than the bound.
+        let rules = link.rules.compiled();
+        let req = relink_core::rules_v2::Request {
+            now_ms: 1_794_832_200_000,
+            country: Some(*b"US"),
+            region: Some(b"CA"),
+            user_agent: Some(b"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"),
+            accept_language: Some(b"en-US,en;q=0.9"),
+            referer: Some(b"https://news.example/"),
+            query: Some(b"src=mail&utm_source=ads"),
+        };
+        let (rule, tested) = rules.evaluate_counted(&req);
+        assert!(tested <= relink_core::rules_v2::MAX_CONDITIONS);
+        assert!(rule.is_none_or(|r| r < rules.urls().len()));
     }
     if let Ok(batch) = serde_json::from_slice::<ClickBatch>(data) {
         for c in &batch.clicks {

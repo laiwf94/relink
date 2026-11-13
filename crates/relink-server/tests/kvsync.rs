@@ -150,7 +150,7 @@ async fn reconciliation_repairs_drift() {
                 fallback_url: None,
                 enabled: true,
                 health_check: false,
-                rules: Vec::new(),
+                rules: Default::default(),
                 domain: None,
             },
             7,

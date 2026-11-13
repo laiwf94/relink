@@ -1,6 +1,14 @@
 //! What to do with one visit to one link. Pure: the caller supplies the
-//! clock, the visitor's country, their cookies and a random number, so the
+//! clock, the visitor's country and region, the request headers targeting
+//! rules read, the query string, their cookies and a random number, so the
 //! origin server and the edge worker give the same answer for the same input.
+//!
+//! The order is fixed: a disabled link is not found, then expiry, then the
+//! country rule, then the link's targeting rules ([`crate::rules_v2`],
+//! compiled when the link was read), and only when no rule matches its own
+//! destinations, A/B split, health and fallback. A redirect from a link
+//! with any rules is never cacheable, whichever way it went: a cache in
+//! between would hand one visitor's answer to the next.
 //!
 //! Max clicks are the one rule this cannot decide alone, because it needs a
 //! shared counter. [`Redirect::needs_admission`] tells the caller to take a
@@ -9,20 +17,45 @@
 
 use crate::abtest::{Signer, choose, cookie_name, find_cookie};
 use crate::model::Link;
+use crate::rules_v2::Request;
 
 /// How long an A/B assignment cookie lives (30 days).
 pub const AB_COOKIE_MAX_AGE: u32 = 30 * 24 * 3600;
 
-/// The request facts the rules depend on.
-#[derive(Clone, Copy, Debug)]
+/// The request facts the rules depend on. Header values are raw bytes as
+/// received.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Visit<'a> {
     pub now_ms: i64,
     /// Two-letter country from a trusted header, if any.
     pub country: Option<[u8; 2]>,
+    /// The subdivision part of the visitor's ISO 3166-2 region (`CA` for
+    /// `US-CA`) from a trusted header, if any.
+    pub region: Option<&'a [u8]>,
+    pub user_agent: Option<&'a [u8]>,
+    pub accept_language: Option<&'a [u8]>,
+    pub referer: Option<&'a [u8]>,
+    /// The query string without the `?`.
+    pub query: Option<&'a [u8]>,
     /// Raw `Cookie` header values.
     pub cookies: &'a [&'a [u8]],
     /// Uniform random bits, used only to assign new A/B visitors.
     pub random: u64,
+}
+
+impl<'a> Visit<'a> {
+    /// The facts targeting rules read.
+    pub fn request(&self) -> Request<'a> {
+        Request {
+            now_ms: self.now_ms,
+            country: self.country,
+            region: self.region,
+            user_agent: self.user_agent,
+            accept_language: self.accept_language,
+            referer: self.referer,
+            query: self.query,
+        }
+    }
 }
 
 /// Settings that must match on every target for cookies to carry over.
@@ -57,6 +90,8 @@ pub struct Redirect<'a> {
     pub fallback: bool,
     /// The link has a click limit: take a click before redirecting.
     pub needs_admission: bool,
+    /// The targeting rule that chose `location`, by index.
+    pub rule: Option<usize>,
 }
 
 pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) -> Decision<'a> {
@@ -75,6 +110,23 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
         return Decision::GeoBlocked {
             fallback: link.fallback_url.as_deref(),
         };
+    }
+
+    let status = match link.redirect_status {
+        301 | 302 | 307 | 308 => link.redirect_status,
+        _ => 302,
+    };
+    let rules = link.rules.compiled();
+    if let Some(i) = rules.evaluate(&visit.request()) {
+        return Decision::Redirect(Redirect {
+            status,
+            location: &rules.urls()[i],
+            set_cookie: None,
+            cacheable: false,
+            fallback: false,
+            needs_admission: link.max_clicks.is_some(),
+            rule: Some(i),
+        });
     }
 
     let any_healthy = (0..link.destinations.len()).any(|i| link.is_healthy(i));
@@ -111,11 +163,8 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
         }
     };
 
-    let status = match link.redirect_status {
-        301 | 302 | 307 | 308 => link.redirect_status,
-        _ => 302,
-    };
     let cacheable = link.geo.is_none()
+        && link.rules.is_empty()
         && link.destinations.len() == 1
         && link.max_clicks.is_none()
         && link.expires_at.is_none()
@@ -127,6 +176,7 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
         cacheable,
         fallback,
         needs_admission: link.max_clicks.is_some(),
+        rule: None,
     })
 }
 
@@ -149,6 +199,7 @@ fn assignment_cookie(link: &Link, name: &str, variant: usize, settings: &Setting
 mod tests {
     use super::*;
     use crate::model::{Destination, GeoMode, GeoRule};
+    use crate::rules_v2::RuleSet;
     use chrono::{TimeZone, Utc};
 
     fn link(urls: &[&str]) -> Link {
@@ -171,16 +222,15 @@ mod tests {
             enabled: true,
             health_check: false,
             unhealthy: vec![false; urls.len()],
-            rules: Vec::new(),
+            rules: RuleSet::default(),
         }
     }
 
     fn visit<'a>(cookies: &'a [&'a [u8]]) -> Visit<'a> {
         Visit {
             now_ms: 1_000_000,
-            country: None,
             cookies,
-            random: 0,
+            ..Visit::default()
         }
     }
 
@@ -303,5 +353,121 @@ mod tests {
         l.max_clicks = Some(3);
         let r = redirect(evaluate(&l, &visit(&[]), &SETTINGS));
         assert!(r.needs_admission && !r.cacheable);
+    }
+
+    fn with_rules(mut l: Link, json: &str) -> Link {
+        l.rules = serde_json::from_str(json).unwrap();
+        l
+    }
+
+    #[test]
+    fn targeting_rules_choose_before_the_destinations() {
+        let l = with_rules(
+            link(&["https://a.example.com/", "https://b.example.com/"]),
+            r#"[{"if": {"country": ["DE"]}, "url": "https://de.example.com/"},
+                {"if": {"all": [{"os": ["ios"]}, {"query": {"name": "src", "values": ["mail"]}}]},
+                 "url": "https://ios.example.com/"},
+                {"if": {"region": ["US-CA"]}, "url": "https://ca.example.com/"},
+                {"if": {"language": ["fr"]}, "url": "https://fr.example.com/"},
+                {"if": {"referrer": ["news.example"]}, "url": "https://news.example.com/"}]"#,
+        );
+        let base = visit(&[]);
+        let de = Visit {
+            country: Some(*b"DE"),
+            ..base
+        };
+        let r = redirect(evaluate(&l, &de, &SETTINGS));
+        assert_eq!((r.location, r.rule), ("https://de.example.com/", Some(0)));
+        assert!(!r.cacheable && r.set_cookie.is_none() && !r.fallback);
+
+        let ios = Visit {
+            user_agent: Some(b"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"),
+            query: Some(b"a=1&src=mail"),
+            ..base
+        };
+        assert_eq!(
+            redirect(evaluate(&l, &ios, &SETTINGS)).location,
+            "https://ios.example.com/"
+        );
+        let ca = Visit {
+            country: Some(*b"US"),
+            region: Some(b"ca"),
+            ..base
+        };
+        assert_eq!(redirect(evaluate(&l, &ca, &SETTINGS)).rule, Some(2));
+        let fr = Visit {
+            accept_language: Some(b"fr-CA,fr;q=0.9,en;q=0.5"),
+            ..base
+        };
+        assert_eq!(redirect(evaluate(&l, &fr, &SETTINGS)).rule, Some(3));
+        let news = Visit {
+            referer: Some(b"https://www.news.example/story"),
+            ..base
+        };
+        assert_eq!(redirect(evaluate(&l, &news, &SETTINGS)).rule, Some(4));
+
+        // No rule holds: the A/B split answers, and still nothing caches it.
+        let r = redirect(evaluate(&l, &base, &SETTINGS));
+        assert_eq!(r.rule, None);
+        assert!(r.set_cookie.is_some() && !r.cacheable);
+        let single = with_rules(
+            link(&["https://a.example.com/"]),
+            r#"[{"if": {"country": ["DE"]}, "url": "https://de.example.com/"}]"#,
+        );
+        let r = redirect(evaluate(&single, &base, &SETTINGS));
+        assert_eq!(r.location, "https://a.example.com/");
+        assert!(
+            !r.cacheable,
+            "the answer depends on the rules even when none held"
+        );
+    }
+
+    #[test]
+    fn rules_come_after_expiry_and_geo_and_keep_status_and_limits() {
+        let mut l = with_rules(
+            link(&["https://a.example.com/"]),
+            r#"[{"if": {"not": {"country": ["ZZ"]}}, "url": "https://rule.example.com/"}]"#,
+        );
+        l.redirect_status = 301;
+        l.max_clicks = Some(5);
+        let r = redirect(evaluate(&l, &visit(&[]), &SETTINGS));
+        assert_eq!((r.status, r.location), (301, "https://rule.example.com/"));
+        assert!(r.needs_admission);
+        l.redirect_status = 303;
+        assert_eq!(redirect(evaluate(&l, &visit(&[]), &SETTINGS)).status, 302);
+
+        l.geo = Some(GeoRule {
+            mode: GeoMode::Allow,
+            countries: vec![*b"US"],
+        });
+        assert_eq!(
+            evaluate(&l, &visit(&[]), &SETTINGS),
+            Decision::GeoBlocked { fallback: None }
+        );
+        l.geo = None;
+        l.expires_at = Some(Utc.timestamp_millis_opt(1).unwrap());
+        assert_eq!(evaluate(&l, &visit(&[]), &SETTINGS), Decision::Expired);
+        l.expires_at = None;
+        l.enabled = false;
+        assert_eq!(evaluate(&l, &visit(&[]), &SETTINGS), Decision::NotFound);
+    }
+
+    #[test]
+    fn health_and_fallback_never_override_a_matching_rule() {
+        let mut l = with_rules(
+            link(&["https://a.example.com/"]),
+            r#"[{"if": {"time": {"after": "1970-01-01T00:00:00Z"}}, "url": "https://rule.example.com/"}]"#,
+        );
+        l.health_check = true;
+        l.unhealthy = vec![true];
+        l.fallback_url = Some("https://fallback.example.com/".into());
+        let r = redirect(evaluate(&l, &visit(&[]), &SETTINGS));
+        assert_eq!(r.location, "https://rule.example.com/");
+        assert!(!r.fallback);
+        let early = Visit {
+            now_ms: -1,
+            ..visit(&[])
+        };
+        assert!(redirect(evaluate(&l, &early, &SETTINGS)).fallback);
     }
 }

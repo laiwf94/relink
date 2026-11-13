@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83500650ccd463707b8327c1b2d92fc7ca75a3917a56dae35cfd1ac54bd5c58f # shrinks to lists = [([], true)], visits = [(0, Visitor { country: None, region: None, user_agent: None, accept_language: None, referer: None, query: None })]

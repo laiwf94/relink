@@ -27,10 +27,12 @@ export RELINK_ADDR="127.0.0.1:$ORIGIN_PORT"
 export RELINK_ADMIN_ADDR="127.0.0.1:$((ORIGIN_PORT + 1))"
 export RELINK_COOKIE_KEY="$COOKIE_KEY"
 export RELINK_EDGE_TOKEN="$EDGE_TOKEN"
-# The edge forwards the visitor's address and country; trust it from loopback.
+# The edge forwards the visitor's address, country and region; trust it from
+# loopback.
 export RELINK_TRUSTED_PROXIES="127.0.0.1,::1"
 export RELINK_CLIENT_IP_HEADER="x-forwarded-for"
 export RELINK_COUNTRY_HEADER="cf-ipcountry"
+export RELINK_REGION_HEADER="cf-region-code"
 export RELINK_LOG=warn
 export WRANGLER_SEND_METRICS=false
 export CLOUDFLARE_CF_FETCH_ENABLED=false

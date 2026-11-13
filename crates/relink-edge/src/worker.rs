@@ -15,7 +15,8 @@ use worker::{
 };
 
 use crate::logic::{
-    self, ClickBatcher, EdgeError, EdgeRequest, EdgeResponse, Kv, Origin, Push, forwarded_host,
+    self, ClickBatcher, EdgeError, EdgeRequest, EdgeResponse, Kv, Origin, Push, REGION_HEADER,
+    forwarded_host, origin_path,
 };
 
 /// Clicks per batch, and the longest a click waits in an idle isolate.
@@ -71,6 +72,11 @@ impl Origin for WorkerOrigin {
                 .set("referer", &String::from_utf8_lossy(r))
                 .map_err(err)?;
         }
+        if let Some(l) = &req.accept_language {
+            headers
+                .set("accept-language", &String::from_utf8_lossy(l))
+                .map_err(err)?;
+        }
         // The origin believes these only because the edge is in its
         // RELINK_TRUSTED_PROXIES.
         if let Some(ip) = req.client_ip {
@@ -89,12 +95,17 @@ impl Origin for WorkerOrigin {
                 .set("cf-ipcountry", &String::from_utf8_lossy(&c))
                 .map_err(err)?;
         }
+        if let Some(r) = &req.region {
+            headers
+                .set(REGION_HEADER, &String::from_utf8_lossy(r))
+                .map_err(err)?;
+        }
         let mut init = RequestInit::new();
         init.with_method(Method::Get)
             .with_headers(headers)
             .with_redirect(RequestRedirect::Manual);
-        let request =
-            Request::new_with_init(&format!("{}/{}", self.base, req.code), &init).map_err(err)?;
+        let request = Request::new_with_init(&format!("{}/{}", self.base, origin_path(req)), &init)
+            .map_err(err)?;
         let mut resp = Fetch::Request(request).send().await.map_err(err)?;
         let mut out = Vec::new();
         for name in [
@@ -202,6 +213,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             .and_then(|ip| ip.parse().ok()),
         user_agent: headers.get("user-agent")?.map(String::into_bytes),
         referer: headers.get("referer")?.map(String::into_bytes),
+        region: req
+            .cf()
+            .and_then(|cf| cf.region_code())
+            .map(String::into_bytes),
+        accept_language: headers.get("accept-language")?.map(String::into_bytes),
+        query: url.query().map(str::to_owned),
         now_ms: worker::Date::now().as_millis() as i64,
         random: random_u64(),
     };

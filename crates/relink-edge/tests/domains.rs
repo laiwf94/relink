@@ -182,7 +182,7 @@ fn link(id: i64, code: String, state: State) -> Link {
         enabled: !matches!(state, State::Disabled),
         health_check: false,
         unhealthy: vec![false],
-        rules: Vec::new(),
+        rules: Default::default(),
     }
 }
 
@@ -368,7 +368,8 @@ impl Origin for Behind {
             );
         }
         let peer: IpAddr = EDGE_PEER.parse().unwrap();
-        let (resp, _) = relink_server::redirect::handle(&self.0, &req.code, &headers, peer).await;
+        let (resp, _) =
+            relink_server::redirect::handle(&self.0, &req.code, None, &headers, peer).await;
         Ok(answer(resp).await)
     }
 }
@@ -419,7 +420,7 @@ async fn both(
         headers.insert(header::HOST, HeaderValue::from_str(h).unwrap());
     }
     let visitor: IpAddr = VISITOR.parse().unwrap();
-    let (resp, _) = relink_server::redirect::handle(app, path, &headers, visitor).await;
+    let (resp, _) = relink_server::redirect::handle(app, path, None, &headers, visitor).await;
     let at_origin = agreed(answer(resp).await);
 
     let signer = Signer::new(

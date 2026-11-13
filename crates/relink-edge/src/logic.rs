@@ -21,8 +21,10 @@
 //! by the one-read path reads the record only when it needs a page. The
 //! decisions are the same functions the origin calls.
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::net::IpAddr;
+use std::rc::Rc;
 
 use relink_core::classify::{UNKNOWN_COUNTRY, device_class, referrer_host};
 use relink_core::code::is_plausible_code;
@@ -65,8 +67,27 @@ pub struct EdgeRequest {
     pub client_ip: Option<IpAddr>,
     pub user_agent: Option<Vec<u8>>,
     pub referer: Option<Vec<u8>>,
+    /// Set by the CDN, so trusted: the subdivision part of the visitor's
+    /// ISO 3166-2 region (`CA` for `US-CA`).
+    pub region: Option<Vec<u8>>,
+    pub accept_language: Option<Vec<u8>>,
+    /// The query string without the `?`, as sent.
+    pub query: Option<String>,
     pub now_ms: i64,
     pub random: u64,
+}
+
+/// The header the edge names the visitor's region in when it forwards a
+/// request; the origin reads it when `RELINK_REGION_HEADER` names it.
+pub const REGION_HEADER: &str = "cf-region-code";
+
+/// The path and query the edge asks the origin for: the visitor's own, so
+/// rules on `query` decide the same at both.
+pub fn origin_path(req: &EdgeRequest) -> String {
+    match req.query.as_deref() {
+        Some(q) if !q.is_empty() => format!("{}?{q}", req.code),
+        _ => req.code.clone(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,9 +253,16 @@ async fn serve<K: Kv, O: Origin>(
         return from_origin(origin, req).await;
     }
     let cookies: Vec<&[u8]> = req.cookies.iter().map(Vec::as_slice).collect();
+    // Targeting rules were compiled when the record was parsed; they read
+    // the same facts the origin reads.
     let visit = Visit {
         now_ms: req.now_ms,
         country: req.country,
+        region: req.region.as_deref(),
+        user_agent: req.user_agent.as_deref(),
+        accept_language: req.accept_language.as_deref(),
+        referer: req.referer.as_deref(),
+        query: req.query.as_deref().map(str::as_bytes),
         cookies: &cookies,
         random: req.random,
     };
@@ -250,6 +278,8 @@ async fn serve<K: Kv, O: Origin>(
                 None,
             );
         }
+        // A rule's answer is no-store (`cacheable` is false), like every
+        // answer from a link with rules.
         // Unreachable while limited links are proxied, but if one ever got
         // here the origin is the only place that can admit it.
         Decision::Redirect(r) if r.needs_admission => return from_origin(origin, req).await,
@@ -296,7 +326,7 @@ fn error_page(
 
 /// A link record read from KV.
 enum Read {
-    Found(Box<Link>),
+    Found(Rc<Link>),
     Missing,
     /// The read failed or the record would not parse.
     Failed,
@@ -304,12 +334,99 @@ enum Read {
 
 async fn read<K: Kv>(kv: &K, key: &str) -> Read {
     match kv.get(key).await {
-        Ok(Some(json)) => match serde_json::from_str::<Link>(&json) {
-            Ok(link) => Read::Found(Box::new(link)),
-            Err(_) => Read::Failed,
+        Ok(Some(json)) => match PARSED.with(|p| p.borrow_mut().parse(key, json)) {
+            Some(link) => Read::Found(link),
+            None => Read::Failed,
         },
         Ok(None) => Read::Missing,
         Err(_) => Read::Failed,
+    }
+}
+
+thread_local! {
+    // One per isolate (and per test thread natively); Workers run one
+    // request at a time per isolate thread.
+    static PARSED: RefCell<Parsed> = RefCell::new(Parsed::new(PARSED_BYTES));
+}
+
+/// Most bytes of key and record text [`Parsed`] keeps per isolate. Parsed
+/// links take a few times their text, so this stays well inside a Worker's
+/// memory.
+pub const PARSED_BYTES: usize = 2 << 20;
+
+/// Link records parsed (with their compiled targeting rules) by this
+/// isolate, so a hot link is parsed once rather than on every request. An
+/// entry is reused only while KV returns exactly the text it was parsed
+/// from, so a changed record is parsed again on its first read and the
+/// cache never answers with anything KV no longer says.
+///
+/// A list, oldest first, rather than a map: lookups scan at most
+/// [`PARSED_ENTRIES`] short keys, which costs less than hashing would
+/// save, and a map's code would weigh on the Worker bundle.
+#[derive(Debug)]
+pub struct Parsed {
+    entries: Vec<(String, String, Rc<Link>)>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+/// Most records [`Parsed`] keeps.
+pub const PARSED_ENTRIES: usize = 256;
+
+impl Parsed {
+    pub fn new(max_bytes: usize) -> Parsed {
+        Parsed {
+            entries: Vec::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    /// The link `json` (the record at `key`) describes, or `None` if it
+    /// does not parse.
+    pub fn parse(&mut self, key: &str, json: String) -> Option<Rc<Link>> {
+        let at = self.entries.iter().position(|(k, _, _)| k == key);
+        if let Some(i) = at {
+            let (_, text, link) = &self.entries[i];
+            if *text == json {
+                return Some(link.clone());
+            }
+        }
+        let link = Rc::new(serde_json::from_str::<Link>(&json).ok()?);
+        if let Some(i) = at {
+            self.evict(i);
+        }
+        let size = key.len() + json.len();
+        if size > self.max_bytes {
+            return Some(link);
+        }
+        // Drop the oldest entries until the new one fits.
+        while !self.entries.is_empty()
+            && (self.bytes + size > self.max_bytes || self.entries.len() >= PARSED_ENTRIES)
+        {
+            self.evict(0);
+        }
+        self.bytes += size;
+        self.entries.push((key.to_owned(), json, link.clone()));
+        Some(link)
+    }
+
+    fn evict(&mut self, i: usize) {
+        let (k, text, _) = self.entries.remove(i);
+        self.bytes -= k.len() + text.len();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Bytes of key and record text held.
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -527,7 +644,7 @@ mod tests {
             enabled: true,
             health_check: false,
             unhealthy: vec![false],
-            rules: Vec::new(),
+            rules: Default::default(),
         }
     }
 
@@ -1183,5 +1300,125 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parsed_records_are_reused_only_while_kv_text_is_unchanged() {
+        let mut ruled = link("promo");
+        ruled.rules = serde_json::from_str(
+            r#"[{"if": {"country": ["DE"]}, "url": "https://example.com/de"}]"#,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&ruled).unwrap();
+        let mut p = Parsed::new(1 << 20);
+        let a = p.parse("link:promo", json.clone()).unwrap();
+        let b = p.parse("link:promo", json.clone()).unwrap();
+        assert!(Rc::ptr_eq(&a, &b), "the same text is parsed once");
+        assert_eq!(a.rules.compiled().steps().len(), 1);
+        assert_eq!((p.len(), p.bytes()), (1, "link:promo".len() + json.len()));
+
+        ruled.destinations[0].url = "https://example.com/new".into();
+        let changed = serde_json::to_string(&ruled).unwrap();
+        let c = p.parse("link:promo", changed.clone()).unwrap();
+        assert_eq!(c.destinations[0].url, "https://example.com/new");
+        assert_eq!(
+            (p.len(), p.bytes()),
+            (1, "link:promo".len() + changed.len())
+        );
+        assert!(p.parse("link:promo", "{not json".into()).is_none());
+        assert!(Rc::ptr_eq(&c, &p.parse("link:promo", changed).unwrap()));
+    }
+
+    #[test]
+    fn parsed_records_stay_within_their_byte_budget() {
+        let json = serde_json::to_string(&link("promo")).unwrap();
+        let one = "link:aaaa".len() + json.len();
+        let mut p = Parsed::new(one * 3);
+        for key in [
+            "link:aaaa",
+            "link:bbbb",
+            "link:cccc",
+            "link:dddd",
+            "link:eeee",
+        ] {
+            assert!(p.parse(key, json.clone()).is_some());
+            assert!(p.bytes() <= one * 3);
+        }
+        assert_eq!(p.len(), 3);
+        // The oldest go first: the newest three are still parsed once.
+        let e = p.parse("link:eeee", json.clone()).unwrap();
+        assert!(Rc::ptr_eq(&e, &p.parse("link:eeee", json.clone()).unwrap()));
+        assert!(p.parse("link:cccc", json.clone()).is_some());
+        assert_eq!(p.len(), 3);
+        // And never more than PARSED_ENTRIES, whatever the budget.
+        let mut wide = Parsed::new(usize::MAX / 2);
+        for i in 0..PARSED_ENTRIES + 10 {
+            assert!(wide.parse(&format!("link:k{i}"), json.clone()).is_some());
+        }
+        assert_eq!(wide.len(), PARSED_ENTRIES);
+        // A record bigger than the whole budget is served but not kept.
+        let mut tiny = Parsed::new(8);
+        assert!(tiny.parse("link:aaaa", json).is_some());
+        assert!(tiny.is_empty() && tiny.bytes() == 0);
+    }
+
+    #[test]
+    fn rules_read_every_visitor_fact_at_the_edge() {
+        let mut ruled = link("promo");
+        ruled.rules = serde_json::from_str(
+            r#"[{"if": {"all": [{"region": ["US-CA"]}, {"language": ["de"]},
+                               {"referrer": ["news.example"]}, {"os": ["android"]},
+                               {"query": {"name": "src", "values": ["mail"]}}]},
+                 "url": "https://example.com/rule"}]"#,
+        )
+        .unwrap();
+        let kv = MemoryKv::with(&ruled);
+        let origin = FakeOrigin::default();
+        let mut r = req("promo");
+        r.country = Some(*b"US");
+        r.region = Some(b"CA".to_vec());
+        r.accept_language = Some(b"de-AT,de;q=0.9".to_vec());
+        r.referer = Some(b"https://m.news.example/x".to_vec());
+        r.user_agent = Some(b"Mozilla/5.0 (Linux; Android 14) Chrome/124.0 Mobile".to_vec());
+        r.query = Some("src=mail".into());
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &r));
+        assert_eq!(out.served, Served::Edge);
+        assert_eq!(out.response.status, 301);
+        assert_eq!(
+            out.response.header("location"),
+            Some("https://example.com/rule")
+        );
+        assert_eq!(out.response.header("cache-control"), Some("no-store"));
+        assert!(
+            out.click.is_some(),
+            "a rule's redirect is a click like any other"
+        );
+        r.query = Some("src=ads".into());
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &r));
+        assert_eq!(
+            out.response.header("location"),
+            Some("https://example.com/landing")
+        );
+        assert_eq!(out.response.header("cache-control"), Some("no-store"));
+        assert_eq!(origin.calls.get(), 0);
+    }
+
+    #[test]
+    fn records_with_written_rules_go_to_the_origin() {
+        // What the origin published before rules were compiled for the
+        // edge: the written list under `rules`. Ignoring it would serve the
+        // link without its rules, so the record must not parse.
+        let mut record = serde_json::to_value(link("promo")).unwrap();
+        record["rules"] = serde_json::json!([
+            {"if": {"country": ["DE"]}, "url": "https://example.com/de"}
+        ]);
+        let kv = MemoryKv::default();
+        kv.values
+            .borrow_mut()
+            .insert(kv_key("promo"), record.to_string());
+        let origin = FakeOrigin::default();
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req("promo")));
+        assert_eq!(out.served, Served::Origin);
+        assert_eq!(origin.calls.get(), 1);
     }
 }

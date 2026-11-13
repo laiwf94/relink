@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::Instrument;
 
-use relink_core::rules_v2::{self, Rule};
+use relink_core::rules_v2::{self, Rule, RuleSet};
 use relink_core::wire::{ClickBatch, MAX_BATCH, WireClick};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -575,7 +575,7 @@ impl LinkView {
             enabled: link.enabled,
             health_check: link.health_check,
             health_checked_at: link.health_checked_at,
-            rules: link.rules.clone(),
+            rules: link.rules.rules().to_vec(),
             created_at: link.created_at,
             updated_at: link.updated_at,
         }
@@ -740,15 +740,16 @@ fn validate_geo(g: GeoInput) -> Result<GeoRule, ApiError> {
 }
 
 /// Validates a rule list by compiling it under the destination policy, and
-/// returns it with each rule's destination normalised. The error names the
-/// part at fault by its JSON path, `rules[1].if.all[0].country[2]: ...`.
-fn validate_rules(app: &App, mut rules: Vec<Rule>) -> Result<Vec<Rule>, ApiError> {
-    let compiled = rules_v2::compile(&rules, app.cfg.destination_policy)
-        .map_err(|e| ApiError::invalid(e.to_string()))?;
+/// returns it with each rule's destination normalised, compiled. The error
+/// names the part at fault by its JSON path,
+/// `rules[1].if.all[0].country[2]: ...`.
+fn validate_rules(app: &App, mut rules: Vec<Rule>) -> Result<RuleSet, ApiError> {
+    let invalid = |e: rules_v2::RuleError| ApiError::invalid(e.to_string());
+    let compiled = rules_v2::compile(&rules, app.cfg.destination_policy).map_err(invalid)?;
     for (rule, url) in rules.iter_mut().zip(compiled.urls()) {
         rule.url.clone_from(url);
     }
-    Ok(rules)
+    RuleSet::new(rules).map_err(invalid)
 }
 
 fn validate_fallback(app: &App, url: String) -> Result<String, ApiError> {

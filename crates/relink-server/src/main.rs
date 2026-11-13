@@ -43,8 +43,9 @@
 //! | `RELINK_CODE_LENGTH` | `7` | Generated code length, 4 to 32 |
 //! | `RELINK_COOKIE_KEY` | random | 64+ hex chars; HMAC key for A/B cookies. Set it so assignments survive restarts and match across instances |
 //! | `RELINK_COOKIE_SECURE` | `true` | Add `Secure` to A/B and session cookies |
-//! | `RELINK_TRUSTED_PROXIES` | unset | Comma-separated addresses or CIDR blocks of your CDN or load balancer; the two headers below are read only from these peers |
+//! | `RELINK_TRUSTED_PROXIES` | unset | Comma-separated addresses or CIDR blocks of your CDN or load balancer; the three headers below are read only from these peers |
 //! | `RELINK_COUNTRY_HEADER` | unset | Header with the visitor's country set by the CDN, e.g. `cf-ipcountry` |
+//! | `RELINK_REGION_HEADER` | unset | Header with the subdivision of the visitor's region (`CA` for `US-CA`) set by the CDN, e.g. `cf-region-code`; read by targeting rules on `region` |
 //! | `RELINK_CLIENT_IP_HEADER` | unset | Header with the client address chain, e.g. `x-forwarded-for`; the rightmost untrusted hop is used. Unset uses the socket peer |
 //! | `RELINK_ALLOW_IP_LITERALS` | `false` | Accept public IP-address destinations |
 //! | `RELINK_ALLOW_PRIVATE_DESTINATIONS` | `false` | Accept private/loopback destinations and let health checks reach them (development only) |

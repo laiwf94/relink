@@ -83,8 +83,9 @@ $ docker run -p 8080:8080 -e RELINK_DATABASE_URL=... relink
 Configuration is by environment variable, listed with defaults at the top of
 [crates/relink-server/src/main.rs](crates/relink-server/src/main.rs). Two
 deserve a mention here. `RELINK_TRUSTED_PROXIES` lists the addresses of your
-CDN or load balancer; the country and client-address headers are read only
-from those peers, so a visitor cannot pick their own country (and so is
+CDN or load balancer; the country, region and client-address headers are
+read only from those peers, so a visitor cannot pick their own country or
+region for a targeting rule (and so is
 `x-forwarded-host`, which the edge uses to name a custom domain). `RELINK_KV_*`
 turns on publishing to Workers KV; without it the origin works alone. With
 `RELINK_KV_ZONE_ID` as well, each verified domain is registered as a custom

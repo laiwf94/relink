@@ -767,7 +767,7 @@ entries are served as they were, by design, for up to a day.
 
 ### Targeting rules
 
-`relink-core/src/rules_v2.rs` holds the rules engine both targets will run:
+`relink-core/src/rules_v2.rs` holds the rules engine both targets run:
 an ordered list of `{"if": condition, "url": ...}` where conditions combine
 `all`, `any` and `not` over country, ISO 3166-2 region, device, OS, browser,
 preferred language, referrer host, a time window (instants, weekdays and
@@ -799,8 +799,51 @@ destination normalised, in `links.rules` (migration 0016, a `jsonb` array
 bounded to 64 KiB). It is part of `relink_core::model::Link`, so the
 redirect role reads it with the rest of the row, audit entries show it,
 and the edge gets it inside the link's KV record; the field is left out
-of that record when a link has no rules. The redirect path does not
-evaluate rules yet: that lands with the next task of week 3.
+of that record when a link has no rules.
+
+On the redirect path a link's rules are compiled once. `Link.rules` is a
+`RuleSet`, holding the written list and its compiled decision list. The
+database column holds the written list, and the origin compiles it when it
+loads a row into its cache; stored destinations are taken as the API
+normalised them, so a destination policy made stricter later cannot make a
+link unreadable. The KV record carries the compiled decision list instead
+(`rules_v2::program`: `{"steps": [...], "urls": [...]}`), which the edge
+loads after checking every promise the compiler makes (at most 64 steps and
+32 rules, jumps forward and in range, value lists bounded, country lists
+sorted). The edge therefore never links the compiler. Shipping it would
+have cost about 19 KB of the gzipped Worker bundle, which is 249,224 bytes
+with rules evaluated, under the 250 KB target (239,760 before). A record
+published before this change holds the written list under `rules`, which
+does not parse as a decision list, so the edge sends that link to the
+origin until it is next published. `relink_core::rules::evaluate` runs them after the
+disabled, expiry and country checks and before the link's destinations: a
+matching rule sends the visitor to its URL with the link's status, no A/B
+cookie, no health or fallback, and still takes a click (and a lease, for a
+link with a click limit). Every answer from a link with rules is
+`no-store`, whether or not a rule held, because a cache in between would
+give one visitor's answer to the next.
+
+Both targets pass the same facts. The origin reads `User-Agent`,
+`Accept-Language`, `Referer` and the query string from the request, and the
+country and region from `RELINK_COUNTRY_HEADER` and `RELINK_REGION_HEADER`,
+believed only from `RELINK_TRUSTED_PROXIES`. The edge reads the country and
+`regionCode` from Cloudflare's `cf` object and the rest from the request,
+and when it forwards it sends all of them to the origin: the visitor's
+query string on the URL, the three headers as received, and the region as
+`cf-region-code` (set `RELINK_REGION_HEADER=cf-region-code` behind the
+Worker). `crates/relink-edge/tests/rules.rs` generates links with random
+rule lists over every leaf type and random visitors, answers each request at
+the origin and at the edge (which forwards click-limited links to that same
+origin), and checks that the responses are the same and that both are
+`no-store`. A redirect a rule chose is counted as
+`relink_redirects_total{outcome="rule"}`.
+
+On the benchmark machine a cached link whose 64 leaves are all tested costs
+about 2.2 µs in the origin handler, against about 0.96 µs for a link
+without rules (`cargo bench --bench hot_path -- handler_cache_hit`).
+Parsing and compiling that 64-leaf list takes about 38 µs
+(`rules_v2_parse_and_compile_64_conditions`), which is why it happens once
+per cached link and not per request.
 
 ## Click limits without a write per click
 
@@ -865,10 +908,19 @@ the link has no click limit: redirects, 404 for disabled links, 410 for
 expired ones, 451 or the fallback for geo-blocked visitors. It forwards to the
 origin, without following redirects, when the record is missing (KV may not
 have caught up with a new link), when KV fails, and for every link with a
-click limit. The country comes from Cloudflare's `cf` object, which clients
-cannot set; the visitor's address from `CF-Connecting-IP`. Both are passed to
-the origin, which believes them because the edge is in its
-`RELINK_TRUSTED_PROXIES`.
+click limit. The country and region come from Cloudflare's `cf` object,
+which clients cannot set; the visitor's address from `CF-Connecting-IP`. They
+are passed to the origin, which believes them because the edge is in its
+`RELINK_TRUSTED_PROXIES`, with the visitor's query string, `User-Agent`,
+`Referer` and `Accept-Language`, so targeting rules decide there as they
+would have at the edge.
+
+Each isolate keeps the link records it has parsed, by KV key
+(`logic::Parsed`: at most 256 records and 2 MiB of text, oldest dropped
+first). An entry is reused only while KV returns exactly the text it was
+parsed from, so a hot link costs a string comparison instead of a parse,
+and a changed record is parsed afresh on its first read: the cache can
+never answer with something KV no longer says.
 
 ### Custom domains at the edge
 

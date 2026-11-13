@@ -41,7 +41,7 @@ fn split_link() -> Link {
         enabled: true,
         health_check: false,
         unhealthy: vec![false; 3],
-        rules: Vec::new(),
+        rules: Default::default(),
     }
 }
 
@@ -110,7 +110,7 @@ async fn at_origin(app: &App, cookie: Option<&str>) -> (String, Option<String>) 
         headers.insert(header::COOKIE, HeaderValue::from_str(c).unwrap());
     }
     let peer: IpAddr = "203.0.113.8".parse().unwrap();
-    let (resp, _) = relink_server::redirect::handle(app, "pricing", &headers, peer).await;
+    let (resp, _) = relink_server::redirect::handle(app, "pricing", None, &headers, peer).await;
     let get = |name| {
         resp.headers()
             .get(name)

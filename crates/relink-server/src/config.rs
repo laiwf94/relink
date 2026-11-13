@@ -83,6 +83,9 @@ pub struct Config {
     pub cookie_key: Option<[u8; 32]>,
     pub cookie_secure: bool,
     pub country_header: Option<HeaderName>,
+    /// Header with the subdivision part of the visitor's ISO 3166-2 region
+    /// (`CA` for `US-CA`), read by targeting rules.
+    pub region_header: Option<HeaderName>,
     pub client_ip_header: Option<HeaderName>,
     /// Peers whose forwarding headers are believed.
     pub trusted_proxies: TrustedProxies,
@@ -141,6 +144,7 @@ impl fmt::Debug for Config {
             .field("cookie_key", &self.cookie_key.map(|_| "<redacted>"))
             .field("cookie_secure", &self.cookie_secure)
             .field("country_header", &self.country_header)
+            .field("region_header", &self.region_header)
             .field("client_ip_header", &self.client_ip_header)
             .field("trusted_proxies", &self.trusted_proxies)
             .field("destination_policy", &self.destination_policy)
@@ -482,6 +486,7 @@ impl Config {
             cookie_key,
             cookie_secure: v.bool("RELINK_COOKIE_SECURE", true)?,
             country_header: v.header("RELINK_COUNTRY_HEADER", None)?,
+            region_header: v.header("RELINK_REGION_HEADER", None)?,
             client_ip_header: v.header("RELINK_CLIENT_IP_HEADER", None)?,
             trusted_proxies: TrustedProxies::parse(
                 &v.raw("RELINK_TRUSTED_PROXIES").unwrap_or_default(),
@@ -562,12 +567,15 @@ impl Config {
             key_encryption_key,
             tls,
         };
-        if (cfg.country_header.is_some() || cfg.client_ip_header.is_some())
+        if (cfg.country_header.is_some()
+            || cfg.region_header.is_some()
+            || cfg.client_ip_header.is_some())
             && cfg.trusted_proxies.is_empty()
         {
             return Err(
-                "RELINK_COUNTRY_HEADER and RELINK_CLIENT_IP_HEADER are only read from \
-                        RELINK_TRUSTED_PROXIES; set it to your CDN or load balancer addresses"
+                "RELINK_COUNTRY_HEADER, RELINK_REGION_HEADER and RELINK_CLIENT_IP_HEADER are \
+                 only read from RELINK_TRUSTED_PROXIES; set it to your CDN or load balancer \
+                 addresses"
                     .into(),
             );
         }
@@ -599,6 +607,7 @@ mod tests {
             "no header is trusted by default"
         );
         assert!(c.client_ip_header.is_none());
+        assert!(c.region_header.is_none());
         assert!(c.trusted_proxies.is_empty());
         assert!(c.cookie_secure);
         assert!(c.cookie_key.is_none());
@@ -807,6 +816,7 @@ mod tests {
             ("RELINK_COOKIE_KEY", &key),
             ("RELINK_COOKIE_SECURE", "false"),
             ("RELINK_COUNTRY_HEADER", "cf-ipcountry"),
+            ("RELINK_REGION_HEADER", "CF-Region-Code"),
             ("RELINK_CLIENT_IP_HEADER", "CF-Connecting-IP"),
             ("RELINK_TRUSTED_PROXIES", "10.0.0.0/8, 2001:db8::/32"),
             ("RELINK_ALLOW_PRIVATE_DESTINATIONS", "1"),
@@ -818,6 +828,7 @@ mod tests {
         assert_eq!(c.cookie_key, Some([0xab; 32]));
         assert!(!c.cookie_secure);
         assert_eq!(c.country_header.as_ref().unwrap().as_str(), "cf-ipcountry");
+        assert_eq!(c.region_header.as_ref().unwrap().as_str(), "cf-region-code");
         assert!(c.trusted_proxies.contains("10.1.2.3".parse().unwrap()));
         assert_eq!(
             c.client_ip_header.as_ref().unwrap().as_str(),
@@ -843,6 +854,8 @@ mod tests {
             vec![base, ("RELINK_COOKIE_SECURE", "maybe")],
             vec![base, ("RELINK_COUNTRY_HEADER", "bad header")],
             vec![base, ("RELINK_COUNTRY_HEADER", "cf-ipcountry")],
+            vec![base, ("RELINK_REGION_HEADER", "cf-region-code")],
+            vec![base, ("RELINK_REGION_HEADER", "bad header")],
             vec![base, ("RELINK_TRUSTED_PROXIES", "10.0.0.0/99")],
             vec![base, ("RELINK_PUBLIC_BASE_URL", "ftp://x")],
             vec![base, ("RELINK_DB_TIMEOUT_MS", "1")],

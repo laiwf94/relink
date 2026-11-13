@@ -44,7 +44,7 @@ pub async fn redirect(
     // The path as sent, still percent-encoded, as the edge sees it: codes
     // are plain ASCII, so an encoded path never names one.
     let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
-    let (response, outcome) = handle(&app, path, &headers, peer.ip()).await;
+    let (response, outcome) = handle(&app, path, uri.query(), &headers, peer.ip()).await;
     app.metrics.redirect_latency.observe(start.elapsed());
     app.metrics.outcome(outcome);
     response
@@ -82,6 +82,16 @@ pub fn visitor_country(app: &App, headers: &HeaderMap, peer: IpAddr) -> Option<[
         return None;
     }
     country(headers.get(name).map(HeaderValue::as_bytes))
+}
+
+/// The region header (the subdivision code, `CA` for `US-CA`), believed
+/// only from a trusted proxy.
+pub fn visitor_region<'a>(app: &App, headers: &'a HeaderMap, peer: IpAddr) -> Option<&'a [u8]> {
+    let name = app.cfg.region_header.as_ref()?;
+    if !app.cfg.trusted_proxies.contains(peer) {
+        return None;
+    }
+    headers.get(name).map(HeaderValue::as_bytes)
 }
 
 /// The public router's fallback: a GET or HEAD is read as a redirect path
@@ -153,12 +163,13 @@ fn error_page(
     (resp, outcome)
 }
 
-/// Evaluates a request for `path` (without the leading `/`, as sent).
-/// Separate from the handler so tests and benchmarks can call it without
-/// a socket.
+/// Evaluates a request for `path` (without the leading `/`, as sent) with
+/// the query string `query` (without the `?`). Separate from the handler so
+/// tests and benchmarks can call it without a socket.
 pub async fn handle(
     app: &App,
     path: &str,
+    query: Option<&str>,
     headers: &HeaderMap,
     peer: IpAddr,
 ) -> (Response, Outcome) {
@@ -200,9 +211,15 @@ pub async fn handle(
         .iter()
         .map(HeaderValue::as_bytes)
         .collect();
+    let raw = |name| headers.get(name).map(HeaderValue::as_bytes);
     let visit = Visit {
         now_ms: now_ms(),
         country,
+        region: visitor_region(app, headers, peer),
+        user_agent: raw(header::USER_AGENT),
+        accept_language: raw(header::ACCEPT_LANGUAGE),
+        referer: raw(header::REFERER),
+        query: query.map(str::as_bytes),
         cookies: &cookies,
         random: fast_random(),
     };
@@ -246,6 +263,8 @@ pub async fn handle(
     let cache = redirect.cacheable.then(|| app.cache_control.clone());
     let outcome = if redirect.fallback {
         Outcome::Fallback
+    } else if redirect.rule.is_some() {
+        Outcome::Rule
     } else {
         Outcome::Redirect
     };

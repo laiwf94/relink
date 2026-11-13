@@ -23,7 +23,7 @@ use relink_server::metrics::Metrics;
 use relink_server::model::{Destination, Link};
 use relink_server::redirect::handle;
 use relink_server::resolver::LinkSource;
-use relink_server::rules_v2::{self, Rule};
+use relink_server::rules_v2::{self, Rule, RuleSet};
 use relink_server::server::{App, public_router};
 use relink_server::store::{Db, DbConfig, DbError};
 use relink_server::util::BoxFuture;
@@ -52,7 +52,7 @@ fn link(code: &str, destinations: usize) -> Link {
         enabled: true,
         health_check: false,
         unhealthy: vec![false; destinations],
-        rules: Vec::new(),
+        rules: Default::default(),
     }
 }
 
@@ -95,7 +95,9 @@ fn app(rt: &tokio::runtime::Runtime) -> Arc<App> {
             kv_outbox: false,
         },
     );
-    let source = Arc::new(Links(vec![link("bench", 1), link("split", 3)]));
+    let mut ruled = link("ruled", 1);
+    ruled.rules = serde_json::from_str(&worst_rules_for_handler()).unwrap();
+    let source = Arc::new(Links(vec![link("bench", 1), link("split", 3), ruled]));
     let (app, mut rx) = App::new(
         cfg,
         db,
@@ -120,22 +122,33 @@ fn redirect_path(c: &mut Criterion) {
     headers.insert("referer", "https://news.example.org/story".parse().unwrap());
     headers.insert("cf-ipcountry", "DE".parse().unwrap());
     let peer = "203.0.113.9".parse().unwrap();
-    rt.block_on(handle(&app, "bench", &headers, peer));
-    rt.block_on(handle(&app, "split", &headers, peer));
+    rt.block_on(handle(&app, "bench", None, &headers, peer));
+    rt.block_on(handle(&app, "split", None, &headers, peer));
 
     let mut g = c.benchmark_group("redirect");
     g.bench_function("handler_cache_hit", |b| {
         b.to_async(&rt)
-            .iter(|| handle(&app, "bench", &headers, peer))
+            .iter(|| handle(&app, "bench", None, &headers, peer))
     });
     g.bench_function("handler_ab_split_new_visitor", |b| {
         b.to_async(&rt)
-            .iter(|| handle(&app, "split", &headers, peer))
+            .iter(|| handle(&app, "split", None, &headers, peer))
+    });
+    // A cached link whose rules are compiled already: all 64 leaves are
+    // tested and the eighth rule answers.
+    let mut ruled_headers = headers.clone();
+    ruled_headers.insert("accept-language", "en-US,en;q=0.9".parse().unwrap());
+    let query = Some("utm_source=newsletter&utm_medium=email");
+    let (resp, _) = rt.block_on(handle(&app, "ruled", query, &ruled_headers, peer));
+    assert_eq!(resp.headers()["location"], "https://r7.example.com/");
+    g.bench_function("handler_cache_hit_64_rule_conditions", |b| {
+        b.to_async(&rt)
+            .iter(|| handle(&app, "ruled", query, &ruled_headers, peer))
     });
     g.bench_function("handler_negative_hit", |b| {
-        rt.block_on(handle(&app, "missing", &headers, peer));
+        rt.block_on(handle(&app, "missing", None, &headers, peer));
         b.to_async(&rt)
-            .iter(|| handle(&app, "missing", &headers, peer))
+            .iter(|| handle(&app, "missing", None, &headers, peer))
     });
     let router = public_router(app.clone());
     let addr: SocketAddr = "203.0.113.9:4000".parse().unwrap();
@@ -226,9 +239,25 @@ fn rules(c: &mut Criterion) {
         b.iter(|| one.evaluate(&req))
     });
 
-    // Eight rules of eight leaves; the last leaf of each of the first seven
-    // fails, so all 64 are tested before the eighth rule matches.
-    let leaves = [
+    let worst = compile(&worst_rules());
+    assert_eq!(worst.evaluate_counted(&req), (Some(7), 64));
+    c.bench_function("rules_v2_64_conditions_worst_case", |b| {
+        b.iter(|| worst.evaluate(&req))
+    });
+    // What the edge pays per KV read of such a link: parsing the rule list
+    // and compiling it.
+    let json = worst_rules();
+    c.bench_function("rules_v2_parse_and_compile_64_conditions", |b| {
+        b.iter(|| serde_json::from_str::<RuleSet>(&json).unwrap())
+    });
+}
+
+/// Eight rules of eight leaves, read at 2026-11-16 09:30 UTC (a Monday)
+/// by an iPhone in California with `utm_source=newsletter`: the last leaf
+/// of each of the first seven fails, so all 64 are tested before the
+/// eighth rule matches.
+fn worst_rules() -> String {
+    eight_by_eight([
         r#"{"country": ["US"]}"#,
         r#"{"region": ["US-CA"]}"#,
         r#"{"device": ["mobile"]}"#,
@@ -236,7 +265,27 @@ fn rules(c: &mut Criterion) {
         r#"{"language": ["en"]}"#,
         r#"{"referrer": ["example.org"]}"#,
         r#"{"time": {"days": ["mon"], "hours": ["09:00", "17:00"]}}"#,
-    ];
+    ])
+}
+
+/// The same shape for the handler benchmark's request, which comes from an
+/// untrusted peer (so no country or region) at whatever time it runs: every
+/// leaf but the last of each rule still holds, so again all 64 are tested.
+fn worst_rules_for_handler() -> String {
+    eight_by_eight([
+        r#"{"not": {"country": ["ZZ"]}}"#,
+        r#"{"not": {"region": ["US-NY"]}}"#,
+        r#"{"device": ["mobile"]}"#,
+        r#"{"os": ["ios"]}"#,
+        r#"{"language": ["en"]}"#,
+        r#"{"referrer": ["example.org"]}"#,
+        r#"{"query": {"name": "utm_medium", "values": ["email"]}}"#,
+    ])
+}
+
+/// Eight rules, each `all` of `leaves` and a `utm_source` leaf that holds
+/// only in the eighth.
+fn eight_by_eight(leaves: [&str; 7]) -> String {
     let mut list = Vec::new();
     for r in 0..8 {
         let last = if r < 7 {
@@ -250,11 +299,7 @@ fn rules(c: &mut Criterion) {
             all.join(",")
         ));
     }
-    let worst = compile(&format!("[{}]", list.join(",")));
-    assert_eq!(worst.evaluate_counted(&req), (Some(7), 64));
-    c.bench_function("rules_v2_64_conditions_worst_case", |b| {
-        b.iter(|| worst.evaluate(&req))
-    });
+    format!("[{}]", list.join(","))
 }
 
 criterion_group!(benches, redirect_path, components);

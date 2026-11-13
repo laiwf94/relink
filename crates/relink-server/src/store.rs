@@ -24,7 +24,7 @@ use crate::auth::{Role, Scopes};
 use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
-use relink_core::rules_v2::Rule;
+use relink_core::rules_v2::RuleSet;
 use relink_core::wire::{domain_kv_key, host_kv_key, kv_key};
 
 /// Columns read into a [`Link`], as a literal so queries stay `&'static str`.
@@ -211,8 +211,8 @@ pub struct NewLink {
     pub fallback_url: Option<String>,
     pub enabled: bool,
     pub health_check: bool,
-    /// Targeting rules, compiled once by the API to validate them.
-    pub rules: Vec<Rule>,
+    /// Targeting rules, compiled by the API to validate them.
+    pub rules: RuleSet,
     /// The verified custom domain (hostname) to create the link on, or
     /// `None` for the default domain.
     pub domain: Option<String>,
@@ -231,7 +231,7 @@ pub struct LinkPatch {
     pub enabled: Option<bool>,
     pub health_check: Option<bool>,
     /// The whole new rule list; empty removes the rules.
-    pub rules: Option<Vec<Rule>>,
+    pub rules: Option<RuleSet>,
 }
 
 /// An active API key as stored, with its owner's role in its workspace.
@@ -554,7 +554,9 @@ impl Db {
             .map(|i| failures.get(i).copied().unwrap_or(0) >= self.health_threshold)
             .collect();
         let status: i16 = row.try_get("redirect_status")?;
-        let Json(rules): Json<Vec<Rule>> = row.try_get("rules")?;
+        // Compiled here, once per load: the cached link carries its rules
+        // ready to evaluate.
+        let Json(rules): Json<RuleSet> = row.try_get("rules")?;
         let link = Link {
             id: row.try_get("id")?,
             code: row.try_get("code")?,

@@ -208,7 +208,8 @@ pub struct Request<'a> {
 // ---------------------------------------------------------------- compiled
 
 /// Where a step goes next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Jump {
     /// Test the step at this index, always greater than the current one.
     Step(u8),
@@ -219,14 +220,15 @@ pub enum Jump {
 }
 
 /// One leaf test and where to go after it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     test: Test,
     pub on_true: Jump,
     pub on_false: Jump,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Test {
     /// Sorted, for binary search.
     Country(Box<[[u8; 2]]>),
@@ -247,7 +249,7 @@ enum Test {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Window {
     after_ms: Option<i64>,
     before_ms: Option<i64>,
@@ -281,7 +283,13 @@ impl Test {
 
 /// A validated rule list in the form evaluation runs: the flat decision
 /// list and each rule's normalised destination.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// It serialises as `{"steps": [...], "urls": [...]}`, the form published
+/// to the edge, and deserialising checks everything evaluation relies on
+/// (see [`Rules::check`]), so a record that would not compile to this
+/// cannot be loaded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Program", into = "Program")]
 pub struct Rules {
     steps: Vec<Step>,
     urls: Vec<String>,
@@ -338,6 +346,71 @@ impl Rules {
     }
 }
 
+/// The serialised form of [`Rules`].
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Program {
+    steps: Vec<Step>,
+    urls: Vec<String>,
+}
+
+impl From<Rules> for Program {
+    fn from(r: Rules) -> Program {
+        Program {
+            steps: r.steps,
+            urls: r.urls,
+        }
+    }
+}
+
+impl TryFrom<Program> for Rules {
+    type Error = &'static str;
+    fn try_from(p: Program) -> Result<Rules, &'static str> {
+        Rules::check(p.steps, p.urls)
+    }
+}
+
+impl Rules {
+    /// A decision list from outside the compiler, refused unless it keeps
+    /// the promises [`compile`] makes: at most [`MAX_CONDITIONS`] steps and
+    /// [`MAX_RULES`] rules, every jump forward and in range, value lists
+    /// within [`MAX_VALUES`] and country lists sorted for binary search.
+    fn check(steps: Vec<Step>, urls: Vec<String>) -> Result<Rules, &'static str> {
+        if steps.len() > MAX_CONDITIONS || urls.len() > MAX_RULES {
+            return Err("too many steps or rules");
+        }
+        for (i, step) in steps.iter().enumerate() {
+            for jump in [step.on_true, step.on_false] {
+                let ok = match jump {
+                    Jump::Step(j) => usize::from(j) > i && usize::from(j) < steps.len(),
+                    Jump::Rule(r) => usize::from(r) < urls.len(),
+                    Jump::Default => true,
+                };
+                if !ok {
+                    return Err("a jump goes backward or out of range");
+                }
+            }
+            let values = match &step.test {
+                Test::Country(list) => {
+                    if !list.is_sorted() {
+                        return Err("a country list is not sorted");
+                    }
+                    list.len()
+                }
+                Test::Region(list) => list.len(),
+                Test::Language(list) | Test::Referrer(list) => list.len(),
+                Test::Query { values, .. } => values.as_ref().map_or(0, |v| v.len()),
+                Test::Device(_) | Test::Os(_) | Test::Browser(_) | Test::Time(_) => 0,
+            };
+            if values > MAX_VALUES {
+                return Err("a value list is too long");
+            }
+        }
+        let needs = steps.iter().fold(0, |n, s| n | s.test.needs());
+        Ok(Rules { steps, urls, needs })
+    }
+}
+
 // ---------------------------------------------------------------- compiler
 
 /// A validated condition tree, before it is flattened.
@@ -361,6 +434,14 @@ impl Node {
 /// Validates `rules` and compiles them. Destinations are normalised under
 /// `policy`, as link destinations are.
 pub fn compile(rules: &[Rule], policy: Policy) -> Result<Rules, RuleError> {
+    build(rules, |url| {
+        normalize(url, policy).map_err(|e| e.to_string())
+    })
+}
+
+/// Compiles `rules` with each destination taken as given: what [`compile`]
+/// does with `normalize` replaced by `url`.
+fn build(rules: &[Rule], url: impl Fn(&str) -> Result<String, String>) -> Result<Rules, RuleError> {
     if rules.len() > MAX_RULES {
         return fail("rules", format!("at most {MAX_RULES} rules"));
     }
@@ -369,9 +450,9 @@ pub fn compile(rules: &[Rule], policy: Policy) -> Result<Rules, RuleError> {
     let mut total = 0;
     for (i, rule) in rules.iter().enumerate() {
         let path = format!("rules[{i}]");
-        let url = normalize(&rule.url, policy).map_err(|e| RuleError {
+        let url = url(&rule.url).map_err(|reason| RuleError {
             path: format!("{path}.url"),
-            reason: e.to_string(),
+            reason,
         })?;
         let tree = check(&rule.condition, &format!("{path}.if"), 0)?;
         total += tree.leaves();
@@ -400,6 +481,90 @@ pub fn compile(rules: &[Rule], policy: Policy) -> Result<Rules, RuleError> {
     debug_assert_eq!(steps.len(), total);
     let needs = steps.iter().fold(0, |n, s| n | s.test.needs());
     Ok(Rules { steps, urls, needs })
+}
+
+// ---------------------------------------------------------------- rule set
+
+/// A link's rules as written and as compiled, so the redirect path never
+/// compiles.
+///
+/// Its own serde form is the written list: that is what the database and
+/// the API hold, and deserialising it compiles, once, when the origin loads
+/// a link. [`crate::model::Link`] publishes the compiled form instead,
+/// through [`program`], and the edge loads that: it needs only the decision
+/// list, and so never links the compiler. A set loaded from its compiled
+/// form has no written rules. Two sets are equal when their compiled forms
+/// are, which the written rules determine.
+#[derive(Clone, Debug, Default)]
+pub struct RuleSet {
+    written: Vec<Rule>,
+    compiled: Rules,
+}
+
+impl RuleSet {
+    /// Compiles stored `rules`, whose destinations the API normalised
+    /// before storing them. They are not normalised again: that would link
+    /// the URL parser and its IDNA tables into the edge Worker, and a
+    /// destination policy made stricter since must not make a stored link
+    /// unreadable. Fails only if a condition is malformed or a limit is
+    /// exceeded, which the API would have refused.
+    pub fn new(written: Vec<Rule>) -> Result<RuleSet, RuleError> {
+        let compiled = build(&written, |url| Ok(url.to_owned()))?;
+        Ok(RuleSet { written, compiled })
+    }
+
+    /// The rules as written, in order; empty for a set loaded from its
+    /// compiled form.
+    pub fn rules(&self) -> &[Rule] {
+        &self.written
+    }
+
+    pub fn compiled(&self) -> &Rules {
+        &self.compiled
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.compiled.is_empty()
+    }
+}
+
+impl PartialEq for RuleSet {
+    fn eq(&self, other: &RuleSet) -> bool {
+        self.compiled == other.compiled
+    }
+}
+
+impl Eq for RuleSet {}
+
+impl Serialize for RuleSet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.written.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for RuleSet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<RuleSet, D::Error> {
+        let written = Vec::<Rule>::deserialize(d)?;
+        RuleSet::new(written).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A [`RuleSet`] as its compiled [`Rules`], for `#[serde(with)]`: the form
+/// link records carry to the edge.
+pub mod program {
+    use super::{RuleSet, Rules};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(set: &RuleSet, s: S) -> Result<S::Ok, S::Error> {
+        set.compiled.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<RuleSet, D::Error> {
+        Ok(RuleSet {
+            written: Vec::new(),
+            compiled: Rules::deserialize(d)?,
+        })
+    }
 }
 
 fn index(i: usize) -> u8 {
@@ -1439,5 +1604,160 @@ mod tests {
         assert!(!host_matches("com", "example.com"));
         assert!(language_matches("zh-Hant-TW", "zh-hant"));
         assert!(!language_matches("zh", "zh-hant"));
+    }
+
+    #[test]
+    fn rule_sets_compile_on_read_and_keep_the_written_form() {
+        let json = r#"[{"if":{"country":["US"]},"url":"https://example.com/us"}]"#;
+        let set: RuleSet = serde_json::from_str(json).unwrap();
+        assert_eq!(set.rules().len(), 1);
+        assert_eq!(set.compiled().steps().len(), 1);
+        assert_eq!(serde_json::to_string(&set).unwrap(), json);
+        assert_eq!(set, RuleSet::new(set.rules().to_vec()).unwrap());
+        assert_ne!(set, RuleSet::default());
+        assert!(RuleSet::default().is_empty() && RuleSet::default().compiled().is_empty());
+        // Stored destinations are taken as stored: a host a stricter policy
+        // would now refuse still loads, and nothing is rewritten.
+        let private = r#"[{"if":{"country":["US"]},"url":"HTTP://10.0.0.1/x"}]"#;
+        let set: RuleSet = serde_json::from_str(private).unwrap();
+        assert_eq!(set.compiled().urls(), ["HTTP://10.0.0.1/x"]);
+        // Conditions are still checked.
+        let bad = r#"[{"if":{"country":["USA"]},"url":"https://example.com/"}]"#;
+        let err = serde_json::from_str::<RuleSet>(bad).unwrap_err();
+        assert!(
+            err.to_string().starts_with("rules[0].if.country[0]"),
+            "{err}"
+        );
+        // A list past the limits is refused as a whole.
+        let leaf = r#"{"if":{"country":["US"]},"url":"https://example.com/"}"#;
+        let many = format!("[{}]", vec![leaf; MAX_RULES + 1].join(","));
+        let err = serde_json::from_str::<RuleSet>(&many).unwrap_err();
+        assert!(err.to_string().contains("at most 32 rules"), "{err}");
+    }
+
+    #[test]
+    fn the_compiled_program_round_trips_and_evaluates_alike() {
+        let written: Vec<Rule> = serde_json::from_str(
+            r#"[{"if": {"all": [{"country": ["US", "CA"]}, {"not": {"os": ["ios"]}}]},
+                 "url": "https://example.com/a"},
+                {"if": {"any": [{"region": ["US-CA"]}, {"language": ["de"]},
+                                {"referrer": ["news.example"]},
+                                {"query": {"name": "src", "values": ["mail"]}},
+                                {"time": {"days": ["mon"], "hours": ["22:00", "06:00"]}}]},
+                 "url": "https://example.com/b"}]"#,
+        )
+        .unwrap();
+        let set = RuleSet::new(written).unwrap();
+        #[derive(Serialize, Deserialize)]
+        struct Record {
+            #[serde(with = "program")]
+            rules: RuleSet,
+        }
+        let json = serde_json::to_string(&Record { rules: set.clone() }).unwrap();
+        assert!(
+            json.starts_with(r#"{"rules":{"steps":[{"test":{"country""#),
+            "{json}"
+        );
+        let loaded: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.rules, set);
+        assert!(
+            loaded.rules.rules().is_empty(),
+            "the written form is not published"
+        );
+        assert_eq!(loaded.rules.compiled().needs, set.compiled().needs);
+        let req = Request {
+            now_ms: 1_794_832_200_000,
+            accept_language: Some(b"de"),
+            ..Request::default()
+        };
+        assert_eq!(loaded.rules.compiled().evaluate(&req), Some(1));
+        assert_eq!(set.compiled().evaluate(&req), Some(1));
+        // The written list (what records published before held) is refused.
+        let old = r#"{"rules":[{"if":{"country":["US"]},"url":"https://example.com/"}]}"#;
+        assert!(serde_json::from_str::<Record>(old).is_err());
+    }
+
+    #[test]
+    fn a_program_that_breaks_a_promise_is_refused() {
+        let leaf = |test: &str, t: &str, f: &str| {
+            format!(r#"{{"test": {test}, "on_true": {t}, "on_false": {f}}}"#)
+        };
+        let program = |steps: &[String], urls: usize| {
+            let urls: Vec<String> = (0..urls)
+                .map(|i| format!("\"https://e.example/{i}\""))
+                .collect();
+            format!(
+                r#"{{"steps": [{}], "urls": [{}]}}"#,
+                steps.join(","),
+                urls.join(",")
+            )
+        };
+        let us = r#"{"country": [[85, 83]]}"#;
+        let ok = program(
+            &[
+                leaf(us, r#"{"step": 1}"#, r#""default""#),
+                leaf(r#"{"device": 1}"#, r#"{"rule": 0}"#, r#""default""#),
+            ],
+            1,
+        );
+        let rules: Rules = serde_json::from_str(&ok).unwrap();
+        assert_eq!(rules.steps().len(), 2);
+        assert_eq!(rules.needs, NEEDS_DEVICE);
+
+        let bad = [
+            // Backward, to itself, and past the end.
+            program(&[leaf(us, r#"{"step": 0}"#, r#""default""#)], 1),
+            program(&[leaf(us, r#"{"step": 1}"#, r#""default""#)], 1),
+            // A rule that does not exist.
+            program(&[leaf(us, r#"{"rule": 1}"#, r#""default""#)], 1),
+            // Unsorted countries would break the binary search.
+            program(
+                &[leaf(
+                    r#"{"country": [[85, 83], [68, 69]]}"#,
+                    r#"{"rule": 0}"#,
+                    r#""default""#,
+                )],
+                1,
+            ),
+            // Past the bounds.
+            program(
+                &vec![leaf(us, r#""default""#, r#""default""#); MAX_CONDITIONS + 1],
+                1,
+            ),
+            program(&[], MAX_RULES + 1),
+            format!(
+                r#"{{"steps": [{}], "urls": ["https://e.example/"]}}"#,
+                leaf(
+                    &format!(
+                        r#"{{"language": [{}]}}"#,
+                        vec![r#""en""#; MAX_VALUES + 1].join(",")
+                    ),
+                    r#"{"rule": 0}"#,
+                    r#""default""#
+                )
+            ),
+            // Unknown fields and tests.
+            r#"{"steps": [], "urls": [], "extra": 1}"#.to_owned(),
+            program(
+                &[leaf(r#"{"planet": 3}"#, r#"{"rule": 0}"#, r#""default""#)],
+                1,
+            ),
+        ];
+        for json in &bad {
+            assert!(serde_json::from_str::<Rules>(json).is_err(), "{json}");
+        }
+        // Every list compile produces passes the same check.
+        let compiled = compile(
+            &serde_json::from_str::<Vec<Rule>>(
+                r#"[{"if": {"query": {"name": "a", "values": ["1", "2"]}}, "url": "https://example.com/"},
+                    {"if": {"time": {"after": "2020-01-01T00:00:00Z"}}, "url": "https://example.com/t"}]"#,
+            )
+            .unwrap(),
+            Policy::default(),
+        )
+        .unwrap();
+        let again: Rules =
+            serde_json::from_str(&serde_json::to_string(&compiled).unwrap()).unwrap();
+        assert_eq!(again, compiled);
     }
 }

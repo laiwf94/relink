@@ -126,6 +126,113 @@ async fn geo_rules_and_fallback() {
     h.shutdown().await;
 }
 
+/// A path and query, the headers sent with it, and the expected location.
+type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+
+#[tokio::test]
+async fn targeting_rules_route_visitors_from_the_stored_link() {
+    let mut h = harness!(("RELINK_REGION_HEADER", "cf-region-code"));
+    let rules = json!([
+        {"if": {"all": [{"os": ["android"]}, {"device": ["mobile"]}]},
+         "url": "https://play.example.com/app"},
+        {"if": {"region": ["US-CA"]}, "url": "https://example.com/ca"},
+        {"if": {"language": ["de"]}, "url": "https://example.com/de"},
+        {"if": {"referrer": ["news.example"]}, "url": "https://example.com/news"},
+        {"if": {"query": {"name": "src", "values": ["mail"]}}, "url": "https://example.com/mail"}
+    ]);
+    let l = h
+        .create(json!({"url": "https://example.com/", "redirect_type": 307, "rules": rules}))
+        .await;
+    let code = l["code"].as_str().unwrap().to_owned();
+    let android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/124.0 Mobile Safari/537.36";
+    let cases: [Case; 7] = [
+        (
+            &code,
+            &[("user-agent", android)],
+            "https://play.example.com/app",
+        ),
+        (
+            &code,
+            &[("cf-ipcountry", "US"), ("cf-region-code", "CA")],
+            "https://example.com/ca",
+        ),
+        (&code, &[("cf-region-code", "CA")], "https://example.com/"),
+        (
+            &code,
+            &[("accept-language", "de-CH, en;q=0.5")],
+            "https://example.com/de",
+        ),
+        (
+            &code,
+            &[("referer", "https://www.news.example/x")],
+            "https://example.com/news",
+        ),
+        (
+            &format!("{code}?a=1&src=ma%69l"),
+            &[],
+            "https://example.com/mail",
+        ),
+        (&format!("{code}?src=ads"), &[], "https://example.com/"),
+    ];
+    for (path, headers, want) in cases {
+        // Twice: the second answer comes from the cached, compiled link.
+        for _ in 0..2 {
+            let r = h.visit(path, headers).await;
+            assert_eq!(r.status(), 307, "{path} {headers:?}");
+            assert_eq!(location(&r), want, "{path} {headers:?}");
+            assert_eq!(
+                r.headers()["cache-control"],
+                "no-store",
+                "{path} {headers:?}"
+            );
+        }
+    }
+    let m = h.metrics().await;
+    assert_eq!(metric(&m, "relink_redirects_total{outcome=\"rule\"}"), 10.0);
+
+    // A new list takes effect at once, and removing it makes the link
+    // cacheable again.
+    let (status, _) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/links/{code}"),
+            &h.alice,
+            Some(json!({"rules": [{"if": {"language": ["fr"]}, "url": "https://example.com/fr"}]})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let r = h.visit(&code, &[("accept-language", "de")]).await;
+    assert_eq!(location(&r), "https://example.com/");
+    let r = h.visit(&code, &[("accept-language", "fr-FR")]).await;
+    assert_eq!(location(&r), "https://example.com/fr");
+    let (status, _) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/links/{code}"),
+            &h.alice,
+            Some(json!({"rules": null})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let r = h.visit(&code, &[("accept-language", "fr-FR")]).await;
+    assert_eq!(location(&r), "https://example.com/");
+    assert_eq!(r.headers()["cache-control"], "private, max-age=0");
+
+    // A rule's redirect is a click, and spends the click limit.
+    let limited = h
+        .create(json!({"url": "https://example.com/", "max_clicks": 1,
+                       "rules": [{"if": {"query": {"name": "src"}}, "url": "https://example.com/q"}]}))
+        .await;
+    let code = limited["code"].as_str().unwrap();
+    let r = h.visit(&format!("{code}?src"), &[]).await;
+    assert_eq!(
+        (r.status().as_u16(), location(&r).as_str()),
+        (302, "https://example.com/q")
+    );
+    assert_eq!(h.visit(&format!("{code}?src"), &[]).await.status(), 410);
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn forwarding_headers_from_untrusted_peers_are_ignored() {
     // Loopback is not a trusted proxy here, so a client sending CF-IPCountry

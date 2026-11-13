@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::rules_v2::Rule;
+use crate::rules_v2::RuleSet;
 
 /// One place a link can send visitors, with its share of an A/B split.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,9 +125,18 @@ pub struct Link {
     #[serde(default)]
     pub unhealthy: Vec<bool>,
     /// Targeting rules ([`crate::rules_v2`]), as validated by the API, with
-    /// destinations normalised. Omitted from the wire form when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules: Vec<Rule>,
+    /// destinations normalised, and compiled when the link is read. On the
+    /// wire they are the compiled decision list
+    /// ([`crate::rules_v2::program`]), omitted when empty, so the edge never
+    /// compiles. Records published before rules were evaluated carry the
+    /// written list here instead; it does not parse as a decision list, so
+    /// the edge sends such a link to the origin until it is next published.
+    #[serde(
+        default,
+        skip_serializing_if = "RuleSet::is_empty",
+        with = "crate::rules_v2::program"
+    )]
+    pub rules: RuleSet,
 }
 
 impl Link {

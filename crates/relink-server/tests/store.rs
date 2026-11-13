@@ -43,7 +43,7 @@ fn new_link(alias: Option<&str>, max_clicks: Option<i64>) -> NewLink {
         fallback_url: None,
         enabled: true,
         health_check: true,
-        rules: Vec::new(),
+        rules: Default::default(),
         domain: None,
     }
 }

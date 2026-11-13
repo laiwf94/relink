@@ -309,7 +309,7 @@ mod tests {
             enabled: true,
             health_check: false,
             unhealthy: vec![false],
-            rules: Vec::new(),
+            rules: Default::default(),
         }
     }
 
