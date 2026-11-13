@@ -788,6 +788,20 @@ benchmark machine a one-leaf list takes about 26 ns and the worst case, 64
 leaves all tested and every fact read, about 0.8 µs
 (`cargo bench --bench hot_path -- rules_v2`).
 
+Links carry their rules as `rules` in the API (`POST /v1/links`,
+`PATCH /v1/links/{code}`, where a list replaces the old one and `null` or
+`[]` removes it). The server compiles every list it is given under the
+destination policy, so a refused list is `invalid_argument` with the JSON
+path of the part at fault (`rules[1].if.all[0].country[2]: "USA" is not a
+two-letter country code`), and serde's own errors cover unknown leaves and
+fields. A list that compiles is stored as written, with each rule's
+destination normalised, in `links.rules` (migration 0016, a `jsonb` array
+bounded to 64 KiB). It is part of `relink_core::model::Link`, so the
+redirect role reads it with the rest of the row, audit entries show it,
+and the edge gets it inside the link's KV record; the field is left out
+of that record when a link has no rules. The redirect path does not
+evaluate rules yet: that lands with the next task of week 3.
+
 ## Click limits without a write per click
 
 This is escrow (O'Neil, "The Escrow Transactional Method"). Each instance

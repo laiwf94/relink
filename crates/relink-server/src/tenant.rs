@@ -308,8 +308,8 @@ impl<'a> Tenant<'a> {
                     let row = sqlx::query(concat!(
                         "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
                          max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-                         domain_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING ",
+                         domain_id, rules) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING ",
                         api_columns!()
                     ))
                     .bind(&*code)
@@ -324,6 +324,7 @@ impl<'a> Tenant<'a> {
                     .bind(new.enabled)
                     .bind(new.health_check)
                     .bind(domain_id)
+                    .bind(Json(&new.rules))
                     .fetch_one(&mut *tx)
                     .await?;
                     let link = self.db.row_to_link(&row)?;
@@ -434,6 +435,9 @@ impl<'a> Tenant<'a> {
                 if let Some(h) = patch.health_check {
                     link.health_check = h;
                 }
+                if let Some(r) = &patch.rules {
+                    link.rules = r.clone();
+                }
                 let (geo_mode, geo_countries) = geo_columns(link.geo.as_ref());
                 let row = sqlx::query(concat!(
                     "UPDATE links SET destinations = $2, \
@@ -441,7 +445,7 @@ impl<'a> Tenant<'a> {
                      health_failures = CASE WHEN $3 THEN '{}'::smallint[] ELSE health_failures END, \
                      redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
                      geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
-                     updated_at = now() WHERE id = $1 RETURNING ",
+                     rules = $12, updated_at = now() WHERE id = $1 RETURNING ",
                     api_columns!()
                 ))
                 .bind(link.id)
@@ -455,6 +459,7 @@ impl<'a> Tenant<'a> {
                 .bind(&link.fallback_url)
                 .bind(link.enabled)
                 .bind(link.health_check)
+                .bind(Json(&link.rules))
                 .fetch_one(&mut *tx)
                 .await?;
                 let updated = self.db.row_to_link(&row)?;

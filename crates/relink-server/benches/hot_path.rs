@@ -52,6 +52,7 @@ fn link(code: &str, destinations: usize) -> Link {
         enabled: true,
         health_check: false,
         unhealthy: vec![false; destinations],
+        rules: Vec::new(),
     }
 }
 

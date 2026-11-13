@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::Instrument;
 
+use relink_core::rules_v2::{self, Rule};
 use relink_core::wire::{ClickBatch, MAX_BATCH, WireClick};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -467,6 +468,8 @@ pub struct CreateLink {
     pub fallback_url: Option<String>,
     pub enabled: Option<bool>,
     pub health_check: Option<bool>,
+    /// Targeting rules ([`rules_v2`]); absent or empty for none.
+    pub rules: Option<Vec<Rule>>,
     /// A verified custom domain of the workspace to create the link on;
     /// absent or null for the default domain.
     pub domain: Option<String>,
@@ -495,6 +498,9 @@ pub struct PatchLink {
     pub fallback_url: Option<Option<String>>,
     pub enabled: Option<bool>,
     pub health_check: Option<bool>,
+    /// Replaces the whole rule list; `null` or `[]` removes the rules.
+    #[serde(default, deserialize_with = "nullable")]
+    pub rules: Option<Option<Vec<Rule>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -527,6 +533,8 @@ pub struct LinkView {
     pub enabled: bool,
     pub health_check: bool,
     pub health_checked_at: Option<DateTime<Utc>>,
+    /// Targeting rules in order, `[]` for none.
+    pub rules: Vec<Rule>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -567,6 +575,7 @@ impl LinkView {
             enabled: link.enabled,
             health_check: link.health_check,
             health_checked_at: link.health_checked_at,
+            rules: link.rules.clone(),
             created_at: link.created_at,
             updated_at: link.updated_at,
         }
@@ -730,6 +739,18 @@ fn validate_geo(g: GeoInput) -> Result<GeoRule, ApiError> {
     })
 }
 
+/// Validates a rule list by compiling it under the destination policy, and
+/// returns it with each rule's destination normalised. The error names the
+/// part at fault by its JSON path, `rules[1].if.all[0].country[2]: ...`.
+fn validate_rules(app: &App, mut rules: Vec<Rule>) -> Result<Vec<Rule>, ApiError> {
+    let compiled = rules_v2::compile(&rules, app.cfg.destination_policy)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    for (rule, url) in rules.iter_mut().zip(compiled.urls()) {
+        rule.url.clone_from(url);
+    }
+    Ok(rules)
+}
+
 fn validate_fallback(app: &App, url: String) -> Result<String, ApiError> {
     normalize(&url, app.cfg.destination_policy)
         .map_err(|e| ApiError::invalid(format!("fallback_url: {e}")))
@@ -759,6 +780,11 @@ pub async fn create_link(
             .transpose()?,
         enabled: req.enabled.unwrap_or(true),
         health_check: req.health_check.unwrap_or(false),
+        rules: req
+            .rules
+            .map(|r| validate_rules(&app, r))
+            .transpose()?
+            .unwrap_or_default(),
         domain: domain_param(req.domain),
     };
     let link = ws
@@ -866,6 +892,10 @@ pub async fn update_link(
             .transpose()?,
         enabled: req.enabled,
         health_check: req.health_check,
+        rules: req
+            .rules
+            .map(|r| validate_rules(&app, r.unwrap_or_default()))
+            .transpose()?,
     };
     let empty = patch.destinations.is_none()
         && patch.redirect_status.is_none()
@@ -874,7 +904,8 @@ pub async fn update_link(
         && patch.geo.is_none()
         && patch.fallback_url.is_none()
         && patch.enabled.is_none()
-        && patch.health_check.is_none();
+        && patch.health_check.is_none()
+        && patch.rules.is_none();
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }

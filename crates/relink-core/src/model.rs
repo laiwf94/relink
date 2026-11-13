@@ -5,6 +5,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::rules_v2::Rule;
+
 /// One place a link can send visitors, with its share of an A/B split.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +124,10 @@ pub struct Link {
     /// Per destination: true once health checks failed often enough.
     #[serde(default)]
     pub unhealthy: Vec<bool>,
+    /// Targeting rules ([`crate::rules_v2`]), as validated by the API, with
+    /// destinations normalised. Omitted from the wire form when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
 }
 
 impl Link {

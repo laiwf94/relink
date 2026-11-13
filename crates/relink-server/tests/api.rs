@@ -995,3 +995,315 @@ async fn requests_act_in_their_keys_workspace() {
     }
     h.shutdown().await;
 }
+
+/// `rules` as the API returns them for `body`, after checking `status`.
+fn rules_of(status: u16, body: &Value) -> Value {
+    assert_eq!(status, 200, "{body}");
+    body["rules"].clone()
+}
+
+#[tokio::test]
+async fn rules_are_validated_stored_and_replaced() {
+    let mut h = harness!();
+    // A link without rules says so with an empty list.
+    let plain = h.create(json!({"url": "https://example.com/"})).await;
+    assert_eq!(plain["rules"], json!([]));
+
+    let rules = json!([
+        {"if": {"all": [{"country": ["us", "CA"]}, {"os": ["ios"]}]},
+         "url": "https://Apps.Example.com/app"},
+        {"if": {"any": [{"language": ["de"]}, {"region": ["CH-ZH"]}]},
+         "url": "https://example.com/de"},
+        {"if": {"not": {"time": {"days": ["sat", "sun"], "hours": ["09:00", "17:00"],
+                                 "utc_offset_minutes": -300}}},
+         "url": "https://example.com/closed"},
+        {"if": {"query": {"name": "utm_source", "values": ["newsletter"]}},
+         "url": "https://example.com/welcome"},
+        {"if": {"referrer": ["news.example.org"]}, "url": "https://example.com/news"},
+        {"if": {"device": ["mobile"]}, "url": "https://example.com/m"},
+        {"if": {"browser": ["firefox"]}, "url": "https://example.com/ff"},
+    ]);
+    let link = h
+        .create(json!({"url": "https://example.com/", "rules": rules}))
+        .await;
+    let code = link["code"].as_str().unwrap().to_owned();
+    // Destinations are normalised as link destinations are; the rest is
+    // kept as written, in order.
+    let mut expected = rules.clone();
+    expected[0]["url"] = json!("https://apps.example.com/app");
+    assert_eq!(link["rules"], expected);
+    let path = format!("/v1/links/{code}");
+    let (status, got) = h.api(Method::GET, &path, &h.alice, None).await;
+    assert_eq!(rules_of(status, &got), expected);
+    let (status, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
+    assert_eq!(status, 200);
+    let listed = list["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["code"] == code.as_str())
+        .unwrap();
+    assert_eq!(listed["rules"], expected);
+
+    // A patch that leaves rules out keeps them.
+    let (status, patched) = h
+        .api(
+            Method::PATCH,
+            &path,
+            &h.alice,
+            Some(json!({"redirect_type": 301})),
+        )
+        .await;
+    assert_eq!(rules_of(status, &patched), expected);
+
+    // A patch with rules replaces the whole list.
+    let one = json!([{"if": {"country": ["DE"]}, "url": "https://example.com/de"}]);
+    let (status, patched) = h
+        .api(Method::PATCH, &path, &h.alice, Some(json!({"rules": one})))
+        .await;
+    assert_eq!(rules_of(status, &patched), one);
+
+    // null and [] both remove them.
+    for empty in [Value::Null, json!([])] {
+        let (status, patched) = h
+            .api(Method::PATCH, &path, &h.alice, Some(json!({"rules": one})))
+            .await;
+        assert_eq!(rules_of(status, &patched), one);
+        let (status, cleared) = h
+            .api(
+                Method::PATCH,
+                &path,
+                &h.alice,
+                Some(json!({"rules": empty})),
+            )
+            .await;
+        assert_eq!(rules_of(status, &cleared), json!([]));
+    }
+
+    // The bounds are inclusive: 32 rules and 64 conditions in all.
+    let leaf = json!({"country": ["US"]});
+    let two = json!({"all": [leaf, leaf]});
+    let at_limit: Vec<Value> = (0..32)
+        .map(|i| json!({"if": two, "url": format!("https://example.com/{i}")}))
+        .collect();
+    let (status, patched) = h
+        .api(
+            Method::PATCH,
+            &path,
+            &h.alice,
+            Some(json!({"rules": at_limit})),
+        )
+        .await;
+    assert_eq!(rules_of(status, &patched).as_array().unwrap().len(), 32);
+    // So is the nesting limit: eight levels of not around a leaf.
+    let mut deep = leaf.clone();
+    for _ in 0..8 {
+        deep = json!({"not": deep});
+    }
+    let (status, patched) = h
+        .api(
+            Method::PATCH,
+            &path,
+            &h.alice,
+            Some(json!({"rules": [{"if": deep, "url": "https://example.com/"}]})),
+        )
+        .await;
+    assert_eq!(rules_of(status, &patched)[0]["if"], deep);
+
+    // A refused patch changes nothing.
+    let (status, body) = h
+        .api(
+            Method::PATCH,
+            &path,
+            &h.alice,
+            Some(json!({"enabled": false,
+                        "rules": [{"if": {"os": ["beos"]}, "url": "https://example.com/"}]})),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_argument");
+    assert_eq!(
+        body["error"]["message"],
+        "rules[0].if.os[0]: \"beos\" is not a known value"
+    );
+    let (status, got) = h.api(Method::GET, &path, &h.alice, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(got["enabled"], true);
+    assert_eq!(got["rules"][0]["if"], deep);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_rules_are_refused_with_their_path() {
+    let mut h = harness!();
+    let url = "https://example.com/r";
+    // One rule with this condition.
+    let rule = |cond: Value| json!([{"if": cond, "url": url}]);
+    let leaf = json!({"country": ["US"]});
+    let mut too_deep = leaf.clone();
+    for _ in 0..9 {
+        too_deep = json!({"not": too_deep});
+    }
+    let too_many_rules: Vec<Value> = (0..33).map(|_| json!({"if": leaf, "url": url})).collect();
+    let too_many_leaves: Vec<Value> = (0..5)
+        .map(|_| json!({"if": {"any": vec![leaf.clone(); 13]}, "url": url}))
+        .collect();
+    let countries: Vec<String> = (0..301)
+        .map(|i| {
+            let b = [b'A' + (i / 26 % 26) as u8, b'A' + (i % 26) as u8];
+            String::from_utf8(b.to_vec()).unwrap()
+        })
+        .collect();
+
+    // (rules, the start of the error message)
+    let cases: Vec<(Value, &str)> = vec![
+        // Shapes serde refuses before compilation.
+        (json!({"if": leaf, "url": url}), "invalid JSON body"),
+        (
+            json!([{"if": leaf}]),
+            "invalid JSON body: missing field `url`",
+        ),
+        (
+            json!([{"url": url}]),
+            "invalid JSON body: missing field `if`",
+        ),
+        (
+            json!([{"if": leaf, "url": url, "weight": 2}]),
+            "invalid JSON body: unknown field `weight`",
+        ),
+        (
+            rule(json!({"planet": ["mars"]})),
+            "invalid JSON body: unknown variant `planet`",
+        ),
+        (
+            rule(json!({"country": "US"})),
+            "invalid JSON body: invalid type",
+        ),
+        (
+            rule(json!({"time": {"weekdays": ["mon"]}})),
+            "invalid JSON body: unknown field `weekdays`",
+        ),
+        // Destinations follow the destination policy.
+        (
+            json!([{"if": leaf, "url": "ftp://example.com/"}]),
+            "rules[0].url: ",
+        ),
+        (
+            json!([{"if": leaf, "url": "http://localhost/"}]),
+            "rules[0].url: ",
+        ),
+        // Every leaf's values, by path.
+        (rule(json!({"all": []})), "rules[0].if.all: "),
+        (rule(json!({"any": []})), "rules[0].if.any: "),
+        (rule(json!({"country": []})), "rules[0].if.country: "),
+        (
+            rule(json!({"country": ["USA"]})),
+            "rules[0].if.country[0]: ",
+        ),
+        (rule(json!({"region": ["US"]})), "rules[0].if.region[0]: "),
+        (
+            rule(json!({"device": ["phone"]})),
+            "rules[0].if.device[0]: ",
+        ),
+        (rule(json!({"os": ["iOS"]})), "rules[0].if.os[0]: "),
+        (rule(json!({"browser": ["ie"]})), "rules[0].if.browser[0]: "),
+        (
+            rule(json!({"language": ["en_US"]})),
+            "rules[0].if.language[0]: ",
+        ),
+        (
+            rule(json!({"referrer": ["https://example.com/"]})),
+            "rules[0].if.referrer[0]: ",
+        ),
+        (rule(json!({"time": {}})), "rules[0].if.time: "),
+        (
+            rule(
+                json!({"time": {"after": "2026-01-02T00:00:00Z", "before": "2026-01-01T00:00:00Z"}}),
+            ),
+            "rules[0].if.time.before: ",
+        ),
+        (
+            rule(json!({"time": {"days": ["monday"]}})),
+            "rules[0].if.time.days[0]: ",
+        ),
+        (
+            rule(json!({"time": {"hours": ["25:00", "06:00"]}})),
+            "rules[0].if.time.hours[0]: ",
+        ),
+        (
+            rule(json!({"time": {"days": ["mon"], "utc_offset_minutes": 900}})),
+            "rules[0].if.time.utc_offset_minutes: ",
+        ),
+        (
+            rule(json!({"query": {"name": ""}})),
+            "rules[0].if.query.name: ",
+        ),
+        (
+            rule(json!({"query": {"name": "a", "values": []}})),
+            "rules[0].if.query.values: ",
+        ),
+        // A later rule, deep inside, is named exactly.
+        (
+            json!([{"if": leaf, "url": url},
+                   {"if": {"not": {"all": [{"os": ["ios"]}, {"os": []}]}}, "url": url}]),
+            "rules[1].if.not.all[1].os: ",
+        ),
+        // The bounds.
+        (
+            rule(too_deep),
+            "rules[0].if.not.not.not.not.not.not.not.not.not: conditions nest at most 8 deep",
+        ),
+        (json!(too_many_rules), "rules: at most 32 rules"),
+        (
+            json!(too_many_leaves),
+            "rules[4]: rules may hold at most 64 conditions in all",
+        ),
+        (
+            rule(json!({"country": countries})),
+            "rules[0].if.country: at most 300 values",
+        ),
+    ];
+    assert!(cases.len() >= 30, "{} cases", cases.len());
+    for (rules, expected) in &cases {
+        let (status, body) = h
+            .api(
+                Method::POST,
+                "/v1/links",
+                &h.alice,
+                Some(json!({"url": url, "rules": rules})),
+            )
+            .await;
+        assert_eq!(status, 400, "{rules}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_argument", "{rules}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(expected),
+            "{rules}: {message:?} does not start with {expected:?}"
+        );
+    }
+    // None of them made a link.
+    let (status, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(list["links"], json!([]));
+
+    // An update is checked the same way and changes nothing.
+    let link = h.create(json!({"url": url})).await;
+    let path = format!("/v1/links/{}", link["code"].as_str().unwrap());
+    for (rules, expected) in &cases {
+        let (status, body) = h
+            .api(
+                Method::PATCH,
+                &path,
+                &h.alice,
+                Some(json!({"rules": rules})),
+            )
+            .await;
+        assert_eq!(status, 400, "{rules}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with(expected), "{rules}: {message:?}");
+    }
+    let (status, got) = h.api(Method::GET, &path, &h.alice, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(got["rules"], json!([]));
+    h.shutdown().await;
+}

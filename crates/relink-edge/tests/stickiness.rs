@@ -41,6 +41,7 @@ fn split_link() -> Link {
         enabled: true,
         health_check: false,
         unhealthy: vec![false; 3],
+        rules: Vec::new(),
     }
 }
 

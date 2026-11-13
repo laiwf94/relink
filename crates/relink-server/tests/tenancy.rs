@@ -42,6 +42,7 @@ fn new_link(owner: &str, alias: &str) -> NewLink {
         fallback_url: None,
         enabled: true,
         health_check: false,
+        rules: Vec::new(),
         domain: None,
     }
 }

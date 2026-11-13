@@ -182,6 +182,7 @@ fn link(id: i64, code: String, state: State) -> Link {
         enabled: !matches!(state, State::Disabled),
         health_check: false,
         unhealthy: vec![false],
+        rules: Vec::new(),
     }
 }
 

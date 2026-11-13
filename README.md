@@ -216,10 +216,10 @@ $ curl -s localhost:8080/v1/domains/go.example.com -H "Authorization: Bearer $KE
 | Endpoint | Purpose |
 |---|---|
 | `GET /{code}` | Redirect, on the domain named by `Host`. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
-| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`. |
+| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`, `rules` (targeting rules; see [docs/DESIGN.md](docs/DESIGN.md#targeting-rules)). |
 | `GET /v1/links?limit=&cursor=` | Your links, newest first. |
 | `GET /v1/links/{code}?domain=` | One link, with per-destination health; `domain` for a link on a custom domain. |
-| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. |
+| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. `rules` replaces the whole list. |
 | `DELETE /v1/links/{code}?domain=` | Delete the link and its statistics. |
 | `GET /v1/links/{code}/stats?from=&to=&domain=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
 | `GET /v1/usage` | The workspace's plan, link and domain counts and clicks this month, with their limits. |

@@ -434,6 +434,7 @@ pub fn new_link_for(owner: &str, alias: &str) -> relink_server::store::NewLink {
         fallback_url: None,
         enabled: true,
         health_check: false,
+        rules: Vec::new(),
         domain: None,
     }
 }

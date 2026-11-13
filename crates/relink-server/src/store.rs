@@ -24,6 +24,7 @@ use crate::auth::{Role, Scopes};
 use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
+use relink_core::rules_v2::Rule;
 use relink_core::wire::{domain_kv_key, host_kv_key, kv_key};
 
 /// Columns read into a [`Link`], as a literal so queries stay `&'static str`.
@@ -31,7 +32,7 @@ macro_rules! columns {
     () => {
         "id, code, owner, workspace_id, domain_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-         health_failures, health_checked_at, created_at, updated_at"
+         health_failures, health_checked_at, created_at, updated_at, rules"
     };
 }
 pub(crate) use columns;
@@ -210,6 +211,8 @@ pub struct NewLink {
     pub fallback_url: Option<String>,
     pub enabled: bool,
     pub health_check: bool,
+    /// Targeting rules, compiled once by the API to validate them.
+    pub rules: Vec<Rule>,
     /// The verified custom domain (hostname) to create the link on, or
     /// `None` for the default domain.
     pub domain: Option<String>,
@@ -227,6 +230,8 @@ pub struct LinkPatch {
     pub fallback_url: Option<Option<String>>,
     pub enabled: Option<bool>,
     pub health_check: Option<bool>,
+    /// The whole new rule list; empty removes the rules.
+    pub rules: Option<Vec<Rule>>,
 }
 
 /// An active API key as stored, with its owner's role in its workspace.
@@ -549,6 +554,7 @@ impl Db {
             .map(|i| failures.get(i).copied().unwrap_or(0) >= self.health_threshold)
             .collect();
         let status: i16 = row.try_get("redirect_status")?;
+        let Json(rules): Json<Vec<Rule>> = row.try_get("rules")?;
         let link = Link {
             id: row.try_get("id")?,
             code: row.try_get("code")?,
@@ -562,6 +568,7 @@ impl Db {
             enabled: row.try_get("enabled")?,
             health_check: row.try_get("health_check")?,
             unhealthy,
+            rules,
         };
         Ok(StoredLink {
             link,

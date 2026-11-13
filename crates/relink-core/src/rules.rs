@@ -171,6 +171,7 @@ mod tests {
             enabled: true,
             health_check: false,
             unhealthy: vec![false; urls.len()],
+            rules: Vec::new(),
         }
     }
 
