@@ -69,7 +69,16 @@ fn all_but(s: Scope) -> Scopes {
 const HOST: &str = "go.relink-docs.net";
 
 /// Sends one request for a documented route with a body that would succeed.
-async fn call(h: &Harness, method: &str, path: &str, code: &str, key: &str) -> (u16, Value) {
+/// `schedule` is a pending schedule of the link, for the route that cancels
+/// one.
+async fn call(
+    h: &Harness,
+    method: &str,
+    path: &str,
+    code: &str,
+    schedule: i64,
+    key: &str,
+) -> (u16, Value) {
     let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
     let body = match (method, path) {
         (_, "/v1/domains/{hostname}/verify") => None,
@@ -78,10 +87,18 @@ async fn call(h: &Harness, method: &str, path: &str, code: &str, key: &str) -> (
             "hostname": format!("d{}.relink-docs.net", relink_server::code::random_code(8).to_lowercase())
         })),
         ("patch", "/v1/domains/{hostname}") => Some(json!({"prefixes": ["campaign"]})),
+        ("post", "/v1/links/{code}/rollback") => Some(json!({"version": 1})),
+        ("post", "/v1/links/{code}/schedules") => Some(json!({
+            "run_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+            "enabled": false,
+        })),
         ("post" | "patch", _) => Some(json!({"enabled": true, "url": "https://example.com/"})),
         _ => None,
     };
-    let path = path.replace("{code}", code).replace("{hostname}", HOST);
+    let path = path
+        .replace("{code}", code)
+        .replace("{hostname}", HOST)
+        .replace("{id}", &schedule.to_string());
     h.api(m, &path, key, body).await
 }
 
@@ -122,9 +139,10 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 13);
-    // Deletion last, so the other routes still find the link.
-    routes.sort_by_key(|(m, _, _)| *m == "delete");
+    assert_eq!(routes.len(), 18);
+    // Deletion last, and the link's own last of all, so the other routes
+    // still find the link.
+    routes.sort_by_key(|(m, p, _)| (*m == "delete", p == "/v1/links/{code}"));
 
     let link = h.create(json!({"url": "https://example.com/"})).await;
     let code = link["code"].as_str().unwrap();
@@ -137,11 +155,24 @@ async fn every_route_requires_its_documented_scope() {
         )
         .await;
     assert_eq!(status, 201, "{body}");
+    let (status, schedule) = h
+        .api(
+            Method::POST,
+            &format!("/v1/links/{code}/schedules"),
+            &h.alice,
+            Some(json!({
+                "run_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+                "url": "https://example.com/later",
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "{schedule}");
+    let schedule = schedule["id"].as_i64().unwrap();
     for (method, path, scope) in &routes {
         let (without, _) = make_key(&h, "alice", None, all_but(*scope), None)
             .await
             .unwrap();
-        let (status, body) = call(&h, method, path, code, &without).await;
+        let (status, body) = call(&h, method, path, code, schedule, &without).await;
         assert_eq!(status, 403, "{method} {path} without {scope}: {body}");
         assert_eq!(body["error"]["code"], "permission_denied");
         let message = body["error"]["message"].as_str().unwrap();
@@ -150,7 +181,7 @@ async fn every_route_requires_its_documented_scope() {
         let (only, _) = make_key(&h, "alice", None, (*scope).into(), None)
             .await
             .unwrap();
-        let (status, body) = call(&h, method, path, code, &only).await;
+        let (status, body) = call(&h, method, path, code, schedule, &only).await;
         assert!(
             matches!(status, 200 | 201 | 204),
             "{method} {path} with only {scope}: {status} {body}"
@@ -172,7 +203,7 @@ async fn every_route_requires_its_documented_scope() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
-    assert!(metric(&h.metrics().await, "relink_api_permission_denied_total") >= 13.0);
+    assert!(metric(&h.metrics().await, "relink_api_permission_denied_total") >= 18.0);
     h.shutdown().await;
 }
 

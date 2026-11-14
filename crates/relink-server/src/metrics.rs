@@ -171,10 +171,11 @@ pub enum DbOp {
     Listen,
     Maintenance,
     Kv,
+    Schedule,
 }
 
 impl DbOp {
-    const ALL: [DbOp; 8] = [
+    const ALL: [DbOp; 9] = [
         DbOp::Lookup,
         DbOp::Lease,
         DbOp::Flush,
@@ -183,6 +184,7 @@ impl DbOp {
         DbOp::Listen,
         DbOp::Maintenance,
         DbOp::Kv,
+        DbOp::Schedule,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -194,6 +196,7 @@ impl DbOp {
             DbOp::Listen => "listen",
             DbOp::Maintenance => "maintenance",
             DbOp::Kv => "kv",
+            DbOp::Schedule => "schedule",
         }
     }
 }
@@ -273,7 +276,7 @@ pub struct Metrics {
     pub api_latency: Histogram,
     outcomes: [Counter; Outcome::ALL.len()],
     cache: [Counter; 5],
-    db_errors: [Counter; 8],
+    db_errors: [Counter; DbOp::ALL.len()],
     drops: [Counter; 4],
     probes: [Counter; 4],
     /// Requests refused for quota, by limit: links, monthly clicks,
@@ -319,6 +322,10 @@ pub struct Metrics {
     pub tls_certificate_errors: Counter,
     /// Visitor hashes dropped because their day's salt was already destroyed.
     pub late_visitors: Counter,
+    /// Scheduled link changes applied by the scheduler.
+    pub schedules_applied: Counter,
+    /// Scheduled link changes that could not be applied and were marked failed.
+    pub schedules_failed: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -362,6 +369,8 @@ impl Default for Metrics {
             tls_handshake_failures: Counter::default(),
             tls_certificate_errors: Counter::default(),
             late_visitors: Counter::default(),
+            schedules_applied: Counter::default(),
+            schedules_failed: Counter::default(),
             backlog: AtomicU64::new(0),
         }
     }
@@ -478,7 +487,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 29] = [
+        let counters: [(&str, &str, u64); 31] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -548,6 +557,16 @@ impl Metrics {
                 "relink_visitors_dropped_total",
                 "Visitor hashes dropped because their day's salt had already been destroyed.",
                 self.late_visitors.get(),
+            ),
+            (
+                "relink_schedules_applied_total",
+                "Scheduled link changes applied.",
+                self.schedules_applied.get(),
+            ),
+            (
+                "relink_schedules_failed_total",
+                "Scheduled link changes that could not be applied and were marked failed.",
+                self.schedules_failed.get(),
             ),
             (
                 "relink_lookups_coalesced_total",

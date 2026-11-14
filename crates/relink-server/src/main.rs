@@ -67,6 +67,7 @@
 //! | `RELINK_HEALTH_TIMEOUT_MS` | `5000` | Probe timeout |
 //! | `RELINK_HEALTH_FAILURE_THRESHOLD` | `2` | Consecutive failures before a destination is unhealthy |
 //! | `RELINK_HEALTH_BATCH` | `100` | Links claimed per round |
+//! | `RELINK_SCHEDULE_POLL_MS` | `1000` | How often scheduled link changes that are due are looked for and applied |
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |

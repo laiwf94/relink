@@ -33,7 +33,7 @@ macro_rules! columns {
     () => {
         "id, code, owner, workspace_id, domain_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-         health_failures, health_checked_at, created_at, updated_at, rules, app"
+         health_failures, health_checked_at, created_at, updated_at, rules, app, version"
     };
 }
 pub(crate) use columns;
@@ -127,6 +127,9 @@ pub enum DbError {
     /// The request cannot be applied in the current state, such as deleting
     /// a domain that still has links. The message says why.
     Precondition(String),
+    /// Something the request names inside an existing resource does not
+    /// exist, such as a version of a link. The message says what.
+    Missing(String),
 }
 
 impl fmt::Display for DbError {
@@ -137,7 +140,7 @@ impl fmt::Display for DbError {
             DbError::Unavailable(m) => write!(f, "database unavailable: {m}"),
             DbError::Other(m) => write!(f, "database error: {m}"),
             DbError::Quota(q) => q.fmt(f),
-            DbError::Invalid(m) | DbError::Precondition(m) => f.write_str(m),
+            DbError::Invalid(m) | DbError::Precondition(m) | DbError::Missing(m) => f.write_str(m),
         }
     }
 }
@@ -185,6 +188,9 @@ pub struct StoredLink {
     pub health_checked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The number of the version in the link's history that it matches
+    /// (src/schedule.rs).
+    pub version: i32,
 }
 
 impl std::ops::Deref for StoredLink {
@@ -602,6 +608,7 @@ impl Db {
             health_checked_at: row.try_get("health_checked_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            version: row.try_get("version")?,
         })
     }
 

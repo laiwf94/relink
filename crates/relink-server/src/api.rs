@@ -180,6 +180,7 @@ impl From<DbError> for ApiError {
             DbError::Quota(q) => ApiError::quota_exceeded(q.to_string()),
             DbError::Invalid(m) => ApiError::invalid(m),
             DbError::Precondition(m) => ApiError::failed_precondition(m),
+            DbError::Missing(m) => ApiError::not_found_msg(m),
         }
     }
 }
@@ -565,6 +566,8 @@ pub struct LinkView {
     pub rules: Vec<Rule>,
     /// App targets for phones; `null` for none.
     pub app: Option<AppLink>,
+    /// The link's current version (`GET /v1/links/{code}/versions`).
+    pub version: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -607,6 +610,7 @@ impl LinkView {
             health_checked_at: link.health_checked_at,
             rules: link.rules.rules().to_vec(),
             app: link.app.clone(),
+            version: link.version,
             created_at: link.created_at,
             updated_at: link.updated_at,
         }
@@ -643,7 +647,7 @@ pub struct DomainQuery {
 }
 
 /// A hostname from `?domain=` or a request body, in stored form.
-fn domain_param(raw: Option<String>) -> Option<String> {
+pub(crate) fn domain_param(raw: Option<String>) -> Option<String> {
     raw.map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
 }
 
@@ -671,7 +675,7 @@ pub fn decode_cursor(s: &str) -> Option<i64> {
     (id > 0).then_some(id)
 }
 
-fn validate_destinations(
+pub(crate) fn validate_destinations(
     app: &App,
     url: Option<String>,
     destinations: Option<Vec<Destination>>,
@@ -1206,6 +1210,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/links/{code}"),
     ("delete", "/v1/links/{code}"),
     ("get", "/v1/links/{code}/stats"),
+    ("get", "/v1/links/{code}/versions"),
+    ("post", "/v1/links/{code}/rollback"),
+    ("get", "/v1/links/{code}/schedules"),
+    ("post", "/v1/links/{code}/schedules"),
+    ("delete", "/v1/links/{code}/schedules/{id}"),
     ("get", "/v1/usage"),
     ("post", "/v1/domains"),
     ("get", "/v1/domains"),

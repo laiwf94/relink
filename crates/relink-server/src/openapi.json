@@ -476,6 +476,110 @@
           "503": { "$ref": "#/components/responses/Error" }
         }
       }
+    },
+    "/v1/links/{code}/versions": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
+      "get": {
+        "summary": "List a link's versions, newest first",
+        "operationId": "listLinkVersions",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "description": "Every change to what a link does is a new version holding all of its settings; a change that sets what was already set is not. The newest 100 versions are kept.",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "next_cursor from the previous page." }
+        ],
+        "responses": {
+          "200": { "description": "A page of versions.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VersionList" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/links/{code}/rollback": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
+      "post": {
+        "summary": "Restore an earlier version of a link",
+        "operationId": "rollbackLink",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "description": "Gives the link the settings of one of its versions again. The rollback is itself a new version, with source rollback and restored_from set, so history only grows. Restoring the settings the link already has changes nothing. A version the link does not have (any more) is not_found.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Rollback" } } } },
+        "responses": {
+          "200": { "description": "The link with the restored settings.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Link" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/links/{code}/schedules": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
+      "get": {
+        "summary": "List a link's scheduled changes, newest first",
+        "operationId": "listLinkSchedules",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "next_cursor from the previous page." }
+        ],
+        "responses": {
+          "200": { "description": "A page of schedules.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleList" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "summary": "Schedule a change to a link",
+        "operationId": "createLinkSchedule",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "description": "At run_at the server applies the change once, as a new version with source schedule, within RELINK_SCHEDULE_POLL_MS (default one second). A link can have at most 20 pending schedules; beyond that the request is refused with failed_precondition (409).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateSchedule" } } } },
+        "responses": {
+          "201": { "description": "Scheduled.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schedule" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/links/{code}/schedules/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The schedule's ID." }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
+      "delete": {
+        "summary": "Cancel a pending scheduled change",
+        "operationId": "cancelLinkSchedule",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "description": "A schedule that was already applied, failed or cancelled is refused with failed_precondition (409).",
+        "responses": {
+          "200": { "description": "The cancelled schedule.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schedule" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
     }
   },
   "components": {
@@ -702,7 +806,7 @@
       },
       "Link": {
         "type": "object",
-        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "rules", "app", "created_at", "updated_at"],
+        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "rules", "app", "version", "created_at", "updated_at"],
         "properties": {
           "code": { "type": "string" },
           "domain": { "type": ["string", "null"], "description": "The custom domain the link is on; null for the default domain." },
@@ -729,6 +833,7 @@
           "health_checked_at": { "type": ["string", "null"], "format": "date-time" },
           "rules": { "type": "array", "items": { "$ref": "#/components/schemas/Rule" }, "description": "Targeting rules in order, with destinations normalised; [] for none." },
           "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }], "description": "App targets, with store URLs normalised; null for none." },
+          "version": { "type": "integer", "minimum": 1, "description": "The link's current version; see GET /v1/links/{code}/versions." },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         }
@@ -956,6 +1061,87 @@
           "countries": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "XX means unknown." },
           "devices": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "desktop, mobile, tablet, bot or other." },
           "referrers": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "Referrer host, or (direct) when there was none." }
+        }
+      },
+      "LinkSettings": {
+        "type": "object",
+        "description": "A link's settings as one version holds them, destinations and rule and store URLs normalised.",
+        "required": ["destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "rules", "app"],
+        "properties": {
+          "destinations": { "type": "array", "items": { "type": "object", "required": ["url", "weight"], "properties": { "url": { "type": "string" }, "weight": { "type": "integer" } } } },
+          "redirect_type": { "enum": [301, 302, 307, 308] },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "max_clicks": { "type": ["integer", "null"] },
+          "geo": { "oneOf": [{ "$ref": "#/components/schemas/Geo" }, { "type": "null" }] },
+          "fallback_url": { "type": ["string", "null"] },
+          "enabled": { "type": "boolean" },
+          "health_check": { "type": "boolean" },
+          "rules": { "type": "array", "items": { "$ref": "#/components/schemas/Rule" } },
+          "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }] }
+        }
+      },
+      "Version": {
+        "type": "object",
+        "required": ["version", "created_at", "member", "via", "source", "restored_from", "schedule_id", "settings"],
+        "properties": {
+          "version": { "type": "integer", "minimum": 1 },
+          "created_at": { "type": "string", "format": "date-time" },
+          "member": { "type": ["string", "null"], "description": "Who made the change; null for the server or an operator." },
+          "via": { "type": "string", "description": "key:<id>, session:<id>, cli or system." },
+          "source": { "enum": ["create", "update", "rollback", "schedule", "migration"], "description": "migration marks the first version of a link created before version history existed." },
+          "restored_from": { "type": ["integer", "null"], "description": "For a rollback, the version whose settings it restored." },
+          "schedule_id": { "type": ["integer", "null"], "description": "For a scheduled change, its schedule." },
+          "settings": { "$ref": "#/components/schemas/LinkSettings" }
+        }
+      },
+      "VersionList": {
+        "type": "object",
+        "required": ["versions", "next_cursor"],
+        "properties": {
+          "versions": { "type": "array", "items": { "$ref": "#/components/schemas/Version" } },
+          "next_cursor": { "type": ["string", "null"] }
+        }
+      },
+      "Rollback": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version"],
+        "properties": { "version": { "type": "integer", "minimum": 1 } }
+      },
+      "CreateSchedule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_at"],
+        "description": "Give url or destinations, enabled, or both.",
+        "properties": {
+          "run_at": { "type": "string", "format": "date-time", "description": "In the future, within 10 years." },
+          "url": { "type": "string", "maxLength": 2048 },
+          "destinations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/components/schemas/DestinationInput" } },
+          "enabled": { "type": "boolean" }
+        }
+      },
+      "Schedule": {
+        "type": "object",
+        "required": ["id", "run_at", "change", "state", "member", "via", "created_at", "finished_at", "applied_version", "error"],
+        "properties": {
+          "id": { "type": "integer" },
+          "run_at": { "type": "string", "format": "date-time" },
+          "change": { "type": "object", "description": "The fields the schedule changes, destinations normalised.", "properties": { "destinations": { "type": "array", "items": { "type": "object", "required": ["url", "weight"], "properties": { "url": { "type": "string" }, "weight": { "type": "integer" } } } }, "enabled": { "type": "boolean" } } },
+          "state": { "enum": ["pending", "applied", "failed", "canceled"] },
+          "member": { "type": ["string", "null"] },
+          "via": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "finished_at": { "type": ["string", "null"], "format": "date-time", "description": "When it was applied, failed or was cancelled." },
+          "applied_version": { "type": ["integer", "null"], "description": "The link version the change produced, or the one already current when it changed nothing." },
+          "error": { "type": ["string", "null"], "description": "Why it could not be applied." }
+        }
+      },
+      "ScheduleList": {
+        "type": "object",
+        "required": ["schedules", "next_cursor"],
+        "properties": {
+          "schedules": { "type": "array", "items": { "$ref": "#/components/schemas/Schedule" } },
+          "next_cursor": { "type": ["string", "null"] }
         }
       }
     }

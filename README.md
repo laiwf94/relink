@@ -227,6 +227,11 @@ $ curl -s localhost:8080/v1/domains/go.example.com -H "Authorization: Bearer $KE
 | `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. `rules` and `app` replace the whole list or object. |
 | `DELETE /v1/links/{code}?domain=` | Delete the link and its statistics. |
 | `GET /v1/links/{code}/stats?from=&to=&domain=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
+| `GET /v1/links/{code}/versions?domain=&limit=&cursor=` | The link's versions, newest first: its settings after each change that altered them, who made it and how. The newest 100 are kept. |
+| `POST /v1/links/{code}/rollback?domain=` | `{"version": n}`: give the link version `n`'s settings again, as a new version. |
+| `GET /v1/links/{code}/schedules?domain=&limit=&cursor=` | Scheduled changes, newest first, with their state (`pending`, `applied`, `failed`, `canceled`). |
+| `POST /v1/links/{code}/schedules?domain=` | `{"run_at": ..., "url" or "destinations": ..., "enabled": ...}`: change the destinations or enable or disable the link at `run_at`, applied once across all instances. At most 20 pending per link. |
+| `DELETE /v1/links/{code}/schedules/{id}?domain=` | Cancel a pending schedule. |
 | `GET /v1/usage` | The workspace's plan, link and domain counts and clicks this month, with their limits. |
 | `POST /v1/domains` | Add a custom domain by `hostname`; answers with the TXT record that proves it. Admins and owners. |
 | `GET /v1/domains`, `GET /v1/domains/{hostname}` | The workspace's domains, their verification state and, once verified, their certificate's. |

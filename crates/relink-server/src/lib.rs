@@ -11,7 +11,8 @@
 //! certificate request, and [`tls`] serves them, by SNI, with their keys
 //! encrypted at rest;
 //! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
-//! decides which forwarding headers to believe; [`health`] probes
+//! decides which forwarding headers to believe; [`schedule`] keeps each
+//! link's version history and applies scheduled changes; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
 //! Postgres and [`server`] wires it together; [`cli`] parses the key
 //! commands. The rules shared with the edge come from `relink_core` and are
@@ -39,6 +40,7 @@ pub mod quota;
 pub mod ratelimit;
 pub mod redirect;
 pub mod resolver;
+pub mod schedule;
 pub mod server;
 pub mod session;
 pub mod singleflight;

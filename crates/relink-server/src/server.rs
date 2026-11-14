@@ -35,6 +35,7 @@ use crate::oidc::{self, Oidc};
 use crate::ratelimit::{KeyedLimiter, Rate};
 use crate::redirect;
 use crate::resolver::{LinkSource, Resolver};
+use crate::schedule;
 use crate::session;
 use crate::store::{CHANGES_CHANNEL, DOMAINS_CHANGED, Db, DbConfig, parse_change};
 use crate::tls::{self, Sealer, Tls, TlsListener};
@@ -180,6 +181,16 @@ pub fn public_router(app: Arc<App>) -> Router {
                 .delete(api::delete_link),
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
+        .route("/v1/links/{code}/versions", get(schedule::list_versions))
+        .route("/v1/links/{code}/rollback", post(schedule::rollback))
+        .route(
+            "/v1/links/{code}/schedules",
+            get(schedule::list_schedules).post(schedule::create_schedule),
+        )
+        .route(
+            "/v1/links/{code}/schedules/{id}",
+            axum::routing::delete(schedule::cancel_schedule),
+        )
         .route("/v1/usage", get(api::usage))
         .route(
             "/v1/domains",
@@ -392,6 +403,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
     let flusher = tokio::spawn(Flusher::new(sink, metrics.clone(), cfg.flush).run(rx, drain_rx));
     let listener = tokio::spawn(listen_for_changes(app.clone(), bg_rx.clone()));
     let maintenance = tokio::spawn(maintain(app.clone(), bg_rx.clone()));
+    let scheduler = tokio::spawn(schedule::run(app.clone(), cfg.schedule_poll, bg_rx.clone()));
     let health = if cfg.health.enabled {
         let worker = HealthWorker::new(
             db.clone(),
@@ -478,7 +490,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         // The flusher stops retrying a little early so it can still count
         // what it could not write before the supervisor gives up on it.
         let _ = drain_tx.send(Some(deadline - timeout / 10));
-        let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, maintenance];
+        let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, maintenance, scheduler];
         tasks.extend(health);
         tasks.extend(kv);
         tasks.extend(certificates);

@@ -58,6 +58,8 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `sessions` | SHA-256 of each session cookie, its person, CSRF token and expiry. |
 | `audit_log` | Every change made by a person or an operator: workspace, sequence number, time, actor, how they acted, action, target, the state before and after, and the hash chain. |
 | `audit_heads` | The last sequence number and hash of each workspace's audit chain. |
+| `link_versions` | Each link's settings after every change that altered them, numbered per link, with who made the change, how (`create`, `update`, `rollback`, `schedule`, `migration`), the version a rollback restored and the schedule that applied it. The newest 100 per link. |
+| `link_schedules` | Changes to apply to a link later: when, the new destinations and/or `enabled`, who scheduled it, and its state (`pending`, `applied`, `failed`, `canceled`) with the version it produced or why it failed. |
 
 `code` uses the `C` collation (bytewise and case-sensitive, as base62 needs)
 and a `CHECK` repeats the API's character rules. The destination list is
@@ -76,6 +78,9 @@ read, so a hand-edited row produces an error instead of a panic.
 | `click_daily` primary key | The flusher's upsert; stats use its `(link_id, day)` prefix. |
 | `visitor_daily` primary key | `ON CONFLICT DO NOTHING` deduplication; the table holds two days, so the roll-up scan by day stays small. |
 | `kv_outbox (next_attempt_at)` | The sync worker's "what is due". |
+| `link_versions (link_id, version)` primary key | A link's history newest first, by keyset; the current version's snapshot for the "did anything change" check; pruning the oldest. |
+| `link_schedules (run_at, id) WHERE state = 'pending'` | The scheduler's "what is due"; finished schedules cost nothing. |
+| `link_schedules (link_id, id DESC)` | One link's schedules, newest first, by keyset, and its pending count. |
 | `links (workspace_id, id DESC)` | Workspace listing with keyset pagination, and the row-level security predicate. |
 | `workspace_members (member)` | The workspaces one person belongs to. |
 | `workspaces (personal_owner)` unique | Finding an owner's personal workspace; concurrent first uses create one. |
@@ -704,6 +709,82 @@ The pieces above meet on every management request, in this order:
 the HTTP API and the binary. Step 5 of `examples/demo.sh` shows them from
 the command line.
 
+### Versions and schedules
+
+Every change to what a link does is kept as a numbered version, so a bad
+edit can be undone and a campaign can be switched over at a set time
+(`src/schedule.rs`, migration 0018).
+
+**Snapshots are written by the database.** A version holds the link's
+settings, the fields `PATCH` can change, as one JSON object built by the
+SQL function `relink_link_spec(links)` from the row itself; the server
+only reads it back, as `LinkSpec`. A snapshot therefore cannot drift from
+the row it describes, and links that existed before the migration got
+their version 1 from the same function, marked `migration`. Timestamps in
+it are written in UTC with microseconds whatever the session's time zone,
+so equal settings always give equal JSON.
+
+**Recording a version** happens inside the transaction of the change,
+after the row is written: one query compares the row's snapshot with the
+stored snapshot of its current version (`links.version`). If they are
+equal (a `PATCH` that sets what was already set, a schedule that enables
+an enabled link), nothing is recorded and the version number stays. If
+not, `links.version` goes up by one and the new snapshot is inserted with
+the actor, how the change was made, and, for a rollback, the version it
+restored or, for a scheduled change, its schedule. Versions beyond the
+newest 100 are deleted in the same transaction, by primary key. The cost
+is three statements on a write, none on the redirect path: the redirect
+role's functions return `links.*`, which carries `version`, and nothing
+else there reads history.
+
+**A rollback** (`POST /v1/links/{code}/rollback` with `{"version": n}`)
+locks the link, reads version `n` and applies all of its settings through
+the same code as a `PATCH`. So it is itself a new version, history only
+grows, a rollback can be rolled back, and everything a `PATCH` does
+follows: health counters reset if the destinations changed, other
+instances and the edge hear of it through the change notification and
+the KV outbox, and the audit log gets `link.rollback` with the state before
+and after. The settings are restored as they were stored, not validated
+again: they were valid when written, and refusing to restore a version
+because, say, its `expires_at` has passed would make undo unreliable
+exactly when it is needed. A version the link no longer keeps is
+`not_found`.
+
+**Schedules.** `POST /v1/links/{code}/schedules` takes `run_at` (in the
+future, within 10 years) and new destinations (`url` or `destinations`,
+validated and normalised like a `PATCH`), `enabled`, or both. A link has
+at most 20 pending schedules, counted under the link's row lock so two
+concurrent requests cannot both take the last slot. `DELETE` on a
+schedule cancels it if it is still pending (`failed_precondition`
+otherwise); finished schedules are kept, so the list shows what happened.
+
+Every instance runs the scheduler, which every `RELINK_SCHEDULE_POLL_MS`
+(default 1000) reads up to 100 due pending schedules, oldest first, with
+their link's workspace, through the partial index. Each is then applied in
+a tenant transaction for that workspace: it takes the schedule's row lock
+with `FOR UPDATE SKIP LOCKED` and re-checks that it is pending and due,
+locks the link, applies the change through the `PATCH` path (version
+source `schedule`, audit action `schedule.apply`, as the server) and marks
+the schedule `applied` with the version it produced, all before one
+commit. Another instance that reads the same schedule skips it while the
+lock is held and finds it applied afterwards, so each change is applied
+exactly once however many instances run; an instance that dies before the
+commit leaves it pending for the next tick. The instance that applied it
+drops its cached copy at once, the others on the change notification. A
+database outage stops the tick and leaves due schedules pending, counted
+in `relink_db_errors_total{op="schedule"}`; they apply on the first tick
+after it ends. A change the server cannot read (a row edited by hand) is
+marked `failed` with the reason instead of being retried forever, and
+counted in `relink_schedules_failed_total`. Lock order is schedule, then
+link, and nothing takes them the other way round: creating a schedule
+locks only the link, cancelling only the schedule.
+
+Scheduled changes are limited to destinations and `enabled` because those
+are what a campaign switches at a set time, and a change chosen long in
+advance must still be valid when it runs: an `expires_at` or a targeting
+rule set months ahead could be in the past, or refer to a policy that has
+changed, by then.
+
 ## The redirect path on the origin
 
 ### The cache
@@ -1277,6 +1358,7 @@ and counts the clicks it could not write.
 
 | Failure | Behaviour |
 |---|---|
+| Postgres down during a scheduled change | Due schedules stay pending and are applied on the first scheduler tick after the database returns. |
 | Postgres down | Cached links redirect (no added latency once the breaker opens); uncached codes and API calls get 503 within the 2 s timeout; clicks are buffered up to the backlog bound; readiness stays 200 and reports `"database":"down"`. |
 | Postgres slow | Every query, including waiting for a connection, is bounded by the same timeout on the client and by `statement_timeout`. |
 | Postgres restarts | Dead pooled connections fail one query and are replaced; the change listener reconnects and marks every cached entry suspect. |
@@ -1308,6 +1390,8 @@ and counts the clicks it could not write.
 | Countries per geo rule | 300 |
 | Targeting rules | 32 rules and 64 leaf conditions per link, nested 8 deep, 300 values per leaf; queries read up to 64 parameters within 2,048 bytes |
 | App targets | deep link 1,024 printable ASCII characters; package name 255; stored object 8 KiB |
+| Version history | the newest 100 versions per link |
+| Schedules | 20 pending per link; `run_at` within 10 years; due schedules looked for every second (`RELINK_SCHEDULE_POLL_MS`), 100 per query |
 | Domain apps | 8 iOS and 8 Android apps per domain, 8 fingerprints per Android app; bundle ID 155 characters |
 | Alias | 3 to 64 of `[A-Za-z0-9_-]`, alphanumeric at both ends |
 | Generated code | 7 base62 characters by default (4 to 32); collisions retried 5 times |

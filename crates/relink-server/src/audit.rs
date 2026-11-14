@@ -131,6 +131,10 @@ pub enum Action {
     DomainVerify,
     DomainUpdate,
     DomainDelete,
+    LinkRollback,
+    ScheduleCreate,
+    ScheduleCancel,
+    ScheduleApply,
 }
 
 impl Action {
@@ -154,6 +158,10 @@ impl Action {
             Action::DomainVerify => "domain.verify",
             Action::DomainUpdate => "domain.update",
             Action::DomainDelete => "domain.delete",
+            Action::LinkRollback => "link.rollback",
+            Action::ScheduleCreate => "schedule.create",
+            Action::ScheduleCancel => "schedule.cancel",
+            Action::ScheduleApply => "schedule.apply",
         }
     }
 }
@@ -836,6 +844,10 @@ mod tests {
             Action::DomainVerify,
             Action::DomainUpdate,
             Action::DomainDelete,
+            Action::LinkRollback,
+            Action::ScheduleCreate,
+            Action::ScheduleCancel,
+            Action::ScheduleApply,
         ] {
             let s = a.as_str();
             let (noun, verb) = s.split_once('.').unwrap();

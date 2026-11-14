@@ -661,15 +661,29 @@ async fn openapi_matches_the_router_and_responses() {
         )
         .await;
     assert_eq!(status, 201, "{domain}");
-    // Deletion last, so the other routes still find the link.
+    let run_at = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let (status, schedule) = h
+        .api(
+            Method::POST,
+            &format!("/v1/links/{code}/schedules"),
+            &h.alice,
+            Some(json!({"run_at": run_at, "enabled": false})),
+        )
+        .await;
+    assert_eq!(status, 201, "{schedule}");
+    let schedule_id = schedule["id"].to_string();
+    let schedule_body = format!(r#"{{"run_at":"{run_at}","url":"https://example.com/"}}"#);
+    // Deletion last, and the link's own last of all, so the other routes
+    // still find the link.
     let mut ordered: Vec<&(String, String)> = routes.iter().collect();
-    ordered.sort_by_key(|(m, _)| m == "delete");
+    ordered.sort_by_key(|(m, p)| (m == "delete", p == "/v1/links/{code}"));
     for (method, path) in ordered {
         let url = format!(
             "{}{}",
             h.base,
             path.replace("{code}", code)
                 .replace("{hostname}", "go.relink-docs.net")
+                .replace("/schedules/{id}", &format!("/schedules/{schedule_id}"))
         );
         let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
         let edge = path.starts_with("/v1/edge/");
@@ -682,10 +696,16 @@ async fn openapi_matches_the_router_and_responses() {
                 r#"{"hostname":"other.relink-docs.net"}"#
             } else if path == "/v1/domains/{hostname}" {
                 r#"{"prefixes":["campaign"]}"#
+            } else if path.ends_with("/rollback") {
+                r#"{"version":1}"#
+            } else if path.ends_with("/schedules") {
+                schedule_body.as_str()
             } else {
                 r#"{"enabled":true,"url":"https://example.com/"}"#
             };
-            req = req.header("content-type", "application/json").body(body);
+            req = req
+                .header("content-type", "application/json")
+                .body(body.to_owned());
         }
         let resp = req.send().await.unwrap();
         let status = resp.status().as_u16();
@@ -761,6 +781,47 @@ async fn openapi_matches_the_router_and_responses() {
     }
     let keys: BTreeSet<String> = domain.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("Domain"));
+    let code = link["code"].as_str().unwrap();
+    let (_, versions) = h
+        .api(
+            Method::GET,
+            &format!("/v1/links/{code}/versions"),
+            &h.alice,
+            None,
+        )
+        .await;
+    let keys: BTreeSet<String> = versions.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("VersionList"));
+    let version = &versions["versions"][0];
+    let keys: BTreeSet<String> = version.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("Version"));
+    let keys: BTreeSet<String> = version["settings"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, schema_keys("LinkSettings"));
+    let (_, schedule) = h
+        .api(
+            Method::POST,
+            &format!("/v1/links/{code}/schedules"),
+            &h.alice,
+            Some(json!({"run_at": run_at, "enabled": false})),
+        )
+        .await;
+    let keys: BTreeSet<String> = schedule.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("Schedule"));
+    let (_, schedules) = h
+        .api(
+            Method::GET,
+            &format!("/v1/links/{code}/schedules"),
+            &h.alice,
+            None,
+        )
+        .await;
+    let keys: BTreeSet<String> = schedules.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("ScheduleList"));
     let (_, list) = h.api(Method::GET, "/v1/domains", &h.alice, None).await;
     let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("DomainList"));

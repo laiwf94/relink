@@ -96,6 +96,8 @@ pub struct Config {
     pub flush: FlushConfig,
     pub max_lease: i64,
     pub health: HealthConfig,
+    /// How often the scheduler looks for due link schedules.
+    pub schedule_poll: Duration,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -531,6 +533,7 @@ impl Config {
                 failure_threshold: v.parse("RELINK_HEALTH_FAILURE_THRESHOLD", 2, 1, 100)?,
                 batch: v.parse("RELINK_HEALTH_BATCH", 100, 1, 10_000)?,
             },
+            schedule_poll: v.millis("RELINK_SCHEDULE_POLL_MS", 1_000, 10, 60_000)?,
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
                 burst: v.parse("RELINK_API_BURST", 20.0, 1.0, 1_000_000.0)?,

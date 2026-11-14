@@ -28,6 +28,7 @@ use std::sync::Arc;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chrono::{NaiveDate, Utc};
+use sqlx::postgres::PgRow;
 use sqlx::types::Json;
 use sqlx::{Postgres, Row, Transaction};
 
@@ -35,6 +36,7 @@ use crate::api::{ApiError, Authed};
 use crate::audit::{self, Action, Actor, Change};
 use crate::auth::{Principal, Scope};
 use crate::quota::{self, Usage};
+use crate::schedule::{self, Source};
 use crate::server::App;
 use crate::store::{
     Bucket, DayStats, Db, DbError, LinkPatch, NewLink, STATS_COUNTRY, STATS_DEVICE, STATS_REFERRER,
@@ -50,6 +52,46 @@ macro_rules! by_code {
     () => {
         " WHERE COALESCE(domain_id, 0) = (CASE WHEN $2::text IS NULL THEN 0 ELSE \
          COALESCE((SELECT d.id FROM domains d WHERE d.hostname = $2), -1) END) AND code = $1"
+    };
+}
+
+pub(crate) use by_code;
+
+/// Locks the link with `code` on `domain` (see [`by_code!`]) for an update
+/// in `tx`, and returns its row ([`columns!`]); `RowNotFound` if this
+/// workspace has no such link.
+pub(crate) async fn lock_by_code(
+    tx: &mut Transaction<'static, Postgres>,
+    code: &str,
+    domain: Option<&str>,
+) -> Result<PgRow, sqlx::Error> {
+    sqlx::query(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM links",
+        by_code!(),
+        " FOR NO KEY UPDATE"
+    ))
+    .bind(code)
+    .bind(domain)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(sqlx::Error::RowNotFound)
+}
+
+/// What kind of change [`Tenant::apply_patch`] makes, for the audit log and
+/// the version history.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Edit {
+    pub action: Action,
+    pub source: Source,
+}
+
+impl Edit {
+    /// A `PATCH` through the API.
+    pub const UPDATE: Edit = Edit {
+        action: Action::LinkUpdate,
+        source: Source::Update,
     };
 }
 
@@ -329,7 +371,10 @@ impl<'a> Tenant<'a> {
                     .bind(new.app.as_ref().map(Json))
                     .fetch_one(&mut *tx)
                     .await?;
-                    let link = self.db.row_to_link(&row)?;
+                    let mut link = self.db.row_to_link(&row)?;
+                    link.version =
+                        schedule::record_version(&mut tx, link.id, &self.actor, Source::Create)
+                            .await?;
                     // Instances may hold a negative cache entry for this code.
                     self.db.changed(&mut tx, link.id, domain_id, &code).await?;
                     let change = Change {
@@ -395,93 +440,99 @@ impl<'a> Tenant<'a> {
         self.db
             .timed(async {
                 let mut tx = self.begin().await?;
-                let row = sqlx::query(concat!(
-                    "SELECT ",
-                    columns!(),
-                    " FROM links",
-                    by_code!(),
-                    " FOR NO KEY UPDATE"
-                ))
-                .bind(code)
-                .bind(domain)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(sqlx::Error::RowNotFound)?;
-                let mut link = self.db.row_to_link(&row)?;
-                let before = audit::link_state(&link);
-                let destinations_changed = match &patch.destinations {
-                    Some(d) if *d != link.destinations => {
-                        link.destinations = d.clone();
-                        true
-                    }
-                    _ => false,
-                };
-                if let Some(s) = patch.redirect_status {
-                    link.redirect_status = s;
-                }
-                if let Some(e) = patch.expires_at {
-                    link.expires_at = e;
-                }
-                if let Some(m) = patch.max_clicks {
-                    link.max_clicks = m;
-                }
-                if let Some(g) = &patch.geo {
-                    link.geo = g.clone();
-                }
-                if let Some(f) = &patch.fallback_url {
-                    link.fallback_url = f.clone();
-                }
-                if let Some(e) = patch.enabled {
-                    link.enabled = e;
-                }
-                if let Some(h) = patch.health_check {
-                    link.health_check = h;
-                }
-                if let Some(r) = &patch.rules {
-                    link.rules = r.clone();
-                }
-                if let Some(a) = &patch.app {
-                    link.app = a.clone();
-                }
-                let (geo_mode, geo_countries) = geo_columns(link.geo.as_ref());
-                let row = sqlx::query(concat!(
-                    "UPDATE links SET destinations = $2, \
-                     destinations_version = destinations_version + CASE WHEN $3 THEN 1 ELSE 0 END, \
-                     health_failures = CASE WHEN $3 THEN '{}'::smallint[] ELSE health_failures END, \
-                     redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
-                     geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
-                     rules = $12, app = $13, updated_at = now() WHERE id = $1 RETURNING ",
-                    api_columns!()
-                ))
-                .bind(link.id)
-                .bind(Json(&link.destinations))
-                .bind(destinations_changed)
-                .bind(link.redirect_status as i16)
-                .bind(link.expires_at)
-                .bind(link.max_clicks)
-                .bind(geo_mode)
-                .bind(geo_countries)
-                .bind(&link.fallback_url)
-                .bind(link.enabled)
-                .bind(link.health_check)
-                .bind(Json(&link.rules))
-                .bind(link.app.as_ref().map(Json))
-                .fetch_one(&mut *tx)
-                .await?;
-                let updated = self.db.row_to_link(&row)?;
-                self.db
-                    .changed(&mut tx, updated.id, updated.domain_id, &updated.code)
-                    .await?;
-                let change = Change {
-                    before: Some(before),
-                    after: Some(audit::link_state(&updated)),
-                    ..self.change(Action::LinkUpdate, updated.id)
-                };
-                audit::record(&mut tx, &self.actor, change).await?;
+                let row = lock_by_code(&mut tx, code, domain).await?;
+                let updated = self.apply_patch(&mut tx, &row, patch, Edit::UPDATE).await?;
                 tx.commit().await?;
                 Ok(updated)
             })
             .await
+    }
+
+    /// Applies `patch` to the link in `row`, which `tx` holds locked
+    /// (`FOR NO KEY UPDATE`): writes it, records a new version if what the
+    /// link does changed, queues the change for other instances and the
+    /// edge, and appends `edit.action` to the audit chain.
+    pub(crate) async fn apply_patch(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        row: &PgRow,
+        patch: &LinkPatch,
+        edit: Edit,
+    ) -> Result<StoredLink, sqlx::Error> {
+        let mut link = self.db.row_to_link(row)?;
+        let before = audit::link_state(&link);
+        let destinations_changed = match &patch.destinations {
+            Some(d) if *d != link.destinations => {
+                link.destinations = d.clone();
+                true
+            }
+            _ => false,
+        };
+        if let Some(s) = patch.redirect_status {
+            link.redirect_status = s;
+        }
+        if let Some(e) = patch.expires_at {
+            link.expires_at = e;
+        }
+        if let Some(m) = patch.max_clicks {
+            link.max_clicks = m;
+        }
+        if let Some(g) = &patch.geo {
+            link.geo = g.clone();
+        }
+        if let Some(f) = &patch.fallback_url {
+            link.fallback_url = f.clone();
+        }
+        if let Some(e) = patch.enabled {
+            link.enabled = e;
+        }
+        if let Some(h) = patch.health_check {
+            link.health_check = h;
+        }
+        if let Some(r) = &patch.rules {
+            link.rules = r.clone();
+        }
+        if let Some(a) = &patch.app {
+            link.app = a.clone();
+        }
+        let (geo_mode, geo_countries) = geo_columns(link.geo.as_ref());
+        let row = sqlx::query(concat!(
+            "UPDATE links SET destinations = $2, \
+             destinations_version = destinations_version + CASE WHEN $3 THEN 1 ELSE 0 END, \
+             health_failures = CASE WHEN $3 THEN '{}'::smallint[] ELSE health_failures END, \
+             redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
+             geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
+             rules = $12, app = $13, updated_at = now() WHERE id = $1 RETURNING ",
+            api_columns!()
+        ))
+        .bind(link.id)
+        .bind(Json(&link.destinations))
+        .bind(destinations_changed)
+        .bind(link.redirect_status as i16)
+        .bind(link.expires_at)
+        .bind(link.max_clicks)
+        .bind(geo_mode)
+        .bind(geo_countries)
+        .bind(&link.fallback_url)
+        .bind(link.enabled)
+        .bind(link.health_check)
+        .bind(Json(&link.rules))
+        .bind(link.app.as_ref().map(Json))
+        .fetch_one(&mut **tx)
+        .await?;
+        let mut updated = self.db.row_to_link(&row)?;
+        updated.version =
+            schedule::record_version(tx, updated.id, &self.actor, edit.source).await?;
+        self.db
+            .changed(tx, updated.id, updated.domain_id, &updated.code)
+            .await?;
+        let change = Change {
+            before: Some(before),
+            after: Some(audit::link_state(&updated)),
+            ..self.change(edit.action, updated.id)
+        };
+        audit::record(tx, &self.actor, change).await?;
+        Ok(updated)
     }
 
     /// Deletes the link with `code` on `domain` and its statistics, and
