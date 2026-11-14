@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::deeplink::AppTargets;
 use crate::rules_v2::RuleSet;
 
 /// One place a link can send visitors, with its share of an A/B split.
@@ -110,7 +111,7 @@ pub struct Link {
     /// Bumped whenever `destinations` change; part of the A/B cookie MAC.
     pub destinations_version: i32,
     pub redirect_status: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "rfc3339")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub max_clicks: Option<i64>,
@@ -137,6 +138,25 @@ pub struct Link {
         with = "crate::rules_v2::program"
     )]
     pub rules: RuleSet,
+    /// Where phones go instead of the destinations ([`crate::deeplink`]),
+    /// compiled from the link's written app targets when it was read: the
+    /// App Store for iOS, an `intent:` URL for Android. Omitted when empty.
+    #[serde(default, skip_serializing_if = "AppTargets::is_empty")]
+    pub app: AppTargets,
+}
+
+/// Reads an optional RFC 3339 time, as chrono writes it, with chrono's
+/// strict RFC 3339 parser. Its `FromStr` would also accept the looser
+/// forms, through a general format parser that costs the Worker bundle
+/// about 2 KB gzipped; every record is written by chrono, so the strict
+/// parser reads them all.
+fn rfc3339<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(s) => DateTime::parse_from_rfc3339(&s)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 impl Link {
@@ -195,5 +215,31 @@ mod tests {
         let again: Link = serde_json::from_str(&serde_json::to_string(&link).unwrap()).unwrap();
         assert_eq!(again, link);
         assert!(serde_json::from_str::<Link>(&json.replace("\"DE\"", "\"DEU\"")).is_err());
+    }
+
+    #[test]
+    fn expiry_reads_what_chrono_writes() {
+        let json = r#"{"id":7,"code":"abc","destinations":[{"url":"https://example.com/"}],
+            "destinations_version":1,"redirect_status":302,"enabled":true,
+            "expires_at":"2026-11-14T02:53:00.123456Z"}"#;
+        let link: Link = serde_json::from_str(json).unwrap();
+        let t = link.expires_at.unwrap();
+        assert_eq!(t.timestamp_micros(), 1_794_624_780_123_456);
+        // A round trip through chrono's own form, whole seconds and offsets.
+        let again: Link = serde_json::from_str(&serde_json::to_string(&link).unwrap()).unwrap();
+        assert_eq!(again, link);
+        for (raw, micros) in [
+            ("2026-11-14T02:53:00Z", 1_794_624_780_000_000),
+            ("2026-11-14T03:53:00+01:00", 1_794_624_780_000_000),
+        ] {
+            let l: Link =
+                serde_json::from_str(&json.replace("2026-11-14T02:53:00.123456Z", raw)).unwrap();
+            assert_eq!(l.expires_at.unwrap().timestamp_micros(), micros, "{raw}");
+        }
+        let null: Link =
+            serde_json::from_str(&json.replace(r#""2026-11-14T02:53:00.123456Z""#, "null"))
+                .unwrap();
+        assert!(null.expires_at.is_none());
+        assert!(serde_json::from_str::<Link>(&json.replace("2026-11-14T", "tomorrow ")).is_err());
     }
 }

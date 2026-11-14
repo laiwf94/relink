@@ -81,6 +81,15 @@ struct World {
     links: Vec<(Option<usize>, Link)>,
 }
 
+const APPS_NONE: &str = "{}";
+const APPS_IOS: &str = r#"{"ios": [{"team_id": "abcde12345", "bundle_id": "com.example.app"},
+                                   {"team_id": "ZZZZZ99999", "bundle_id": "org.example.b"}]}"#;
+const APPS_ANDROID: &str = r#"{"android": [{"package": "com.example.app",
+    "sha256_cert_fingerprints": ["146de983c5730650d8eeb9952f34fc6416a08342e61dbea88a0496b23fcf44e5"]}]}"#;
+const APPS_BOTH: &str = r#"{"ios": [{"team_id": "ABCDE12345", "bundle_id": "com.example.app"}],
+    "android": [{"package": "com.example.app",
+    "sha256_cert_fingerprints": ["14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5"]}]}"#;
+
 fn settings() -> impl Strategy<Value = DomainSettings> {
     (
         prop::option::of(prop::sample::select(vec![
@@ -91,14 +100,16 @@ fn settings() -> impl Strategy<Value = DomainSettings> {
         prop::option::of(Just("<p>{{code}} has gone</p>")),
         prop::sample::subsequence(PREFIXES.to_vec(), 0..=PREFIXES.len()),
         any::<bool>(),
+        prop::sample::select(vec![APPS_NONE, APPS_IOS, APPS_ANDROID, APPS_BOTH]),
     )
-        .prop_map(|(root, nf, gone, prefixes, ci)| {
+        .prop_map(|(root, nf, gone, prefixes, ci, apps)| {
             DomainSettings {
                 root_url: root.map(str::to_owned),
                 not_found_page: nf.map(str::to_owned),
                 gone_page: gone.map(str::to_owned),
                 prefixes: prefixes.into_iter().map(str::to_owned).collect(),
                 case_insensitive: ci,
+                apps: serde_json::from_str(apps).unwrap(),
             }
             .validated(Policy {
                 allow_ip_literals: false,
@@ -183,6 +194,7 @@ fn link(id: i64, code: String, state: State) -> Link {
         health_check: false,
         unhealthy: vec![false],
         rules: Default::default(),
+        app: Default::default(),
     }
 }
 
@@ -263,6 +275,17 @@ fn path() -> impl Strategy<Value = String> {
             "%2Fabc", "pricing%20", "healthz",
         ])
         .prop_map(str::to_owned),
+        2 => prop::sample::select(vec![
+            ".well-known/apple-app-site-association",
+            "apple-app-site-association",
+            ".well-known/assetlinks.json",
+            ".well-known/Assetlinks.json",
+            ".well-known/assetlinks.json/",
+            "campaign/apple-app-site-association",
+            "Apple-App-Site-Association",
+            ".well-known/apple-app-site-association.json",
+        ])
+        .prop_map(str::to_owned),
         1 => "[a-zA-Z0-9/%._~-]{0,24}",
     ]
 }
@@ -326,10 +349,7 @@ impl MemoryKv {
     fn of(world: &World) -> MemoryKv {
         let mut kv = HashMap::new();
         for d in &world.domains {
-            let record = EdgeDomain {
-                id: d.id,
-                settings: d.settings.clone(),
-            };
+            let record = EdgeDomain::publish(d.id, d.settings.clone());
             kv.insert(
                 host_kv_key(&d.hostname),
                 serde_json::to_string(&record).unwrap(),
@@ -500,17 +520,25 @@ proptest! {
 #[tokio::test]
 async fn the_edge_answers_domain_decisions_itself() {
     let world = World {
-        domains: vec![VerifiedDomain {
-            hostname: "go.example.com".into(),
-            id: 100,
-            settings: DomainSettings {
-                root_url: Some("https://example.com/home".into()),
-                not_found_page: Some("<h1>{{code}} is not on {{host}}</h1>".into()),
-                gone_page: Some("<p>{{code}} has gone</p>".into()),
-                prefixes: vec!["campaign".into()],
-                case_insensitive: true,
+        domains: vec![
+            VerifiedDomain {
+                hostname: "go.example.com".into(),
+                id: 100,
+                settings: DomainSettings {
+                    root_url: Some("https://example.com/home".into()),
+                    not_found_page: Some("<h1>{{code}} is not on {{host}}</h1>".into()),
+                    gone_page: Some("<p>{{code}} has gone</p>".into()),
+                    prefixes: vec!["campaign".into()],
+                    case_insensitive: true,
+                    apps: serde_json::from_str(APPS_BOTH).unwrap(),
+                },
             },
-        }],
+            VerifiedDomain {
+                hostname: "links.example.org".into(),
+                id: 101,
+                settings: DomainSettings::default(),
+            },
+        ],
         links: vec![
             (Some(0), link(1, "pricing".into(), State::Live)),
             (Some(0), link(2, "old".into(), State::Expired)),
@@ -531,6 +559,15 @@ async fn the_edge_answers_domain_decisions_itself() {
         ("other.example.net", "Pricing", 302),
         ("127.0.0.1", "Pricing", 302),
         ("relink.example", "ab", 404),
+        (
+            "go.example.com",
+            ".well-known/apple-app-site-association",
+            200,
+        ),
+        ("go.example.com", "apple-app-site-association", 200),
+        ("go.example.com", ".well-known/assetlinks.json", 200),
+        ("links.example.org", ".well-known/assetlinks.json", 404),
+        ("links.example.org", "apple-app-site-association", 404),
     ] {
         let (o, e, served) = both(&app, &kv, Some(host), path).await;
         assert_eq!(served, Served::Edge, "{host} {path}");
@@ -543,6 +580,19 @@ async fn the_edge_answers_domain_decisions_itself() {
         let (o, e, _) = both(&app, &kv, Some(host), path).await;
         assert!(same(&o, &e), "{host} {path}");
     }
+    let (_, e, _) = both(
+        &app,
+        &kv,
+        Some("go.example.com"),
+        "apple-app-site-association",
+    )
+    .await;
+    assert_eq!(e.header("content-type"), Some("application/json"));
+    let aasa: serde_json::Value = serde_json::from_str(&e.body).unwrap();
+    assert_eq!(
+        aasa["applinks"]["details"][0]["appIDs"][0],
+        "ABCDE12345.com.example.app"
+    );
     let (o, e, served) = both(&app, &kv, Some("go.example.com"), "nothere").await;
     assert_eq!(served, Served::Origin);
     assert_eq!((o.status, e.status), (404, 404));

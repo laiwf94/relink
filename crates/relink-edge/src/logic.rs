@@ -28,6 +28,7 @@ use std::rc::Rc;
 
 use relink_core::classify::{UNKNOWN_COUNTRY, device_class, referrer_host};
 use relink_core::code::is_plausible_code;
+use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file_at};
 use relink_core::hex;
 use relink_core::host::{custom_host, host_part};
 use relink_core::model::Link;
@@ -166,7 +167,9 @@ pub async fn handle<K: Kv, O: Origin>(
     let host = host.to_ascii_lowercase();
     // A plain code is looked up as sent first: on a custom domain that is
     // the one read a redirect costs.
-    let sent = is_plausible_code(&req.code).then_some(req.code.as_str());
+    // An association file's path is never a code on a custom domain.
+    let sent = (is_plausible_code(&req.code) && app_file_at(&req.code).is_none())
+        .then_some(req.code.as_str());
     if let Some(code) = sent {
         match read(kv, &domain_kv_key(&host, code)).await {
             Read::Found(link) => {
@@ -191,6 +194,10 @@ pub async fn handle<K: Kv, O: Origin>(
             None => edge(error_page(PageKind::NotFound, Some(site), &host, req), None),
         },
         Target::Miss => edge(error_page(PageKind::NotFound, Some(site), &host, req), None),
+        Target::AppFile(file) => {
+            let body = domain.files.get(file);
+            edge(app_file_response(body, site, &host, req), None)
+        }
         // Already missing from KV: the code may not have arrived yet, so the
         // origin answers.
         Target::Code(code) if Some(&*code) == sent => from_origin(origin, req).await,
@@ -298,6 +305,28 @@ async fn serve<K: Kv, O: Origin>(
             Ok(None) => edge(error_page(kind, None, host, req), None),
             Err(()) => from_origin(origin, req).await,
         },
+    }
+}
+
+/// One of a domain's app association files, as the origin rendered it
+/// into the domain's record, or its 404 page when it names no app for that
+/// platform.
+fn app_file_response(
+    body: Option<&str>,
+    site: &DomainSettings,
+    host: &str,
+    req: &EdgeRequest,
+) -> EdgeResponse {
+    match body {
+        Some(body) => EdgeResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), JSON.into()),
+                ("cache-control".into(), APP_FILE_CACHE.into()),
+            ],
+            body: body.to_owned(),
+        },
+        None => error_page(PageKind::NotFound, Some(site), host, req),
     }
 }
 
@@ -645,6 +674,7 @@ mod tests {
             health_check: false,
             unhealthy: vec![false],
             rules: Default::default(),
+            app: Default::default(),
         }
     }
 
@@ -911,11 +941,7 @@ mod tests {
     fn mark_domain(kv: &MemoryKv, host: &str) {
         kv.values.borrow_mut().insert(
             host_kv_key(host),
-            serde_json::to_string(&EdgeDomain {
-                id: 3,
-                settings: DomainSettings::default(),
-            })
-            .unwrap(),
+            serde_json::to_string(&EdgeDomain::publish(3, DomainSettings::default())).unwrap(),
         );
     }
 
@@ -1116,13 +1142,14 @@ mod tests {
             gone_page: Some("<p>{{code}} gone</p>".into()),
             prefixes: vec!["campaign".into()],
             case_insensitive: true,
+            apps: Default::default(),
         }
     }
 
     fn with_site(kv: &MemoryKv, host: &str, settings: DomainSettings) {
         kv.values.borrow_mut().insert(
             host_kv_key(host),
-            serde_json::to_string(&EdgeDomain { id: 3, settings }).unwrap(),
+            serde_json::to_string(&EdgeDomain::publish(3, settings)).unwrap(),
         );
     }
 

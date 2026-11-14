@@ -151,6 +151,7 @@ async fn reconciliation_repairs_drift() {
                 enabled: true,
                 health_check: false,
                 rules: Default::default(),
+                app: Default::default(),
                 domain: None,
             },
             7,
@@ -264,7 +265,8 @@ async fn custom_domains_are_published_with_their_hostnames() {
         rec,
         EdgeDomain {
             id: domain_id,
-            settings: Default::default()
+            settings: Default::default(),
+            files: Default::default(),
         }
     );
     assert_eq!(kv.hostnames(), [HOST, "www.relink-docs.net"]);
@@ -294,6 +296,40 @@ async fn custom_domains_are_published_with_their_hostnames() {
     let rec: EdgeDomain = serde_json::from_str(&kv.values.lock().unwrap()[&host_key]).unwrap();
     assert_eq!(rec.id, domain_id);
     assert_eq!(rec.settings.gone_page.as_deref(), Some("<p>gone</p>"));
+
+    // Apps reach the edge as rendered association files, not as the list.
+    let (status, d) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/domains/{HOST}"),
+            &h.alice,
+            Some(json!({"apps": {"android": [{"package": "com.example.app",
+                "sha256_cert_fingerprints": ["14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5"]}]}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{d}");
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            kv.values
+                .lock()
+                .unwrap()
+                .get(&host_key)
+                .and_then(|v| serde_json::from_str::<EdgeDomain>(v).ok())
+                .is_some_and(|r| r.files.android.is_some())
+        })
+        .await,
+        "an apps change reaches the edge record"
+    );
+    let raw = kv.values.lock().unwrap()[&host_key].clone();
+    let rec: EdgeDomain = serde_json::from_str(&raw).unwrap();
+    assert!(rec.files.apple.is_none());
+    assert!(
+        rec.files
+            .android
+            .unwrap()
+            .contains(r#""package_name":"com.example.app""#)
+    );
+    assert!(!raw.contains(r#""apps""#), "{raw}");
 
     // The same code on both domains: two records, each under its own key.
     h.create(json!({"url": "https://a.example.org/", "alias": "promo"}))

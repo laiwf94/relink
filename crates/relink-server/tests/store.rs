@@ -44,6 +44,7 @@ fn new_link(alias: Option<&str>, max_clicks: Option<i64>) -> NewLink {
         enabled: true,
         health_check: true,
         rules: Default::default(),
+        app: Default::default(),
         domain: None,
     }
 }

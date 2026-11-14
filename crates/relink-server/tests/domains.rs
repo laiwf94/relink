@@ -728,7 +728,8 @@ async fn domain_settings_shape_what_its_paths_serve() {
     assert_eq!(
         d["settings"],
         json!({"root_url": null, "not_found_page": null, "gone_page": null,
-               "prefixes": [], "case_insensitive": false})
+               "prefixes": [], "case_insensitive": false,
+               "apps": {"ios": [], "android": []}})
     );
     let record = d["verification"]["value"].as_str().unwrap().to_owned();
     dns.set_txt("_relink-challenge.go.relink-docs.net", &[&record]);
@@ -808,7 +809,8 @@ async fn domain_settings_shape_what_its_paths_serve() {
         json!({"root_url": "https://www.relink-docs.net/",
                "not_found_page": "<h1>{{code}} is not on {{host}}</h1>",
                "gone_page": "<p>{{code}} has gone</p>",
-               "prefixes": ["campaign", "promo"], "case_insensitive": true})
+               "prefixes": ["campaign", "promo"], "case_insensitive": true,
+               "apps": {"ios": [], "android": []}})
     );
     // Links created on the domain now get lowercase codes.
     let (status, l) = h
@@ -942,5 +944,139 @@ async fn domain_settings_shape_what_its_paths_serve() {
     assert_eq!(changes.len(), 3);
     assert_eq!(changes[0]["settings"]["case_insensitive"], true);
     assert!(changes[2].get("settings").is_some());
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_domain_serves_the_association_files_of_its_apps() {
+    let dns = FakeDns::start().await;
+    let Some(mut h) = harness(&dns).await else {
+        return;
+    };
+    let (_, d) = add(&h, &h.alice, HOST).await;
+    let record = d["verification"]["value"].as_str().unwrap().to_owned();
+    dns.set_txt("_relink-challenge.go.relink-docs.net", &[&record]);
+    assert_eq!(verify(&h, &h.alice, HOST).await.1["verified"], true);
+    let path = format!("/v1/domains/{HOST}");
+    let patch = |body: Value| {
+        let (h, path) = (&h, path.clone());
+        async move { h.api(Method::PATCH, &path, &h.alice, Some(body)).await }
+    };
+    let files = [
+        ".well-known/apple-app-site-association",
+        "apple-app-site-association",
+        ".well-known/assetlinks.json",
+    ];
+    // Without apps the paths are the domain's 404.
+    for f in files {
+        assert_eq!(fetch_as(&h, HOST, f).await.0, 404, "{f}");
+    }
+
+    // Invalid apps name the part at fault; nothing is stored.
+    let print = "146de983c5730650d8eeb9952f34fc6416a08342e61dbea88a0496b23fcf44e5";
+    for (bad, want) in [
+        (
+            json!({"ios": [{"team_id": "ABC", "bundle_id": "com.example.app"}]}),
+            "apps.ios[0].team_id: ",
+        ),
+        (
+            json!({"ios": [{"team_id": "ABCDE12345", "bundle_id": "app"}]}),
+            "apps.ios[0].bundle_id: ",
+        ),
+        (
+            json!({"android": [{"package": "com.example.app", "sha256_cert_fingerprints": []}]}),
+            "apps.android[0].sha256_cert_fingerprints: ",
+        ),
+        (
+            json!({"android": [{"package": "com.example.app",
+                                "sha256_cert_fingerprints": [print, "zz"]}]}),
+            "apps.android[0].sha256_cert_fingerprints[1]: ",
+        ),
+        (
+            json!({"android": [{"package": "example", "sha256_cert_fingerprints": [print]}]}),
+            "apps.android[0].package: ",
+        ),
+    ] {
+        let (status, body) = patch(json!({ "apps": bad })).await;
+        assert_eq!(status, 400, "{body}");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with(want), "{msg}");
+    }
+    for bad in [
+        json!({"apps": {"windows": []}}),
+        json!({"apps": {"ios": [{"team_id": "ABCDE12345", "bundle_id": "a.b", "x": 1}]}}),
+    ] {
+        assert_eq!(patch(bad).await.0, 400);
+    }
+
+    let (status, d) = patch(json!({"apps": {
+        "ios": [{"team_id": "abcde12345", "bundle_id": "com.example.app"}],
+        "android": [{"package": "com.example.app", "sha256_cert_fingerprints": [print]}],
+    }}))
+    .await;
+    assert_eq!(status, 200, "{d}");
+    let pretty = "14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:\
+                  B2:3F:CF:44:E5";
+    assert_eq!(
+        d["settings"]["apps"],
+        json!({"ios": [{"team_id": "ABCDE12345", "bundle_id": "com.example.app"}],
+               "android": [{"package": "com.example.app", "sha256_cert_fingerprints": [pretty]}]})
+    );
+    for f in &files[..2] {
+        let (status, _, ctype, _, body) = fetch_as(&h, HOST, f).await;
+        assert_eq!((status, ctype.as_str()), (200, "application/json"), "{f}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["applinks"]["details"][0]["appIDs"],
+            json!(["ABCDE12345.com.example.app"])
+        );
+        assert_eq!(
+            v["applinks"]["details"][0]["components"],
+            json!([{"/": "*"}])
+        );
+    }
+    let (status, _, ctype, _, body) = fetch_as(&h, HOST, files[2]).await;
+    assert_eq!((status, ctype.as_str()), (200, "application/json"));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v[0]["target"]["package_name"], "com.example.app");
+    assert_eq!(v[0]["target"]["sha256_cert_fingerprints"], json!([pretty]));
+    // Only the custom domain has them, and only at exactly these paths.
+    assert_eq!(fetch_as(&h, "localhost", files[2]).await.0, 404);
+    assert_eq!(
+        fetch_as(&h, HOST, ".well-known/assetlinks.json.bak")
+            .await
+            .0,
+        404
+    );
+    // The reserved name cannot become a code.
+    let (status, _) = h
+        .api(
+            Method::POST,
+            "/v1/links",
+            &h.alice,
+            Some(
+                json!({"url": "https://b.example.org/", "alias": "apple-app-site-association",
+                        "domain": HOST}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // One platform removed, then all apps.
+    let (status, _) = patch(json!({"apps": {"android": [{"package": "com.example.app",
+                                                         "sha256_cert_fingerprints": [print]}]}}))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(fetch_as(&h, HOST, files[0]).await.0, 404);
+    assert_eq!(fetch_as(&h, HOST, files[2]).await.0, 200);
+    let (status, d) = patch(json!({"apps": null})).await;
+    assert_eq!(status, 200);
+    assert_eq!(d["settings"]["apps"], json!({"ios": [], "android": []}));
+    assert_eq!(fetch_as(&h, HOST, files[2]).await.0, 404);
+    let m = h.metrics().await;
+    assert_eq!(
+        common::metric(&m, "relink_redirects_total{outcome=\"app_file\"}"),
+        4.0
+    );
     h.shutdown().await;
 }

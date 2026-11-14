@@ -14,7 +14,7 @@
         "summary": "Follow a short link",
         "operationId": "redirect",
         "security": [],
-        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's. A custom domain's settings also apply: / redirects to its root_url, /{prefix}/{code} serves a code behind one of its prefixes, codes ignore case when case_insensitive is set, and its not_found_page and gone_page replace the plain-text 404 and 410 (as text/html, under a Content-Security-Policy that allows no scripts). On the default domain / and two-segment paths are unknown paths.",
+        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's. A custom domain's settings also apply: / redirects to its root_url, /{prefix}/{code} serves a code behind one of its prefixes, codes ignore case when case_insensitive is set, and its not_found_page and gone_page replace the plain-text 404 and 410 (as text/html, under a Content-Security-Policy that allows no scripts). On the default domain / and two-segment paths are unknown paths. A custom domain whose settings name apps also serves their association files, as application/json: /.well-known/apple-app-site-association (and /apple-app-site-association) for iOS universal links, /.well-known/assetlinks.json for Android app links; without apps for that platform they are its 404. A link's app targets send iPhones and iPads to its App Store page and Android browsers to an intent: URL that opens the app or its store fallback, after targeting rules and before the destinations; crawlers and other systems follow the destinations.",
         "parameters": [{ "$ref": "#/components/parameters/Code" }],
         "responses": {
           "301": { "$ref": "#/components/responses/Redirect" },
@@ -570,6 +570,52 @@
           "countries": { "type": "array", "minItems": 1, "maxItems": 300, "items": { "type": "string", "pattern": "^[A-Za-z]{2}$" } }
         }
       },
+      "AppTargets": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Where phones go instead of the destinations. A refused part is invalid_argument with its path, such as app.android.package.",
+        "properties": {
+          "ios": {
+            "type": "object", "additionalProperties": false, "required": ["store_url"],
+            "properties": { "store_url": { "type": "string", "maxLength": 2048, "description": "The App Store page, for iPhones and iPads the app did not open the link on (an installed app opens it first through the domain's universal links). Follows the rules destinations do." } }
+          },
+          "android": {
+            "type": "object", "additionalProperties": false, "required": ["package", "url"],
+            "properties": {
+              "package": { "type": "string", "maxLength": 255, "pattern": "^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$", "description": "The app's package name." },
+              "url": { "type": "string", "maxLength": 1024, "description": "The deep link the app opens at: scheme://..., printable ASCII without #, with a lowercase scheme other than http, intent, javascript, data, file, vbscript, about, blob or filesystem." },
+              "store_url": { "type": "string", "maxLength": 2048, "description": "Where the browser goes without the app; the package's Play Store page when absent. Follows the rules destinations do." }
+            }
+          }
+        }
+      },
+      "Apps": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The apps a domain belongs to; every path on it is associated. A refused part is invalid_argument with its path, such as apps.ios[0].team_id.",
+        "properties": {
+          "ios": {
+            "type": "array", "maxItems": 8,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["team_id", "bundle_id"],
+              "properties": {
+                "team_id": { "type": "string", "pattern": "^[A-Za-z0-9]{10}$", "description": "Stored uppercase." },
+                "bundle_id": { "type": "string", "maxLength": 155, "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$" }
+              }
+            }
+          },
+          "android": {
+            "type": "array", "maxItems": 8,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["package", "sha256_cert_fingerprints"],
+              "properties": {
+                "package": { "type": "string", "maxLength": 255, "pattern": "^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$" },
+                "sha256_cert_fingerprints": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "string" }, "description": "SHA-256 signing-certificate fingerprints, 64 hex digits with or without colons; stored as uppercase pairs joined by colons." }
+              }
+            }
+          }
+        }
+      },
       "Rule": {
         "type": "object",
         "additionalProperties": false,
@@ -632,7 +678,8 @@
           "enabled": { "type": "boolean", "default": true },
           "health_check": { "type": "boolean", "default": false },
           "domain": { "type": ["string", "null"], "maxLength": 253, "description": "A custom domain the workspace has verified; absent or null for the default domain." },
-          "rules": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/Rule" }, "description": "Targeting rules, tried in order. A refused list is invalid_argument with the JSON path of the part at fault, such as rules[1].if.all[0].country[2]." }
+          "rules": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/Rule" }, "description": "Targeting rules, tried in order. A refused list is invalid_argument with the JSON path of the part at fault, such as rules[1].if.all[0].country[2]." },
+          "app": { "$ref": "#/components/schemas/AppTargets" }
         }
       },
       "PatchLink": {
@@ -649,12 +696,13 @@
           "fallback_url": { "type": ["string", "null"], "maxLength": 2048 },
           "enabled": { "type": "boolean" },
           "health_check": { "type": "boolean" },
-          "rules": { "type": ["array", "null"], "maxItems": 32, "items": { "$ref": "#/components/schemas/Rule" }, "description": "Replaces the whole list; null or [] removes the rules." }
+          "rules": { "type": ["array", "null"], "maxItems": 32, "items": { "$ref": "#/components/schemas/Rule" }, "description": "Replaces the whole list; null or [] removes the rules." },
+          "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }], "description": "Replaces the app targets; null or {} removes them." }
         }
       },
       "Link": {
         "type": "object",
-        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "rules", "created_at", "updated_at"],
+        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "rules", "app", "created_at", "updated_at"],
         "properties": {
           "code": { "type": "string" },
           "domain": { "type": ["string", "null"], "description": "The custom domain the link is on; null for the default domain." },
@@ -680,6 +728,7 @@
           "health_check": { "type": "boolean" },
           "health_checked_at": { "type": ["string", "null"], "format": "date-time" },
           "rules": { "type": "array", "items": { "$ref": "#/components/schemas/Rule" }, "description": "Targeting rules in order, with destinations normalised; [] for none." },
+          "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }], "description": "App targets, with store URLs normalised; null for none." },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         }
@@ -856,14 +905,15 @@
           },
           "settings": {
             "type": "object",
-            "required": ["root_url", "not_found_page", "gone_page", "prefixes", "case_insensitive"],
+            "required": ["root_url", "not_found_page", "gone_page", "prefixes", "case_insensitive", "apps"],
             "description": "What the domain does besides serving its links; every field is shown, null or empty when unset.",
             "properties": {
               "root_url": { "type": ["string", "null"] },
               "not_found_page": { "type": ["string", "null"] },
               "gone_page": { "type": ["string", "null"] },
               "prefixes": { "type": "array", "items": { "type": "string" } },
-              "case_insensitive": { "type": "boolean" }
+              "case_insensitive": { "type": "boolean" },
+              "apps": { "type": "object", "required": ["ios", "android"], "properties": { "ios": { "type": "array", "items": { "type": "object" } }, "android": { "type": "array", "items": { "type": "object" } } }, "description": "As Apps, with both lists always present." }
             }
           },
           "created_by": { "type": "string" },
@@ -878,7 +928,8 @@
           "not_found_page": { "type": ["string", "null"], "maxLength": 16384, "description": "HTML for 404: unknown codes, disabled links and paths that are not a code here. {{code}} and {{host}} are replaced, HTML-escaped." },
           "gone_page": { "type": ["string", "null"], "maxLength": 16384, "description": "HTML for 410: expired links and links at their click limit. Same placeholders." },
           "prefixes": { "type": "array", "maxItems": 8, "items": { "type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9_-]{0,30}[A-Za-z0-9])?$" }, "description": "Path segments accepted in front of a code, so /campaign/abc is the link abc. Stored lowercase; reserved words are refused." },
-          "case_insensitive": { "type": "boolean", "description": "Whether /ABC and /abc are the same link. Links created on the domain then get lowercase codes." }
+          "case_insensitive": { "type": "boolean", "description": "Whether /ABC and /abc are the same link. Links created on the domain then get lowercase codes." },
+          "apps": { "oneOf": [{ "$ref": "#/components/schemas/Apps" }, { "type": "null" }], "description": "Replaces the apps the domain belongs to; null removes them." }
         }
       },
       "DomainList": {

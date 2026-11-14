@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::code::is_plausible_code;
+use crate::deeplink::AppFiles;
 use crate::host::is_valid_hostname;
 use crate::site::DomainSettings;
 
@@ -83,6 +84,23 @@ pub struct EdgeDomain {
     /// are the defaults.
     #[serde(default, skip_serializing_if = "DomainSettings::is_default")]
     pub settings: DomainSettings,
+    /// Its app association files, rendered from `settings.apps` (which the
+    /// record leaves out); absent when it names no app.
+    #[serde(default, skip_serializing_if = "AppFiles::is_empty")]
+    pub files: AppFiles,
+}
+
+impl EdgeDomain {
+    /// The record the origin publishes for a verified domain: its settings
+    /// without the app list, and the association files rendered from it.
+    pub fn publish(id: i64, mut settings: DomainSettings) -> EdgeDomain {
+        let apps = std::mem::take(&mut settings.apps);
+        EdgeDomain {
+            id,
+            files: AppFiles::render(&apps),
+            settings,
+        }
+    }
 }
 
 /// Most clicks in one batch sent from the edge.
@@ -181,21 +199,40 @@ mod tests {
     #[test]
     fn domain_records_ignore_fields_they_do_not_know() {
         let d: EdgeDomain = serde_json::from_str(r#"{"id":7,"later":"x"}"#).unwrap();
-        let plain = EdgeDomain {
-            id: 7,
-            settings: DomainSettings::default(),
-        };
+        let plain = EdgeDomain::publish(7, DomainSettings::default());
         assert_eq!(d, plain);
         assert_eq!(serde_json::to_string(&d).unwrap(), r#"{"id":7}"#);
-        let d = EdgeDomain {
-            id: 7,
-            settings: DomainSettings {
+        let d = EdgeDomain::publish(
+            7,
+            DomainSettings {
                 case_insensitive: true,
                 ..DomainSettings::default()
             },
-        };
+        );
         let json = serde_json::to_string(&d).unwrap();
         assert_eq!(json, r#"{"id":7,"settings":{"case_insensitive":true}}"#);
+        assert_eq!(serde_json::from_str::<EdgeDomain>(&json).unwrap(), d);
+    }
+
+    #[test]
+    fn domain_records_carry_rendered_app_files_not_the_list() {
+        let settings = DomainSettings {
+            apps: serde_json::from_str(
+                r#"{"ios": [{"team_id": "ABCDE12345", "bundle_id": "com.example.app"}]}"#,
+            )
+            .unwrap(),
+            ..DomainSettings::default()
+        };
+        let d = EdgeDomain::publish(7, settings);
+        assert!(d.settings.is_default());
+        assert!(d.files.android.is_none());
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.starts_with(r#"{"id":7,"files":["{\"applinks\""#),
+            "{json}"
+        );
+        assert!(json.ends_with(r#"]}}",""]}"#), "{json}");
+        assert!(!json.contains(r#""apps""#));
         assert_eq!(serde_json::from_str::<EdgeDomain>(&json).unwrap(), d);
     }
 }

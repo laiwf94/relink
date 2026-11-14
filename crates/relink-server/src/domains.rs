@@ -57,6 +57,7 @@ use crate::server::App;
 use crate::store::{Db, DbError};
 use crate::tenant::{Allowed, LinksRead, LinksWrite, Tenant};
 use crate::util::{hex_encode, secure_random};
+use relink_core::deeplink::{AndroidApp, Apps, IosApp};
 use relink_core::host::custom_host;
 use relink_core::site::DomainSettings;
 use sqlx::types::Json;
@@ -405,6 +406,14 @@ pub struct SettingsView {
     pub gone_page: Option<String>,
     pub prefixes: Vec<String>,
     pub case_insensitive: bool,
+    pub apps: AppsView,
+}
+
+/// The apps a domain belongs to, both lists always present.
+#[derive(Debug, Serialize)]
+pub struct AppsView {
+    pub ios: Vec<IosApp>,
+    pub android: Vec<AndroidApp>,
 }
 
 impl From<&DomainSettings> for SettingsView {
@@ -415,6 +424,10 @@ impl From<&DomainSettings> for SettingsView {
             gone_page: s.gone_page.clone(),
             prefixes: s.prefixes.clone(),
             case_insensitive: s.case_insensitive,
+            apps: AppsView {
+                ios: s.apps.ios.clone(),
+                android: s.apps.android.clone(),
+            },
         }
     }
 }
@@ -851,6 +864,56 @@ pub struct UpdateDomain {
     pub gone_page: Option<Option<String>>,
     pub prefixes: Option<Vec<String>>,
     pub case_insensitive: Option<bool>,
+    /// Replaces the apps the domain belongs to; `null` removes them.
+    #[serde(default, deserialize_with = "nullable")]
+    pub apps: Option<Option<AppsInput>>,
+}
+
+/// A domain's apps as the API takes them ([`relink_core::deeplink::Apps`]).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppsInput {
+    #[serde(default)]
+    pub ios: Vec<IosAppInput>,
+    #[serde(default)]
+    pub android: Vec<AndroidAppInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IosAppInput {
+    pub team_id: String,
+    pub bundle_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidAppInput {
+    pub package: String,
+    pub sha256_cert_fingerprints: Vec<String>,
+}
+
+impl From<AppsInput> for Apps {
+    fn from(a: AppsInput) -> Apps {
+        Apps {
+            ios: a
+                .ios
+                .into_iter()
+                .map(|i| IosApp {
+                    team_id: i.team_id,
+                    bundle_id: i.bundle_id,
+                })
+                .collect(),
+            android: a
+                .android
+                .into_iter()
+                .map(|a| AndroidApp {
+                    package: a.package,
+                    sha256_cert_fingerprints: a.sha256_cert_fingerprints,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Distinguishes "absent" (outer None) from "null" (Some(None)).
@@ -878,6 +941,9 @@ impl UpdateDomain {
         }
         if let Some(v) = self.case_insensitive {
             s.case_insensitive = v;
+        }
+        if let Some(v) = self.apps {
+            s.apps = v.map(Apps::from).unwrap_or_default();
         }
         s
     }
@@ -1242,6 +1308,7 @@ mod tests {
             gone_page: Some("g".into()),
             prefixes: vec!["p".into()],
             case_insensitive: true,
+            apps: Default::default(),
         };
         let patch: UpdateDomain = serde_json::from_str(r#"{"root_url":null}"#).unwrap();
         let s = patch.apply(&current);

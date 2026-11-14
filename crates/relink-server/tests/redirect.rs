@@ -249,6 +249,121 @@ async fn forwarding_headers_from_untrusted_peers_are_ignored() {
 }
 
 #[tokio::test]
+async fn app_targets_send_phones_from_the_stored_link() {
+    let mut h = harness!();
+    let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 \
+                  (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+    let pixel = "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/124.0 Mobile Safari/537.36";
+    let desktop =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0";
+    let crawler = "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X) Chrome/124.0 Mobile Safari/537.36 \
+                   (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+    let l = h
+        .create(json!({
+            "url": "https://example.com/item/42",
+            "rules": [{"if": {"language": ["de"]}, "url": "https://example.com/de"}],
+            "app": {
+                "ios": {"store_url": "HTTPS://Apps.Apple.com/app/id1"},
+                "android": {"package": "com.example.app", "url": "myapp://item/42?ref=link"}
+            }
+        }))
+        .await;
+    assert_eq!(
+        l["app"],
+        json!({"ios": {"store_url": "https://apps.apple.com/app/id1"},
+               "android": {"package": "com.example.app", "url": "myapp://item/42?ref=link"}})
+    );
+    let code = l["code"].as_str().unwrap().to_owned();
+    let intent = "intent://item/42?ref=link#Intent;scheme=myapp;package=com.example.app;\
+                  S.browser_fallback_url=https%3A%2F%2Fplay.google.com%2Fstore%2Fapps%2Fdetails\
+                  %3Fid%3Dcom.example.app;end";
+    let cases: [Case; 6] = [
+        (
+            &code,
+            &[("user-agent", iphone)],
+            "https://apps.apple.com/app/id1",
+        ),
+        (&code, &[("user-agent", pixel)], intent),
+        (
+            &code,
+            &[("user-agent", desktop)],
+            "https://example.com/item/42",
+        ),
+        (
+            &code,
+            &[("user-agent", crawler)],
+            "https://example.com/item/42",
+        ),
+        (&code, &[], "https://example.com/item/42"),
+        // A targeting rule comes first.
+        (
+            &code,
+            &[("user-agent", iphone), ("accept-language", "de")],
+            "https://example.com/de",
+        ),
+    ];
+    for (path, headers, want) in cases {
+        // Twice: the second answer comes from the cached, compiled link.
+        for _ in 0..2 {
+            let r = h.visit(path, headers).await;
+            assert_eq!(r.status(), 302, "{headers:?}");
+            assert_eq!(location(&r), want, "{headers:?}");
+            assert_eq!(r.headers()["cache-control"], "no-store", "{headers:?}");
+        }
+    }
+    let m = h.metrics().await;
+    assert_eq!(metric(&m, "relink_redirects_total{outcome=\"app\"}"), 4.0);
+
+    // A store URL for Android replaces the Play Store; removing the
+    // targets makes the link cacheable again.
+    let (status, l) = h
+        .api(
+            Method::PATCH,
+            &format!("/v1/links/{code}"),
+            &h.alice,
+            Some(json!({"app": {"android": {"package": "com.example.app",
+                                            "url": "https://example.com/item/42",
+                                            "store_url": "https://example.com/get-the-app"}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{l}");
+    let r = h.visit(&code, &[("user-agent", pixel)]).await;
+    assert_eq!(
+        location(&r),
+        "intent://example.com/item/42#Intent;scheme=https;package=com.example.app;\
+         S.browser_fallback_url=https%3A%2F%2Fexample.com%2Fget-the-app;end"
+    );
+    let r = h.visit(&code, &[("user-agent", iphone)]).await;
+    assert_eq!(location(&r), "https://example.com/item/42");
+    for clear in [json!({"app": null, "rules": null}), json!({"app": {}})] {
+        let (status, l) = h
+            .api(
+                Method::PATCH,
+                &format!("/v1/links/{code}"),
+                &h.alice,
+                Some(clear),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(l["app"], json!(null));
+        let r = h.visit(&code, &[("user-agent", pixel)]).await;
+        assert_eq!(location(&r), "https://example.com/item/42");
+        assert_eq!(r.headers()["cache-control"], "private, max-age=0");
+    }
+
+    // An app redirect is a click, and spends the click limit.
+    let limited = h
+        .create(json!({"url": "https://example.com/", "max_clicks": 1,
+                       "app": {"ios": {"store_url": "https://apps.apple.com/app/id1"}}}))
+        .await;
+    let code = limited["code"].as_str().unwrap();
+    let r = h.visit(code, &[("user-agent", iphone)]).await;
+    assert_eq!(location(&r), "https://apps.apple.com/app/id1");
+    assert_eq!(h.visit(code, &[("user-agent", iphone)]).await.status(), 410);
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn ab_split_is_weighted_and_sticky() {
     let mut h = harness!();
     let l = h

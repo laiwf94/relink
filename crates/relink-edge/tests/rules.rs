@@ -18,6 +18,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use axum::response::Response;
 use proptest::prelude::*;
 use relink_core::abtest::Signer;
+use relink_core::deeplink::AppLink;
 use relink_core::model::{Destination, Link};
 use relink_core::rules::Settings;
 use relink_core::rules_v2::{Condition, QueryMatch, Rule, RuleSet, TimeWindow};
@@ -139,7 +140,23 @@ fn rules() -> impl Strategy<Value = Vec<Rule>> {
     })
 }
 
+/// App targets a generated link may have.
+const APPS: [Option<&str>; 4] = [
+    None,
+    Some(r#"{"ios": {"store_url": "https://apps.apple.com/app/id1"}}"#),
+    Some(r#"{"android": {"package": "com.example.app", "url": "myapp://item/7"}}"#),
+    Some(
+        r#"{"ios": {"store_url": "https://apps.apple.com/app/id1"},
+            "android": {"package": "com.example.app", "url": "https://dest.example/app",
+                        "store_url": "https://dest.example/get?the=app"}}"#,
+    ),
+];
+
 fn link(id: i64, rules: Vec<Rule>, limited: bool) -> Link {
+    with_app(id, rules, limited, None)
+}
+
+fn with_app(id: i64, rules: Vec<Rule>, limited: bool, app: Option<&str>) -> Link {
     Link {
         id,
         code: format!("link{id}"),
@@ -157,6 +174,9 @@ fn link(id: i64, rules: Vec<Rule>, limited: bool) -> Link {
         health_check: false,
         unhealthy: vec![false],
         rules: RuleSet::new(rules).unwrap(),
+        app: app
+            .map(|a| serde_json::from_str::<AppLink>(a).unwrap().compile())
+            .unwrap_or_default(),
     }
 }
 
@@ -411,13 +431,16 @@ proptest! {
 
     #[test]
     fn origin_and_edge_apply_rules_alike(
-        lists in prop::collection::vec((rules(), prop::bool::weighted(0.2)), 1..5),
+        lists in prop::collection::vec(
+            (rules(), prop::bool::weighted(0.2), pick(&APPS)),
+            1..5,
+        ),
         visits in prop::collection::vec((0usize..5, visitor()), 1..16),
     ) {
         let links: Vec<Link> = lists
             .into_iter()
             .enumerate()
-            .map(|(i, (r, limited))| link(i as i64, r, limited))
+            .map(|(i, (r, limited, app))| with_app(i as i64, r, limited, app))
             .collect();
         let rt = runtime();
         rt.block_on(async {
@@ -426,12 +449,12 @@ proptest! {
             for (i, v) in &visits {
                 let l = &links[i % links.len()];
                 let (o, e, served, _) = both(&app, &kv, &l.code, v).await;
-                if !l.rules.is_empty() {
+                if !l.rules.is_empty() || !l.app.is_empty() {
                     for r in [&o, &e] {
                         prop_assert_eq!(
                             r.header("cache-control"),
                             Some("no-store"),
-                            "a link with rules was cacheable: {:?}",
+                            "a link with rules or app targets was cacheable: {:?}",
                             r
                         );
                     }
@@ -561,6 +584,70 @@ async fn rules_route_visitors_at_both_and_are_never_cached() {
     assert_eq!(served, Served::Edge);
     assert_eq!(e.header("cache-control"), Some(EDGE_MAX_AGE));
     assert_ne!(o.header("cache-control"), Some("no-store"));
+}
+
+/// App targets send phones to the store or into the app at both, after
+/// targeting rules and before the destinations; desktops and crawlers
+/// follow the destinations; nothing is cached.
+#[tokio::test]
+async fn app_targets_send_phones_at_both() {
+    let rule: Vec<Rule> =
+        serde_json::from_str(r#"[{"if": {"language": ["de"]}, "url": "https://example.com/de"}]"#)
+            .unwrap();
+    let links = [
+        with_app(0, rule.clone(), false, APPS[3]),
+        with_app(1, rule, true, APPS[3]),
+        with_app(2, Vec::new(), false, APPS[2]),
+    ];
+    let app = origin(&links);
+    let kv = MemoryKv::of(&links);
+    let ua = |i: usize| Visitor {
+        user_agent: Some(UAS[i]),
+        ..Visitor::default()
+    };
+    let intent = "intent://dest.example/app#Intent;scheme=https;package=com.example.app;\
+                  S.browser_fallback_url=https%3A%2F%2Fdest.example%2Fget%3Fthe%3Dapp;end";
+    let german_iphone = Visitor {
+        accept_language: Some(LANGUAGES[1]),
+        ..ua(0)
+    };
+    assert!(LANGUAGES[1].starts_with("de"));
+    for (code, want_served) in [("link0", Served::Edge), ("link1", Served::Origin)] {
+        let dest = format!("https://dest.example/{}", &code[4..]);
+        for (v, want, counted) in [
+            (ua(0), "https://apps.apple.com/app/id1", Outcome::App),
+            (ua(1), "https://apps.apple.com/app/id1", Outcome::App),
+            (ua(2), intent, Outcome::App),
+            (ua(3), dest.as_str(), Outcome::Redirect),
+            (ua(6), dest.as_str(), Outcome::Redirect),
+            (Visitor::default(), dest.as_str(), Outcome::Redirect),
+            (
+                german_iphone.clone(),
+                "https://example.com/de",
+                Outcome::Rule,
+            ),
+        ] {
+            let (o, e, served, outcome) = both(&app, &kv, code, &v).await;
+            assert_eq!(served, want_served, "{code} {v:?}");
+            assert_eq!(outcome, counted, "{code} {v:?}");
+            for r in [&o, &e] {
+                assert_eq!(r.status, 302, "{code} {v:?}: {r:?}");
+                assert_eq!(r.header("location"), Some(want), "{code} {v:?}");
+                assert_eq!(r.header("cache-control"), Some("no-store"), "{code} {v:?}");
+            }
+        }
+    }
+    // Android only: the Play Store is the fallback; iPhones get the link.
+    let (_, e, _, _) = both(&app, &kv, "link2", &ua(2)).await;
+    assert_eq!(
+        e.header("location"),
+        Some(
+            "intent://item/7#Intent;scheme=myapp;package=com.example.app;S.browser_fallback_url=\
+             https%3A%2F%2Fplay.google.com%2Fstore%2Fapps%2Fdetails%3Fid%3Dcom.example.app;end"
+        )
+    );
+    let (_, e, _, _) = both(&app, &kv, "link2", &ua(0)).await;
+    assert_eq!(e.header("location"), Some("https://dest.example/2"));
 }
 
 /// The origin believes the region header only from a trusted proxy, as it

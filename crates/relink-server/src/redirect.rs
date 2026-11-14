@@ -30,6 +30,7 @@ use crate::rules::{Decision, Settings, Visit, evaluate};
 use crate::server::App;
 use crate::store::link_key;
 use crate::util::{fast_random, now_ms, utc_day};
+use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file};
 use relink_core::site::{
     DomainSettings, EXPIRED_TEXT, HTML, PAGE_CSP, PageKind, Target, page, target,
 };
@@ -190,6 +191,10 @@ pub async fn handle(
         (Target::Miss, Some(_)) => {
             return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
         }
+        (Target::AppFile(file), Some(s)) => match app_file(file, &s.settings.apps) {
+            Some(body) => return (json_file(body), Outcome::AppFile),
+            None => return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT),
+        },
         // The default domain: `/` and paths with a `/` were never
         // redirects, and are answered as unknown paths, as before.
         (_, None) if path.is_empty() || path.contains('/') => {
@@ -265,6 +270,8 @@ pub async fn handle(
         Outcome::Fallback
     } else if redirect.rule.is_some() {
         Outcome::Rule
+    } else if redirect.app {
+        Outcome::App
     } else {
         Outcome::Redirect
     };
@@ -272,6 +279,22 @@ pub async fn handle(
         location(redirect.status, redirect.location, cache, cookie),
         outcome,
     )
+}
+
+/// An app association file (`relink_core::deeplink::app_file`).
+fn json_file(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(JSON)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(APP_FILE_CACHE),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Text of the built-in 410 page for a link at its click limit.

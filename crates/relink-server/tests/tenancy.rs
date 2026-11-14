@@ -43,6 +43,7 @@ fn new_link(owner: &str, alias: &str) -> NewLink {
         enabled: true,
         health_check: false,
         rules: Default::default(),
+        app: Default::default(),
         domain: None,
     }
 }

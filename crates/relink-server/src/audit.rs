@@ -200,6 +200,18 @@ pub fn link_state(link: &StoredLink) -> Value {
     let mut v = serde_json::to_value(&link.link).unwrap_or(Value::Null);
     if let Value::Object(m) = &mut v {
         m.insert("owner".into(), Value::String(link.owner.clone()));
+        // App targets as written, not the compiled locations.
+        match &link.app {
+            Some(app) => {
+                m.insert(
+                    "app".into(),
+                    serde_json::to_value(app).unwrap_or(Value::Null),
+                );
+            }
+            None => {
+                m.remove("app");
+            }
+        }
         // Only links on custom domains say so; the default domain has none.
         if let Some(d) = link.domain_id {
             m.insert("domain_id".into(), Value::from(d));

@@ -42,6 +42,7 @@ fn split_link() -> Link {
         health_check: false,
         unhealthy: vec![false; 3],
         rules: Default::default(),
+        app: Default::default(),
     }
 }
 

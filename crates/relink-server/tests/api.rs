@@ -1307,3 +1307,121 @@ async fn invalid_rules_are_refused_with_their_path() {
     assert_eq!(got["rules"], json!([]));
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn app_targets_are_validated_and_refused_with_their_path() {
+    let mut h = harness!();
+    let url = "https://example.com/r";
+    let android = |package: &str, link: &str| json!({"android": {"package": package, "url": link}});
+    // (app, the start of the error message)
+    let cases: Vec<(Value, &str)> = vec![
+        (json!({"windows": {}}), "invalid JSON body"),
+        (json!({"ios": {}}), "invalid JSON body"),
+        (
+            json!({"ios": {"store_url": url, "x": 1}}),
+            "invalid JSON body",
+        ),
+        (
+            json!({"android": {"package": "com.example.app"}}),
+            "invalid JSON body",
+        ),
+        (
+            json!({"ios": {"store_url": "ftp://apps.apple.com/"}}),
+            "app.ios.store_url: ",
+        ),
+        (
+            json!({"ios": {"store_url": "https://localhost/"}}),
+            "app.ios.store_url: ",
+        ),
+        (android("app", "myapp://x"), "app.android.package: "),
+        (android("com.1app", "myapp://x"), "app.android.package: "),
+        (android("com.example.app", "myapp:x"), "app.android.url: "),
+        (
+            android("com.example.app", "http://example.com/"),
+            "app.android.url: ",
+        ),
+        (
+            android("com.example.app", "javascript://%0aalert(1)"),
+            "app.android.url: ",
+        ),
+        (
+            android("com.example.app", "intent://x"),
+            "app.android.url: ",
+        ),
+        (
+            android("com.example.app", "myapp://a#b"),
+            "app.android.url: ",
+        ),
+        (
+            android("com.example.app", "myapp://a b"),
+            "app.android.url: ",
+        ),
+        (
+            json!({"android": {"package": "com.example.app", "url": "myapp://x",
+                               "store_url": "javascript:alert(1)"}}),
+            "app.android.store_url: ",
+        ),
+    ];
+    for (app, expected) in &cases {
+        for patch in [false, true] {
+            let (method, path) = if patch {
+                (Method::PATCH, "/v1/links/apps-ok")
+            } else {
+                (Method::POST, "/v1/links")
+            };
+            let body = if patch {
+                json!({ "app": app })
+            } else {
+                json!({"url": url, "alias": "apps-bad", "app": app})
+            };
+            if patch && h.api(Method::GET, path, &h.alice, None).await.0 == 404 {
+                h.create(json!({"url": url, "alias": "apps-ok"})).await;
+            }
+            let (status, body) = h.api(method, path, &h.alice, Some(body)).await;
+            assert_eq!(status, 400, "{app}: {body}");
+            let msg = body["error"]["message"].as_str().unwrap();
+            assert!(msg.starts_with(expected), "{app}: {msg}");
+        }
+    }
+    // Nothing was created or changed.
+    assert_eq!(
+        h.api(Method::GET, "/v1/links/apps-bad", &h.alice, None)
+            .await
+            .0,
+        404
+    );
+    let (_, l) = h
+        .api(Method::GET, "/v1/links/apps-ok", &h.alice, None)
+        .await;
+    assert_eq!(l["app"], json!(null));
+
+    // Stored as written, store URLs normalised; listed with the link; a
+    // patch without `app` keeps it.
+    let (status, l) = h
+        .api(
+            Method::PATCH,
+            "/v1/links/apps-ok",
+            &h.alice,
+            Some(
+                json!({"app": {"android": {"package": "com.example.app", "url": "myapp://x",
+                                            "store_url": "HTTPS://Example.COM/get"}}}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "{l}");
+    let want = json!({"android": {"package": "com.example.app", "url": "myapp://x",
+                                  "store_url": "https://example.com/get"}});
+    assert_eq!(l["app"], want);
+    let (_, l) = h
+        .api(
+            Method::PATCH,
+            "/v1/links/apps-ok",
+            &h.alice,
+            Some(json!({"enabled": true})),
+        )
+        .await;
+    assert_eq!(l["app"], want);
+    let (_, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
+    assert_eq!(list["links"][0]["app"], want);
+    h.shutdown().await;
+}

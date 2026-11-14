@@ -105,6 +105,12 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             Target::Miss => {}
+            // Association files exist only on custom domains, at exactly
+            // their paths.
+            Target::AppFile(f) => {
+                assert!(on.is_some());
+                assert_eq!(relink_core::deeplink::app_file_at(s), Some(f));
+            }
         }
     }
 });

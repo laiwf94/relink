@@ -53,6 +53,7 @@ fn link(code: &str, destinations: usize) -> Link {
         health_check: false,
         unhealthy: vec![false; destinations],
         rules: Default::default(),
+        app: Default::default(),
     }
 }
 

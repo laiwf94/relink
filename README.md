@@ -40,8 +40,12 @@ words. Destinations must be http or https, carry no credentials and point at
 public hosts; they are normalised before storage. On top of that a link can
 have an expiry, a click limit, an A/B split across weighted destinations
 (sticky per visitor through an HMAC-signed cookie), a country allow or deny
-list with a fallback URL, and health checks that take failing destinations out
-of rotation.
+list with a fallback URL, health checks that take failing destinations out
+of rotation, targeting rules, and app targets for phones: iPhones go to the
+App Store page and Android browsers get an `intent:` URL that opens the app or
+its store. A custom domain can name the iOS and Android apps it belongs to and
+then serves their `apple-app-site-association` and `assetlinks.json`, so an
+installed app opens its links directly.
 
 The origin answers `/{code}` from a bounded in-process cache with
 stale-while-revalidate, stale-if-error, negative caching and one coalesced
@@ -217,10 +221,10 @@ $ curl -s localhost:8080/v1/domains/go.example.com -H "Authorization: Bearer $KE
 | Endpoint | Purpose |
 |---|---|
 | `GET /{code}` | Redirect, on the domain named by `Host`. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
-| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`, `rules` (targeting rules; see [docs/DESIGN.md](docs/DESIGN.md#targeting-rules)). |
+| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`, `rules` (targeting rules; see [docs/DESIGN.md](docs/DESIGN.md#targeting-rules)), `app` (app targets; see [docs/DESIGN.md](docs/DESIGN.md#deep-links)). |
 | `GET /v1/links?limit=&cursor=` | Your links, newest first. |
 | `GET /v1/links/{code}?domain=` | One link, with per-destination health; `domain` for a link on a custom domain. |
-| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. `rules` replaces the whole list. |
+| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. `rules` and `app` replace the whole list or object. |
 | `DELETE /v1/links/{code}?domain=` | Delete the link and its statistics. |
 | `GET /v1/links/{code}/stats?from=&to=&domain=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
 | `GET /v1/usage` | The workspace's plan, link and domain counts and clicks this month, with their limits. |
@@ -228,6 +232,7 @@ $ curl -s localhost:8080/v1/domains/go.example.com -H "Authorization: Bearer $KE
 | `GET /v1/domains`, `GET /v1/domains/{hostname}` | The workspace's domains, their verification state and, once verified, their certificate's. |
 | `POST /v1/domains/{hostname}/verify` | Look the TXT record up now; verified, or `check_error` says what was found. |
 | `DELETE /v1/domains/{hostname}` | Delete a domain that has no links left. |
+| `GET /.well-known/apple-app-site-association`, `GET /.well-known/assetlinks.json` | On a custom domain whose settings name `apps`: the iOS universal link and Android app link association files (also `/apple-app-site-association`). |
 | `GET /.well-known/acme-challenge/{token}` | The ACME HTTP-01 answer, on the host being validated, while its certificate is being ordered. |
 | `GET /v1/auth/login?return_to=` | Sign in with the OpenID Connect provider (authorization code with PKCE). Absent unless `RELINK_OIDC_ISSUER` is set. |
 | `GET /v1/auth/callback` | The provider's redirect back; starts a session cookie. |

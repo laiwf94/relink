@@ -310,6 +310,7 @@ mod tests {
             health_check: false,
             unhealthy: vec![false],
             rules: Default::default(),
+            app: Default::default(),
         }
     }
 

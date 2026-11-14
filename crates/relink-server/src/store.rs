@@ -24,6 +24,7 @@ use crate::auth::{Role, Scopes};
 use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
+use relink_core::deeplink::AppLink;
 use relink_core::rules_v2::RuleSet;
 use relink_core::wire::{domain_kv_key, host_kv_key, kv_key};
 
@@ -32,7 +33,7 @@ macro_rules! columns {
     () => {
         "id, code, owner, workspace_id, domain_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-         health_failures, health_checked_at, created_at, updated_at, rules"
+         health_failures, health_checked_at, created_at, updated_at, rules, app"
     };
 }
 pub(crate) use columns;
@@ -179,6 +180,8 @@ pub struct StoredLink {
     pub domain_id: Option<i64>,
     /// That domain's hostname, when the query read it ([`api_columns!`]).
     pub domain: Option<String>,
+    /// The app targets as written; `link.app` is their compiled form.
+    pub app: Option<AppLink>,
     pub health_checked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -213,6 +216,8 @@ pub struct NewLink {
     pub health_check: bool,
     /// Targeting rules, compiled by the API to validate them.
     pub rules: RuleSet,
+    /// App targets for phones, validated by the API.
+    pub app: Option<AppLink>,
     /// The verified custom domain (hostname) to create the link on, or
     /// `None` for the default domain.
     pub domain: Option<String>,
@@ -232,6 +237,8 @@ pub struct LinkPatch {
     pub health_check: Option<bool>,
     /// The whole new rule list; empty removes the rules.
     pub rules: Option<RuleSet>,
+    /// New app targets, or `Some(None)` to remove them.
+    pub app: Option<Option<AppLink>>,
 }
 
 /// An active API key as stored, with its owner's role in its workspace.
@@ -557,6 +564,10 @@ impl Db {
         // Compiled here, once per load: the cached link carries its rules
         // ready to evaluate.
         let Json(rules): Json<RuleSet> = row.try_get("rules")?;
+        // The app targets too: the cached link carries the locations.
+        let app: Option<AppLink> = row
+            .try_get::<Option<Json<AppLink>>, _>("app")?
+            .map(|Json(a)| a);
         let link = Link {
             id: row.try_get("id")?,
             code: row.try_get("code")?,
@@ -571,6 +582,7 @@ impl Db {
             health_check: row.try_get("health_check")?,
             unhealthy,
             rules,
+            app: app.as_ref().map(AppLink::compile).unwrap_or_default(),
         };
         Ok(StoredLink {
             link,
@@ -586,6 +598,7 @@ impl Db {
             } else {
                 None
             },
+            app,
             health_checked_at: row.try_get("health_checked_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,

@@ -496,6 +496,7 @@ and audited as `domain.update` with the settings before and after:
 | `gone_page` | HTML served with 410 for expired links and links at their click limit |
 | `prefixes` | up to 8 lowercase segments accepted in front of a code: `/campaign/abc` is `abc` |
 | `case_insensitive` | `/ABC` is `abc`; codes created on the domain are stored lowercase |
+| `apps` | the iOS (`team_id`, `bundle_id`) and Android (`package`, `sha256_cert_fingerprints`) apps the domain belongs to, served as its association files ("Deep links") |
 
 The decisions are functions in `relink_core::site`, called by the origin
 and the Worker alike. `target(path, settings)` reads the path as sent,
@@ -521,7 +522,8 @@ then retries on collision like any other).
 
 Settings travel with the domain: in the in-memory map every instance
 routes by (reloaded on the same change notification as verification), and
-inside the domain's `host:` record at the edge.
+inside the domain's `host:` record at the edge, except `apps`, which the
+record carries as the rendered association files.
 
 ### Certificates
 
@@ -845,6 +847,84 @@ Parsing and compiling that 64-leaf list takes about 38 µs
 (`rules_v2_parse_and_compile_64_conditions`), which is why it happens once
 per cached link and not per request.
 
+### Deep links
+
+`relink-core/src/deeplink.rs` holds both halves of mobile deep linking, and
+both targets call it.
+
+**Domain association.** A custom domain's `apps` setting names the iOS and
+Android apps it belongs to (up to 8 of each). Team IDs are 10 letters or
+digits, stored uppercase; bundle IDs and package names are checked for
+their platform's syntax; each Android app lists 1 to 8 SHA-256 signing
+fingerprints, accepted with or without colons and stored as uppercase pairs
+joined by colons. A refused list names the part at fault
+(`apps.android[0].sha256_cert_fingerprints[1]: ...`). The domain then
+answers `/.well-known/apple-app-site-association` (and the legacy
+`/apple-app-site-association`) and `/.well-known/assetlinks.json` with
+`application/json`, cached for five minutes (Apple fetches the first
+through its own CDN, Android the second when the app is installed), and
+counts each as `relink_redirects_total{outcome="app_file"}` at the origin. The
+Apple file lists each app under both `appIDs` with `components` (iOS 13
+and later) and `appID` with `paths`, so every iOS version associates every
+path; the domain only serves links, and an app can hand a URL it does not
+handle back to the browser. A domain without apps for a platform answers
+that file with its 404 page, and the default domain has neither. Both are
+`relink_core::site::Target::AppFile`, read from the path before codes and
+prefixes, and `apple-app-site-association` is a reserved word, so no code
+can shadow it. The Worker does not parse the app list: the origin renders
+both files into the domain's `host:` record (`EdgeDomain::publish`, which
+leaves `apps` out of the published settings), and the edge serves them as
+they are.
+
+**App targets on links.** A link's `app` says where phones go instead of
+its destinations: `ios.store_url`, the App Store page, and
+`android.package`, `android.url` (the deep link, such as
+`myapp://item/42` or an https app link) and an optional
+`android.store_url`. Store URLs are validated and normalised like
+destinations. A deep link must be `scheme://...` in at most 1,024
+printable ASCII characters without `#`, with a lowercase scheme other than
+`http` and the ones a browser would act on itself (`javascript`, `data`,
+`file`, `intent` and the like); a refused part is named
+(`app.android.url: ...`). The written form is stored in `links.app`
+(migration 0017, `jsonb`, at most 8 KiB) and returned by the API.
+
+`rules::evaluate` applies them after targeting rules and before the
+destinations: a visitor whose User-Agent is iOS (iPhone or iPad) goes to
+the App Store page, and an Android one to
+
+```text
+intent://item/42#Intent;scheme=myapp;package=com.example.app;S.browser_fallback_url=<store URL, percent-encoded>;end
+```
+
+which opens the app at `myapp://item/42` when it is installed and sends
+the browser to the store URL, by default the package's Play Store page,
+when it is not. A visit that reaches relink on iOS is one the app did not
+take (with the domain's association file, an installed app opens the link
+before the request is sent), so the store is the right answer there.
+Crawlers, desktops and other systems follow the destinations, so link
+previews show the web page. An app redirect keeps the link's status, sets
+no A/B cookie, counts a click (and takes a lease for a limited link), is
+counted as `relink_redirects_total{outcome="app"}`, and, like every answer
+from a link with app targets, is `no-store`.
+
+The redirect path never builds an intent per request. `Link.app` is
+`AppTargets`, the two `Location` values, compiled when the origin loads
+the row; a stored part that fails the API's checks (a row edited by hand)
+compiles to nothing rather than to a bad header. The KV record carries the
+same two strings, as the list `[ios, android]` with `""` for a platform
+that is not set, so the Worker reads a list of strings it already knows
+how to parse. `crates/relink-edge/tests/rules.rs` generates links with app
+targets among its rule lists and checks that origin and edge answer every
+visitor alike; `crates/relink-edge/tests/domains.rs` does the same for the
+association files on random domains.
+
+Fitting this into the Worker took two changes to what it parses. Records
+carry compiled forms only, as above. And `Link.expires_at` is now read with
+chrono's strict RFC 3339 parser instead of its `FromStr`, whose general
+format parser was about 2 KB of the gzipped bundle; every record is
+written by chrono, so the strict parser reads them all. The bundle went
+from 249,224 to 241,476 bytes gzipped.
+
 ## Click limits without a write per click
 
 This is escrow (O'Neil, "The Escrow Transactional Method"). Each instance
@@ -937,7 +1017,7 @@ KV holds three kinds of record (`relink_core::wire`):
 |---|---|---|
 | `link:<code>` | the link | the link exists on the default domain |
 | `link:<host>/<code>` | the link | the link exists on the verified domain `<host>` |
-| `host:<host>` | `{"id": <domain id>, "settings": {...}}` (settings left out while they are the defaults) | `<host>` is a verified domain |
+| `host:<host>` | `{"id": <domain id>, "settings": {...}, "files": [<apple-app-site-association>, <assetlinks.json>]}` (settings left out while they are the defaults, `apps` always; `files` left out without apps) | `<host>` is a verified domain |
 
 Hostnames and codes never contain `/`, so no two records share a key, and
 only canonical keys parse (`KvKey::parse`): lowercase hostnames the
@@ -1227,6 +1307,8 @@ and counts the clicks it could not write.
 | Destinations per link | 10, weights 1 to 1000 |
 | Countries per geo rule | 300 |
 | Targeting rules | 32 rules and 64 leaf conditions per link, nested 8 deep, 300 values per leaf; queries read up to 64 parameters within 2,048 bytes |
+| App targets | deep link 1,024 printable ASCII characters; package name 255; stored object 8 KiB |
+| Domain apps | 8 iOS and 8 Android apps per domain, 8 fingerprints per Android app; bundle ID 155 characters |
 | Alias | 3 to 64 of `[A-Za-z0-9_-]`, alphanumeric at both ends |
 | Generated code | 7 base62 characters by default (4 to 32); collisions retried 5 times |
 | `max_clicks` | 1 to 10¹² |

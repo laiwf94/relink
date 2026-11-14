@@ -91,10 +91,14 @@ pub enum Outcome {
     Root,
     /// Sent where a targeting rule said.
     Rule,
+    /// A phone sent to the link's app target.
+    App,
+    /// A custom domain's app association file.
+    AppFile,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 8] = [
+    const ALL: [Outcome; 10] = [
         Outcome::Redirect,
         Outcome::Fallback,
         Outcome::NotFound,
@@ -103,6 +107,8 @@ impl Outcome {
         Outcome::Unavailable,
         Outcome::Root,
         Outcome::Rule,
+        Outcome::App,
+        Outcome::AppFile,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -114,6 +120,8 @@ impl Outcome {
             Outcome::Unavailable => "unavailable",
             Outcome::Root => "root",
             Outcome::Rule => "rule",
+            Outcome::App => "app",
+            Outcome::AppFile => "app_file",
         }
     }
 }

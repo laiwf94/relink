@@ -19,6 +19,7 @@ pub const MAX_ALIAS_LEN: usize = 64;
 pub const RESERVED: &[&str] = &[
     "admin",
     "api",
+    "apple-app-site-association",
     "assets",
     "docs",
     "favicon",

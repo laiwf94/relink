@@ -30,6 +30,39 @@ fuzz_target!(|data: &[u8]| {
         let (rule, tested) = rules.evaluate_counted(&req);
         assert!(tested <= relink_core::rules_v2::MAX_CONDITIONS);
         assert!(rule.is_none_or(|r| r < rules.urls().len()));
+        // App targets pick one of their own locations, or none.
+        for ua in [
+            &b"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"[..],
+            b"Android 14",
+        ] {
+            if let Some(loc) = link.app.target(Some(ua)) {
+                assert!(
+                    Some(loc) == link.app.ios.as_deref()
+                        || Some(loc) == link.app.android.as_deref()
+                );
+            }
+        }
+    }
+    // Written app targets as stored: an intent is built only from parts the
+    // API accepts, and is always a valid Location.
+    if let Ok(app) = serde_json::from_slice::<relink_core::deeplink::AppLink>(data) {
+        let compiled = app.compile();
+        if let Some(intent) = &compiled.android {
+            assert!(intent.starts_with("intent://") && intent.ends_with(";end"));
+            assert!(intent.bytes().all(|b| b.is_ascii_graphic()), "{intent:?}");
+        }
+        let again: relink_core::deeplink::AppTargets =
+            serde_json::from_str(&serde_json::to_string(&compiled).unwrap()).unwrap();
+        assert_eq!(again, compiled);
+    }
+    // A domain's apps: whatever validation accepts renders to valid JSON.
+    if let Ok(apps) = serde_json::from_slice::<relink_core::deeplink::Apps>(data)
+        && let Ok(apps) = apps.validated("apps")
+    {
+        let files = relink_core::deeplink::AppFiles::render(&apps);
+        for body in [files.apple, files.android].into_iter().flatten() {
+            serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        }
     }
     if let Ok(batch) = serde_json::from_slice::<ClickBatch>(data) {
         for c in &batch.clicks {

@@ -5,10 +5,11 @@
 //!
 //! The order is fixed: a disabled link is not found, then expiry, then the
 //! country rule, then the link's targeting rules ([`crate::rules_v2`],
-//! compiled when the link was read), and only when no rule matches its own
+//! compiled when the link was read), then its app targets for phones
+//! ([`crate::deeplink`]), and only when none of those applies its own
 //! destinations, A/B split, health and fallback. A redirect from a link
-//! with any rules is never cacheable, whichever way it went: a cache in
-//! between would hand one visitor's answer to the next.
+//! with any rules or app targets is never cacheable, whichever way it went:
+//! a cache in between would hand one visitor's answer to the next.
 //!
 //! Max clicks are the one rule this cannot decide alone, because it needs a
 //! shared counter. [`Redirect::needs_admission`] tells the caller to take a
@@ -92,6 +93,8 @@ pub struct Redirect<'a> {
     pub needs_admission: bool,
     /// The targeting rule that chose `location`, by index.
     pub rule: Option<usize>,
+    /// `location` is the link's app target for the visitor's phone.
+    pub app: bool,
 }
 
 pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) -> Decision<'a> {
@@ -126,6 +129,19 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
             fallback: false,
             needs_admission: link.max_clicks.is_some(),
             rule: Some(i),
+            app: false,
+        });
+    }
+    if let Some(location) = link.app.target(visit.user_agent) {
+        return Decision::Redirect(Redirect {
+            status,
+            location,
+            set_cookie: None,
+            cacheable: false,
+            fallback: false,
+            needs_admission: link.max_clicks.is_some(),
+            rule: None,
+            app: true,
         });
     }
 
@@ -165,6 +181,7 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
 
     let cacheable = link.geo.is_none()
         && link.rules.is_empty()
+        && link.app.is_empty()
         && link.destinations.len() == 1
         && link.max_clicks.is_none()
         && link.expires_at.is_none()
@@ -177,6 +194,7 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
         fallback,
         needs_admission: link.max_clicks.is_some(),
         rule: None,
+        app: false,
     })
 }
 
@@ -223,6 +241,7 @@ mod tests {
             health_check: false,
             unhealthy: vec![false; urls.len()],
             rules: RuleSet::default(),
+            app: Default::default(),
         }
     }
 
@@ -469,5 +488,53 @@ mod tests {
             ..visit(&[])
         };
         assert!(redirect(evaluate(&l, &early, &SETTINGS)).fallback);
+    }
+
+    #[test]
+    fn app_targets_send_phones_after_rules_and_before_destinations() {
+        const IPHONE: &[u8] = b"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)";
+        const PIXEL: &[u8] = b"Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120.0 Mobile";
+        let mut l = with_rules(
+            link(&["https://a.example.com/", "https://b.example.com/"]),
+            r#"[{"if": {"country": ["DE"]}, "url": "https://de.example.com/"}]"#,
+        );
+        l.app = serde_json::from_str::<crate::deeplink::AppLink>(
+            r#"{"ios": {"store_url": "https://apps.apple.com/app/id1"},
+                "android": {"package": "com.example.app", "url": "myapp://x"}}"#,
+        )
+        .unwrap()
+        .compile();
+        l.max_clicks = Some(9);
+        l.health_check = true;
+        l.unhealthy = vec![true, true];
+        l.fallback_url = Some("https://fallback.example.com/".into());
+        let phone = |ua: &'static [u8]| Visit {
+            user_agent: Some(ua),
+            ..visit(&[])
+        };
+        let r = redirect(evaluate(&l, &phone(IPHONE), &SETTINGS));
+        assert_eq!(r.location, "https://apps.apple.com/app/id1");
+        assert!(r.app && !r.cacheable && !r.fallback && r.needs_admission);
+        assert!(r.set_cookie.is_none() && r.rule.is_none());
+        let r = redirect(evaluate(&l, &phone(PIXEL), &SETTINGS));
+        assert!(r.location.starts_with("intent://x#Intent;scheme=myapp;"));
+        assert!(r.app);
+
+        // A matching rule wins over the app target.
+        let de = Visit {
+            country: Some(*b"DE"),
+            ..phone(IPHONE)
+        };
+        let r = redirect(evaluate(&l, &de, &SETTINGS));
+        assert_eq!((r.rule, r.app), (Some(0), false));
+
+        // Desktops follow the destinations, and nothing caches the answer.
+        let mut single = link(&["https://a.example.com/"]);
+        single.app = l.app.clone();
+        let r = redirect(evaluate(&single, &visit(&[]), &SETTINGS));
+        assert_eq!(r.location, "https://a.example.com/");
+        assert!(!r.app && !r.cacheable);
+        single.app = Default::default();
+        assert!(redirect(evaluate(&single, &visit(&[]), &SETTINGS)).cacheable);
     }
 }

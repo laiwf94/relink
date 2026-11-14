@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::Instrument;
 
+use relink_core::deeplink::{self, AppLink};
 use relink_core::rules_v2::{self, Rule, RuleSet};
 use relink_core::wire::{ClickBatch, MAX_BATCH, WireClick};
 use sha2::{Digest, Sha256};
@@ -470,6 +471,8 @@ pub struct CreateLink {
     pub health_check: Option<bool>,
     /// Targeting rules ([`rules_v2`]); absent or empty for none.
     pub rules: Option<Vec<Rule>>,
+    /// Where phones go instead of the destinations ([`deeplink`]).
+    pub app: Option<AppInput>,
     /// A verified custom domain of the workspace to create the link on;
     /// absent or null for the default domain.
     pub domain: Option<String>,
@@ -501,6 +504,31 @@ pub struct PatchLink {
     /// Replaces the whole rule list; `null` or `[]` removes the rules.
     #[serde(default, deserialize_with = "nullable")]
     pub rules: Option<Option<Vec<Rule>>>,
+    /// Replaces the app targets; `null` or `{}` removes them.
+    #[serde(default, deserialize_with = "nullable")]
+    pub app: Option<Option<AppInput>>,
+}
+
+/// A link's app targets as the API takes them ([`deeplink::AppLink`]).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppInput {
+    pub ios: Option<IosInput>,
+    pub android: Option<AndroidInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IosInput {
+    pub store_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidInput {
+    pub package: String,
+    pub url: String,
+    pub store_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -535,6 +563,8 @@ pub struct LinkView {
     pub health_checked_at: Option<DateTime<Utc>>,
     /// Targeting rules in order, `[]` for none.
     pub rules: Vec<Rule>,
+    /// App targets for phones; `null` for none.
+    pub app: Option<AppLink>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -576,6 +606,7 @@ impl LinkView {
             health_check: link.health_check,
             health_checked_at: link.health_checked_at,
             rules: link.rules.rules().to_vec(),
+            app: link.app.clone(),
             created_at: link.created_at,
             updated_at: link.updated_at,
         }
@@ -752,6 +783,26 @@ fn validate_rules(app: &App, mut rules: Vec<Rule>) -> Result<RuleSet, ApiError> 
     RuleSet::new(rules).map_err(invalid)
 }
 
+/// Validates app targets: `None` when neither platform is set. Errors name
+/// the part at fault, `app.android.package: ...`.
+fn validate_app(app: &App, input: AppInput) -> Result<Option<AppLink>, ApiError> {
+    let policy = app.cfg.destination_policy;
+    let invalid = |e: deeplink::AppError| ApiError::invalid(e.to_string());
+    let link = AppLink {
+        ios: input
+            .ios
+            .map(|t| deeplink::ios_target(&t.store_url, policy))
+            .transpose()
+            .map_err(invalid)?,
+        android: input
+            .android
+            .map(|t| deeplink::android_target(&t.package, &t.url, t.store_url.as_deref(), policy))
+            .transpose()
+            .map_err(invalid)?,
+    };
+    Ok((!link.is_empty()).then_some(link))
+}
+
 fn validate_fallback(app: &App, url: String) -> Result<String, ApiError> {
     normalize(&url, app.cfg.destination_policy)
         .map_err(|e| ApiError::invalid(format!("fallback_url: {e}")))
@@ -786,6 +837,11 @@ pub async fn create_link(
             .map(|r| validate_rules(&app, r))
             .transpose()?
             .unwrap_or_default(),
+        app: req
+            .app
+            .map(|a| validate_app(&app, a))
+            .transpose()?
+            .flatten(),
         domain: domain_param(req.domain),
     };
     let link = ws
@@ -897,6 +953,14 @@ pub async fn update_link(
             .rules
             .map(|r| validate_rules(&app, r.unwrap_or_default()))
             .transpose()?,
+        app: req
+            .app
+            .map(|a| {
+                a.map(|a| validate_app(&app, a))
+                    .transpose()
+                    .map(Option::flatten)
+            })
+            .transpose()?,
     };
     let empty = patch.destinations.is_none()
         && patch.redirect_status.is_none()
@@ -906,7 +970,8 @@ pub async fn update_link(
         && patch.fallback_url.is_none()
         && patch.enabled.is_none()
         && patch.health_check.is_none()
-        && patch.rules.is_none();
+        && patch.rules.is_none()
+        && patch.app.is_none();
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }

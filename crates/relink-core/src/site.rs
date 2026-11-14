@@ -14,6 +14,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::code::{is_plausible_code, is_reserved};
+use crate::deeplink::{AppError, AppFile, Apps, app_file_at};
 use crate::destination::{Policy, UrlError, normalize};
 
 /// Most path prefixes a domain may accept.
@@ -58,6 +59,14 @@ pub struct DomainSettings {
     /// are stored in lowercase.
     #[serde(skip_serializing_if = "is_false")]
     pub case_insensitive: bool,
+    /// The iOS and Android apps the domain belongs to, published in its
+    /// association files ([`crate::deeplink`]). The Worker never reads
+    /// them: the origin renders the files into the domain's `host:` record
+    /// ([`crate::wire::EdgeDomain::files`]), so on wasm32 the field is not
+    /// parsed and its parser stays out of the bundle.
+    #[serde(skip_serializing_if = "Apps::is_empty")]
+    #[cfg_attr(target_arch = "wasm32", serde(skip_deserializing))]
+    pub apps: Apps,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -70,6 +79,7 @@ pub enum SettingsError {
     RootUrl(UrlError),
     Page { field: &'static str, reason: String },
     Prefix(String),
+    Apps(AppError),
 }
 
 impl fmt::Display for SettingsError {
@@ -78,6 +88,7 @@ impl fmt::Display for SettingsError {
             SettingsError::RootUrl(e) => write!(f, "root_url: {e}"),
             SettingsError::Page { field, reason } => write!(f, "{field}: {reason}"),
             SettingsError::Prefix(reason) => write!(f, "prefixes: {reason}"),
+            SettingsError::Apps(e) => write!(f, "{e}"),
         }
     }
 }
@@ -148,6 +159,7 @@ impl DomainSettings {
             )));
         }
         self.prefixes = prefixes;
+        self.apps = self.apps.validated("apps").map_err(SettingsError::Apps)?;
         Ok(self)
     }
 
@@ -167,6 +179,9 @@ pub enum Target<'a> {
     /// Nothing this domain could serve: answered with its 404 page and no
     /// lookup.
     Miss,
+    /// One of the domain's app association files
+    /// ([`crate::deeplink::app_file`]), answered from its settings.
+    AppFile(AppFile),
 }
 
 /// Reads `path` (without the leading `/`, still percent-encoded) on a
@@ -175,6 +190,11 @@ pub enum Target<'a> {
 pub fn target<'a>(path: &'a str, settings: Option<&DomainSettings>) -> Target<'a> {
     if path.is_empty() {
         return Target::Root;
+    }
+    if settings.is_some()
+        && let Some(file) = app_file_at(path)
+    {
+        return Target::AppFile(file);
     }
     let code = match (path.split_once('/'), settings) {
         (None, _) => path,
@@ -325,6 +345,7 @@ mod tests {
             gone_page: Some("<p>gone</p>".into()),
             prefixes: vec!["campaign".into()],
             case_insensitive: true,
+            apps: Apps::default(),
         }
     }
 
@@ -380,6 +401,25 @@ mod tests {
             ..DomainSettings::default()
         };
         assert!(err(many).contains("at most 8"));
+
+        // Apps are validated with their path and kept in canonical form.
+        let with_apps = |json: &str| DomainSettings {
+            apps: serde_json::from_str(json).unwrap(),
+            ..DomainSettings::default()
+        };
+        let s =
+            with_apps(r#"{"ios": [{"team_id": "abcde12345", "bundle_id": "com.example.app"}]}"#)
+                .validated(POLICY)
+                .unwrap();
+        assert_eq!(s.apps.ios[0].team_id, "ABCDE12345");
+        assert!(!s.is_default());
+        let e = err(with_apps(
+            r#"{"ios": [{"team_id": "x", "bundle_id": "com.example.app"}]}"#,
+        ));
+        assert!(e.starts_with("apps.ios[0].team_id: "), "{e}");
+        // Settings without apps leave them out of the wire form.
+        let json = serde_json::to_string(&DomainSettings::default()).unwrap();
+        assert_eq!(json, "{}");
     }
 
     #[test]
@@ -427,6 +467,28 @@ mod tests {
             ("ab", Some(&s), Target::Miss),
             ("a%62c", Some(&s), Target::Miss),
             ("abc.php", None, Target::Miss),
+            // Association files exist only on custom domains.
+            (
+                ".well-known/apple-app-site-association",
+                Some(&plain),
+                Target::AppFile(AppFile::Apple),
+            ),
+            (
+                "apple-app-site-association",
+                Some(&s),
+                Target::AppFile(AppFile::Apple),
+            ),
+            (
+                ".well-known/assetlinks.json",
+                Some(&s),
+                Target::AppFile(AppFile::Android),
+            ),
+            (".well-known/assetlinks.json", None, Target::Miss),
+            (
+                "apple-app-site-association",
+                None,
+                code("apple-app-site-association"),
+            ),
         ] {
             assert_eq!(target(path, on), want, "{path:?}");
         }

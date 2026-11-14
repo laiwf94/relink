@@ -499,7 +499,7 @@ impl KvSync {
                     self.metrics.edge_hostnames_added.inc();
                     tracing::info!(%host, "registered custom hostname");
                 }
-                let json = serde_json::to_string(&EdgeDomain { id, settings })
+                let json = serde_json::to_string(&EdgeDomain::publish(id, settings))
                     .map_err(|e| KvError(format!("encoding {key}: {e}")))?;
                 self.write(key, Some(json)).await
             }
