@@ -871,6 +871,21 @@ benchmark machine a one-leaf list takes about 26 ns and the worst case, 64
 leaves all tested and every fact read, about 0.8 µs
 (`cargo bench --bench hot_path -- rules_v2`).
 
+`crates/relink-core/tests/rules.rs` checks the compiler against a naive
+interpreter that walks the written tree recursively, computes every fact
+up front, reads the time of day through chrono and decodes query strings
+into new buffers. Each run generates 1,000 rule lists (about a fifth of them at
+exactly 64 leaves, the bound) and 100 requests for each, 100,000 in all,
+from small vocabularies so that rules often match, with random headers
+mixed in and query strings that land around the parameter and byte limits.
+For every request the compiled list, in all three forms it is loaded (by
+the API, by the origin from a row, by the edge from the published decision
+list), must pick the same rule and test the same number of leaves as the
+tree walk: the decision list is short-circuit evaluation of the tree, so it
+must stop exactly where the walk stops. Moving the query byte limit by one,
+dropping the dot check from referrer subdomains or misreading a clock time
+each makes it fail within seconds.
+
 Links carry their rules as `rules` in the API (`POST /v1/links`,
 `PATCH /v1/links/{code}`, where a list replaces the old one and `null` or
 `[]` removes it). The server compiles every list it is given under the
