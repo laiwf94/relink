@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 
 use crate::metrics::Outcome;
 use crate::model::Link;
-use crate::redirect::{Located, locate, stopped, visit_settings};
+use crate::redirect::{Located, Routed, locate, stopped, visit_settings};
 use crate::rules::{Decision, evaluate};
 use crate::server::App;
 use crate::util::now_ms;
@@ -192,14 +192,14 @@ async fn answer(
     body: Body,
 ) -> (Response, Outcome) {
     let found: Located<'_> = match locate(app, path, headers, peer).await {
-        Ok(f) if f.preview => {
+        Routed::Link(f) if f.preview => {
             return (
                 plain(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
                 Outcome::NotFound,
             );
         }
-        Ok(f) => f,
-        Err(answer) => return answer,
+        Routed::Link(f) => f,
+        Routed::Answered(response, outcome) => return (response, outcome),
     };
     let link = &found.link;
     let cookies: Vec<&[u8]> = headers

@@ -191,50 +191,104 @@ impl Located<'_> {
     }
 }
 
+/// Where [`locate`] took a request.
+pub enum Routed<'h> {
+    /// To a link.
+    Link(Located<'h>),
+    /// Answered already: the domain's root, an association file, an
+    /// unknown code, or the database unavailable.
+    Answered(Response, Outcome),
+}
+
 /// Routes `path` (without the leading `/`, as sent) to a link: by `Host`
 /// to a custom domain, then the code. Anything else (the domain's root,
 /// an association file, an unknown code) is answered here.
-pub async fn locate<'h>(
+pub async fn locate<'h>(app: &App, path: &str, headers: &'h HeaderMap, peer: IpAddr) -> Routed<'h> {
+    match route_link(app, path, headers, peer).await {
+        Ok(found) => Routed::Link(found),
+        Err(answer) => {
+            let (response, outcome) = *answer;
+            Routed::Answered(response, outcome)
+        }
+    }
+}
+
+/// [`locate`], with `?` for the early answers.
+async fn route_link<'h>(
     app: &App,
     path: &str,
     headers: &'h HeaderMap,
     peer: IpAddr,
-) -> Result<Located<'h>, (Response, Outcome)> {
+) -> Result<Located<'h>, Box<(Response, Outcome)>> {
     let host_header = request_host(app, headers, peer);
     let site = match app.domains.route(host_header, &app.cfg.default_host) {
         Route::Default => None,
         Route::Domain(site) => Some(site),
-        Route::Unavailable => return Err((unavailable(), Outcome::Unavailable)),
+        Route::Unavailable => return Err(Box::new((unavailable(), Outcome::Unavailable))),
     };
     let pages = site.as_ref().map(|s| (host_header, &s.settings));
     let (code, preview) = match (target(path, site.as_ref().map(|s| &s.settings)), &site) {
         (Target::Code(code), _) => (code, false),
         (Target::Preview(code), _) => (code, true),
         (Target::Root, Some(s)) => match &s.settings.root_url {
-            Some(url) => return Err((location(302, url, None, None), Outcome::Root)),
-            None => return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT)),
+            Some(url) => return Err(Box::new((location(302, url, None, None), Outcome::Root))),
+            None => {
+                return Err(Box::new(error_page(
+                    PageKind::NotFound,
+                    pages,
+                    path,
+                    EXPIRED_TEXT,
+                )));
+            }
         },
         (Target::Miss, Some(_)) => {
-            return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT));
+            return Err(Box::new(error_page(
+                PageKind::NotFound,
+                pages,
+                path,
+                EXPIRED_TEXT,
+            )));
         }
         (Target::AppFile(file), Some(s)) => match app_file(file, &s.settings.apps) {
-            Some(body) => return Err((json_file(body), Outcome::AppFile)),
-            None => return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT)),
+            Some(body) => return Err(Box::new((json_file(body), Outcome::AppFile))),
+            None => {
+                return Err(Box::new(error_page(
+                    PageKind::NotFound,
+                    pages,
+                    path,
+                    EXPIRED_TEXT,
+                )));
+            }
         },
         // The default domain: `/` and paths with a `/` were never
         // redirects, and are answered as unknown paths, as before.
         (_, None) if path.is_empty() || path.contains('/') => {
-            return Err((ApiError::not_found().into_response(), Outcome::NotFound));
+            return Err(Box::new((
+                ApiError::not_found().into_response(),
+                Outcome::NotFound,
+            )));
         }
-        (_, None) => return Err(error_page(PageKind::NotFound, None, path, EXPIRED_TEXT)),
+        (_, None) => {
+            return Err(Box::new(error_page(
+                PageKind::NotFound,
+                None,
+                path,
+                EXPIRED_TEXT,
+            )));
+        }
     };
     let key = site.as_ref().map(|s| link_key(Some(s.id), &code));
     let link = match app.resolver.resolve(key.as_deref().unwrap_or(&code)).await {
         Resolved::Found(link) => link,
         Resolved::NotFound => {
-            return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT));
+            return Err(Box::new(error_page(
+                PageKind::NotFound,
+                pages,
+                path,
+                EXPIRED_TEXT,
+            )));
         }
-        Resolved::Unavailable => return Err((unavailable(), Outcome::Unavailable)),
+        Resolved::Unavailable => return Err(Box::new((unavailable(), Outcome::Unavailable))),
     };
     Ok(Located {
         host: host_header,
@@ -306,8 +360,8 @@ pub async fn handle(
     peer: IpAddr,
 ) -> (Response, Outcome) {
     let found = match locate(app, path, headers, peer).await {
-        Ok(found) => found,
-        Err(answer) => return answer,
+        Routed::Link(found) => found,
+        Routed::Answered(response, outcome) => return (response, outcome),
     };
     let link = &found.link;
     let pages = found.pages();
