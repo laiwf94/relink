@@ -20,6 +20,12 @@
 //! link they name. Its 404 and 410 pages are served here, and a link found
 //! by the one-read path reads the record only when it needs a page. The
 //! decisions are the same functions the origin calls.
+//!
+//! Protected links (`relink_core::gate`) are never published to KV, and
+//! one found there anyway goes to the origin, which alone holds the
+//! password hash. The form their interstitial posts goes to the origin
+//! unread. `/{code}+` previews a link from KV like a redirect would
+//! answer it, without a click.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -29,6 +35,7 @@ use std::rc::Rc;
 use relink_core::classify::{UNKNOWN_COUNTRY, device_class, referrer_host};
 use relink_core::code::is_plausible_code;
 use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file_at};
+use relink_core::gate::{GATE_CSP, preview};
 use relink_core::hex;
 use relink_core::host::{custom_host, host_part};
 use relink_core::model::Link;
@@ -74,6 +81,9 @@ pub struct EdgeRequest {
     pub accept_language: Option<Vec<u8>>,
     /// The query string without the `?`, as sent.
     pub query: Option<String>,
+    /// The body of a form posted to a protected link's interstitial
+    /// (`application/x-www-form-urlencoded`); `None` for a GET.
+    pub form: Option<String>,
     pub now_ms: i64,
     pub random: u64,
 }
@@ -161,6 +171,10 @@ pub async fn handle<K: Kv, O: Origin>(
     default_host: &str,
     req: &EdgeRequest,
 ) -> Outcome {
+    // A password or consent: only the origin can check it.
+    if req.form.is_some() {
+        return from_origin(origin, req).await;
+    }
     let Some(host) = custom_host(req.host.as_deref(), default_host) else {
         return default_domain(kv, origin, settings, req).await;
     };
@@ -208,6 +222,13 @@ pub async fn handle<K: Kv, O: Origin>(
             }
             Read::Missing | Read::Failed => from_origin(origin, req).await,
         },
+        Target::Preview(code) => match read(kv, &domain_kv_key(&host, &code)).await {
+            Read::Found(link) => {
+                let pages = Pages::Known(&host, site);
+                serve_preview(kv, origin, settings, req, &link, pages).await
+            }
+            Read::Missing | Read::Failed => from_origin(origin, req).await,
+        },
     }
 }
 
@@ -218,6 +239,16 @@ async fn default_domain<K: Kv, O: Origin>(
     settings: &Settings<'_>,
     req: &EdgeRequest,
 ) -> Outcome {
+    if let Some(code) = req.code.strip_suffix('+')
+        && is_plausible_code(code)
+    {
+        return match read(kv, &kv_key(code)).await {
+            Read::Found(link) => {
+                serve_preview(kv, origin, settings, req, &link, Pages::Default).await
+            }
+            Read::Missing | Read::Failed => from_origin(origin, req).await,
+        };
+    }
     if !is_plausible_code(&req.code) {
         return edge(EdgeResponse::text(404, NOT_FOUND_TEXT), None);
     }
@@ -256,13 +287,19 @@ async fn serve<K: Kv, O: Origin>(
     link: &Link,
     pages: Pages<'_>,
 ) -> Outcome {
-    if link.max_clicks.is_some() {
+    if link.max_clicks.is_some() || link.is_protected() {
         return from_origin(origin, req).await;
     }
     let cookies: Vec<&[u8]> = req.cookies.iter().map(Vec::as_slice).collect();
-    // Targeting rules were compiled when the record was parsed; they read
-    // the same facts the origin reads.
-    let visit = Visit {
+    let visit = visit(req, &cookies);
+    let decision = evaluate(link, &visit, settings);
+    stopped(kv, origin, req, link, pages, decision).await
+}
+
+/// The facts the decisions read: targeting rules were compiled when the
+/// record was parsed, and read the same facts the origin reads.
+fn visit<'a>(req: &'a EdgeRequest, cookies: &'a [&'a [u8]]) -> Visit<'a> {
+    Visit {
         now_ms: req.now_ms,
         country: req.country,
         region: req.region.as_deref(),
@@ -270,10 +307,57 @@ async fn serve<K: Kv, O: Origin>(
         accept_language: req.accept_language.as_deref(),
         referer: req.referer.as_deref(),
         query: req.query.as_deref().map(str::as_bytes),
-        cookies: &cookies,
+        cookies,
         random: req.random,
-    };
-    let kind = match evaluate(link, &visit, settings) {
+    }
+}
+
+/// `/{code}+` for a link found in KV: its preview, or the page the link
+/// itself would answer with.
+async fn serve_preview<K: Kv, O: Origin>(
+    kv: &K,
+    origin: &O,
+    settings: &Settings<'_>,
+    req: &EdgeRequest,
+    link: &Link,
+    pages: Pages<'_>,
+) -> Outcome {
+    if link.is_protected() {
+        return from_origin(origin, req).await;
+    }
+    let cookies: Vec<&[u8]> = req.cookies.iter().map(Vec::as_slice).collect();
+    let path = req.code.strip_suffix('+').unwrap_or(&req.code);
+    match preview(link, path, &visit(req, &cookies), settings) {
+        Ok(html) => edge(gate_response(200, html), None),
+        Err(decision) => stopped(kv, origin, req, link, pages, decision).await,
+    }
+}
+
+/// An interstitial or preview page.
+pub fn gate_response(status: u16, html: String) -> EdgeResponse {
+    EdgeResponse {
+        status,
+        headers: vec![
+            ("content-type".into(), HTML.into()),
+            ("cache-control".into(), "no-store".into()),
+            ("content-security-policy".into(), GATE_CSP.into()),
+            ("x-content-type-options".into(), "nosniff".into()),
+            ("referrer-policy".into(), "no-referrer".into()),
+        ],
+        body: html,
+    }
+}
+
+/// Answers `decision` for a link found in KV.
+async fn stopped<K: Kv, O: Origin>(
+    kv: &K,
+    origin: &O,
+    req: &EdgeRequest,
+    link: &Link,
+    pages: Pages<'_>,
+    decision: Decision<'_>,
+) -> Outcome {
+    let kind = match decision {
         Decision::NotFound => PageKind::NotFound,
         Decision::Expired => PageKind::Gone,
         Decision::GeoBlocked {
@@ -675,6 +759,7 @@ mod tests {
             unhealthy: vec![false],
             rules: Default::default(),
             app: Default::default(),
+            protection: Default::default(),
         }
     }
 
@@ -1447,5 +1532,140 @@ mod tests {
         let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req("promo")));
         assert_eq!(out.served, Served::Origin);
         assert_eq!(origin.calls.get(), 1);
+    }
+
+    #[test]
+    fn previews_are_served_from_kv_without_a_click() {
+        let mut split = link("promo");
+        split.destinations.push(Destination {
+            url: "https://example.com/b".into(),
+            weight: 1,
+        });
+        let kv = MemoryKv::with(&split);
+        let mut off = link("off");
+        off.enabled = false;
+        put(&kv, kv_key("off"), &off);
+        let mut gone = link("gone");
+        gone.expires_at = Some(chrono::DateTime::from_timestamp(1, 0).unwrap());
+        put(&kv, kv_key("gone"), &gone);
+        let mut limited = link("limited");
+        limited.max_clicks = Some(5);
+        put(&kv, kv_key("limited"), &limited);
+        let origin = FakeOrigin::default();
+        let get = |code: &str| run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req(code)));
+
+        let out = get("promo+");
+        assert_eq!((out.response.status, out.served), (200, Served::Edge));
+        assert!(out.click.is_none());
+        assert_eq!(out.response.header("content-type"), Some(HTML));
+        assert_eq!(out.response.header("cache-control"), Some("no-store"));
+        assert_eq!(
+            out.response.header("content-security-policy"),
+            Some(GATE_CSP)
+        );
+        assert!(out.response.body.contains("https://example.com/"));
+        assert!(out.response.body.contains("2 destinations"));
+        assert!(out.response.body.contains("href=\"/promo\""));
+        // No A/B cookie for a preview.
+        assert!(out.response.header("set-cookie").is_none());
+        // A click-limited link previews at the edge too: nothing is taken.
+        let out = get("limited+");
+        assert_eq!((out.response.status, out.served), (200, Served::Edge));
+        // A disabled or expired link answers as it would anyway.
+        assert_eq!(get("off+").response.status, 404);
+        assert_eq!(get("gone+").response.status, 410);
+        assert_eq!(origin.calls.get(), 0);
+        // Not in KV (yet): the origin answers.
+        assert_eq!(get("other+").served, Served::Origin);
+        // Not a code: the built-in 404, no lookup.
+        assert_eq!(get("a+").response.status, 404);
+        assert_eq!(get("promo++").response.status, 404);
+        assert_eq!(origin.calls.get(), 1);
+    }
+
+    #[test]
+    fn custom_domains_preview_behind_their_prefixes() {
+        let kv = MemoryKv::default();
+        with_site(&kv, HOST, site());
+        put(&kv, domain_kv_key(HOST, "summer"), &link("summer"));
+        let origin = FakeOrigin::default();
+        for path in ["summer+", "SUMMER+", "campaign/Summer+"] {
+            let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &on(HOST, path)));
+            assert_eq!(
+                (out.response.status, out.served),
+                (200, Served::Edge),
+                "{path}"
+            );
+            let own = path.strip_suffix('+').unwrap();
+            assert!(
+                out.response.body.contains(&format!("href=\"/{own}\"")),
+                "{path}"
+            );
+        }
+        let out = run(handle(
+            &kv,
+            &origin,
+            &SETTINGS,
+            DEFAULT,
+            &on(HOST, "other/summer+"),
+        ));
+        assert_eq!((out.response.status, out.served), (404, Served::Edge));
+        assert!(out.response.body.contains("not on go.example.com"));
+        let out = run(handle(
+            &kv,
+            &origin,
+            &SETTINGS,
+            DEFAULT,
+            &on(HOST, "winter+"),
+        ));
+        assert_eq!(out.served, Served::Origin);
+    }
+
+    #[test]
+    fn protected_links_and_their_forms_go_to_the_origin() {
+        let mut locked = link("locked");
+        locked.protection.password = true;
+        locked.protection.max_attempts = Some(3);
+        let kv = MemoryKv::with(&locked);
+        let mut asks = link("asks");
+        asks.protection.consent = Some("Over 18?".into());
+        put(&kv, kv_key("asks"), &asks);
+        put(&kv, domain_kv_key(HOST, "asks"), &asks);
+        mark_domain(&kv, HOST);
+        let origin = FakeOrigin::default();
+        // Never published by the server, but an edge that finds one in KV
+        // still never redirects past it, nor previews it.
+        for (r, n) in [
+            (req("locked"), 1),
+            (req("asks"), 2),
+            (req("locked+"), 3),
+            (on(HOST, "asks"), 4),
+            (on(HOST, "asks+"), 5),
+        ] {
+            let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &r));
+            assert_eq!(out.served, Served::Origin, "{}", r.code);
+            assert!(out.click.is_none());
+            assert_eq!(origin.calls.get(), n);
+        }
+        // A form goes to the origin without a KV read, whatever the path.
+        kv.fail.set(true);
+        for r in [req("promo"), on(HOST, "campaign/x"), req("")] {
+            let form = EdgeRequest {
+                form: Some("password=hunter22".into()),
+                ..r
+            };
+            let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &form));
+            assert_eq!(out.served, Served::Origin);
+        }
+        assert_eq!(origin.calls.get(), 8);
+    }
+
+    #[test]
+    fn gate_pages_carry_their_headers() {
+        let r = gate_response(401, "<p>x</p>".into());
+        assert_eq!(r.status, 401);
+        assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+        assert_eq!(r.body, "<p>x</p>");
     }
 }

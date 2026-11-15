@@ -12,7 +12,8 @@
 //! encrypted at rest;
 //! [`oidc`] signs people in and [`session`] keeps them signed in; [`trust`]
 //! decides which forwarding headers to believe; [`schedule`] keeps each
-//! link's version history and applies scheduled changes; [`health`] probes
+//! link's version history and applies scheduled changes; [`protect`] puts
+//! a password or consent page in front of a link; [`health`] probes
 //! destinations; [`kvsync`] publishes links for the edge; [`store`] is
 //! Postgres and [`server`] wires it together; [`cli`] parses the key
 //! commands. The rules shared with the edge come from `relink_core` and are
@@ -36,6 +37,7 @@ pub mod kvsync;
 pub mod limiter;
 pub mod metrics;
 pub mod oidc;
+pub mod protect;
 pub mod quota;
 pub mod ratelimit;
 pub mod redirect;

@@ -1006,6 +1006,108 @@ format parser was about 2 KB of the gzipped bundle; every record is
 written by chrono, so the strict parser reads them all. The bundle went
 from 249,224 to 241,476 bytes gzipped.
 
+### Protected links
+
+A link can ask for a password, for consent, or both, before it redirects
+(`protection` in the API; `relink-core/src/gate.rs` has the pages and the
+cookie, `relink-server/src/protect.rs` the rest). Disabled, expired and
+geo-blocked links answer as they would without it: the page only comes in
+front of a redirect. Until the visitor holds a grant, `GET /{code}`
+answers 200 with an interstitial: a password field, the link's consent
+text, or both, and one button. The form has no `action`, so it posts to
+the page's own URL with its query string and any path prefix. When the
+origin accepts it, it answers 303 back to that same URL with a grant
+cookie, and the visitor's browser asks again and is redirected as usual:
+rules, app targets, A/B assignment, click limits and click counting all
+happen in the one place they always do. Nothing about the destination is
+in the page, and a protected link's answers are never cacheable.
+
+**Passwords.** They are 4 to 256 bytes without control characters, and
+stored only as an argon2id hash in PHC form (`links.password_hash`,
+migration 0019): 19 MiB of memory, two passes, one lane, a 16-byte random
+salt, the OWASP baseline. argon2 is the one dependency added for this,
+because a password hash for a secret people choose must be memory-hard; a
+fast hash such as SHA-256 would let anyone who reads the table try
+billions of guesses a second. Hashing runs on tokio's blocking pool, at
+most two at once, so it can take at most 38 MiB however many requests
+arrive, and never stalls the async workers. Verification uses the
+parameters stored in the hash, so raising them later keeps old passwords
+working. The hash never leaves the server: `Link.protection` serialises
+`password: true` without it, which is all the API, the audit log and the
+version history see. Protection is not part of a link's versions at all,
+so a rollback leaves it as it is and no snapshot keeps an old hash.
+
+**Attempt limits.** Every password check first takes one of the link's
+attempts for the hour (`max_attempts`, 1 to 1,000, 10 by default) from
+`link_password_attempts`, through `relink_password_attempt`, which locks
+the link's row for the decision, so instances racing for the last attempt
+cannot both win. A right password gives its attempt back
+(`relink_password_refund`), so the limit counts wrong ones, and since the
+attempt is taken before hashing, an attacker can make the origin compute at
+most `max_attempts` hashes per link per hour. With the attempts used up, a
+form answers 429 with `Retry-After` until the hour from the first attempt
+is over, without hashing, and the page says how long to wait. The limit
+is per link, not per visitor: a guesser can lock a link's legitimate
+visitors out for an hour, but cannot get around it by changing address,
+and an owner can raise the limit, which applies at once. The trade suits
+links whose password is shared with a known group; a per-address limit
+would be the other choice, and belongs with the threat model of week 43.
+
+**Consent.** The consent text (1 to 1,000 characters, trimmed, newlines
+kept, other control characters refused) is shown as escaped plain text;
+the form carries `consent=yes`, and a submission without it is asked
+again (400). With a password as well, both are on one page and both are
+needed.
+
+**Grants.** The cookie is `rl.<code>` (`.` is not a code character, so it
+never meets an A/B cookie), `HttpOnly; SameSite=Lax; Path=/`, `Secure`
+unless `RELINK_COOKIE_SECURE=false`, with the value
+`<expiry in unix seconds>.<tag>`: the first 16 bytes of HMAC-SHA256, under
+the cookie key, over the link ID, a digest of the password hash and the
+consent text, and the expiry. A grant lasts 12 hours with a password and
+30 days for consent alone. It cannot be moved to another link, extended,
+or kept across a change: a new password or new consent text changes the
+digest and revokes every grant at once, with nothing stored per visitor.
+`Path=/` lets one grant cover `/abc` and `/campaign/abc` on a custom
+domain.
+
+**The pages.** Both the interstitial and the preview are a few hundred
+bytes of HTML with one inline style sheet, under
+`default-src 'none'; style-src 'unsafe-inline'; base-uri 'none';
+form-action 'self'; frame-ancestors 'none'`, with `no-store`, `nosniff`
+and `Referrer-Policy: no-referrer`. They run no script, so a visitor
+without JavaScript gets the same page, and they cannot be framed for
+clickjacking. A form is read only as `application/x-www-form-urlencoded`
+(415 otherwise) and only up to 4 KiB (413).
+
+**Previews.** `/{code}+`, and `/{prefix}/{code}+` on a custom domain, is
+the link's preview page (`site::Target::Preview`): the link's path and
+where this visit would go, decided by `rules::evaluate` exactly as the
+redirect would be (so a link with targeting rules previews the visitor's
+own destination), with a note when an A/B split has more than one, and a
+Continue link to the short link itself. It sets no A/B cookie, takes no
+click lease and counts no click (`outcome="preview"`). A disabled, expired
+or geo-blocked link answers its usual 404, 410 or 451, and a protected
+link's preview says only that it is protected. Only GET previews; a POST
+to one is 405.
+
+**At the edge.** A protected link is never published to KV: the KV sync
+deletes its key, so the edge sends its visitors to the origin, the only
+place that holds the hash. That also keeps a Worker deployed before this
+change from redirecting past a password it does not know about. A
+protected record found in KV anyway goes to the origin too, and the
+Worker reads its `protection` only as far as knowing it is there
+(`Protection::present`), which keeps the field's parser out of the
+bundle. The Worker forwards a POST, only as a form of at most 4 KiB, to
+the origin unread, with the visitor's facts as for a GET. Previews of
+links in KV are rendered at the edge by the same `gate::preview` the
+origin calls. The bundle went from 241,476 to 246,885 bytes gzipped,
+mostly the preview page and the form forwarding.
+
+**Metrics.** `relink_redirects_total` counts `gate` (a page shown),
+`gate_accepted`, `gate_rejected` (a wrong password or missing consent),
+`gate_locked` and `preview`.
+
 ## Click limits without a write per click
 
 This is escrow (O'Neil, "The Escrow Transactional Method"). Each instance
@@ -1069,7 +1171,9 @@ the link has no click limit: redirects, 404 for disabled links, 410 for
 expired ones, 451 or the fallback for geo-blocked visitors. It forwards to the
 origin, without following redirects, when the record is missing (KV may not
 have caught up with a new link), when KV fails, and for every link with a
-click limit. The country and region come from Cloudflare's `cf` object,
+click limit. Protected links are never in KV, and a POST (a protected
+link's form) is forwarded unread ("Protected links" above). The country and
+region come from Cloudflare's `cf` object,
 which clients cannot set; the visitor's address from `CF-Connecting-IP`. They
 are passed to the origin, which believes them because the edge is in its
 `RELINK_TRUSTED_PROXIES`, with the visitor's query string, `User-Agent`,
@@ -1451,6 +1555,7 @@ audit` known advisories.
 | `ring` | RS256 and ES256 signature verification for OpenID Connect ID tokens, and P-256 key generation and ES256 signing for ACME requests and certificate requests, and AES-256-GCM for keys at rest. RSA and ECDSA are not code to hand-roll, and `ring` is already in the tree through rustls, so it adds no new code to the build. |
 | `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys and the audit chain, constant-time comparison. |
 | `getrandom` | The OS CSPRNG for codes, keys and salts. |
+| `argon2` | argon2id for protected links' passwords. A password people choose needs a memory-hard hash, and argon2 is not code to hand-roll; it shares `digest` and `getrandom` with crates already in the tree, so it adds only itself, `blake2`, `password-hash` and `base64ct`. Built at `opt-level = 3` in the dev profile too, so tests hash in milliseconds. |
 | `chrono` | Timestamps and UTC dates; the core uses it without its clock so it stays wasm-friendly. |
 | `tracing`, `tracing-subscriber` | Structured JSON logs with request-scoped spans. |
 | `worker` | The workers-rs binding to the Cloudflare Workers runtime; wasm32 only. |

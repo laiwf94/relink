@@ -23,3 +23,11 @@ lto = "thin"
 
 [profile.bench]
 debug = false
+
+# Argon2 is memory-hard on purpose: unoptimised, one password hash in the
+# test suite takes seconds instead of tens of milliseconds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

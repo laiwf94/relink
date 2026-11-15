@@ -107,7 +107,10 @@ pub struct LinkSpec {
 }
 
 impl LinkSpec {
-    /// The patch that gives a link exactly these settings.
+    /// The patch that gives a link exactly these settings. A link's
+    /// password and consent page are not part of its versions (a version
+    /// would otherwise keep old password hashes), so a rollback leaves them
+    /// as they are.
     pub fn into_patch(self) -> LinkPatch {
         LinkPatch {
             destinations: Some(self.destinations),
@@ -120,6 +123,7 @@ impl LinkSpec {
             health_check: Some(self.health_check),
             rules: Some(self.rules),
             app: Some(self.app),
+            protection: None,
         }
     }
 }

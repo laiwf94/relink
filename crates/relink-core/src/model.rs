@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::deeplink::AppTargets;
+use crate::gate::Protection;
 use crate::rules_v2::RuleSet;
 
 /// One place a link can send visitors, with its share of an A/B split.
@@ -143,6 +144,18 @@ pub struct Link {
     /// App Store for iOS, an `intent:` URL for Android. Omitted when empty.
     #[serde(default, skip_serializing_if = "AppTargets::is_empty")]
     pub app: AppTargets,
+    /// A password or consent page in front of the redirect
+    /// ([`crate::gate`]). Serialised without the password hash; the server
+    /// never publishes a protected link to the edge at all, and an edge
+    /// that finds one sends it to the origin. Omitted when there is none,
+    /// so the Worker only checks that it is there
+    /// ([`Protection::present`]) and its parser stays out of the bundle.
+    #[serde(default, skip_serializing_if = "Protection::is_empty")]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        serde(deserialize_with = "Protection::present")
+    )]
+    pub protection: Protection,
 }
 
 /// Reads an optional RFC 3339 time, as chrono writes it, with chrono's
@@ -163,6 +176,11 @@ impl Link {
     /// Whether destination `i` should receive traffic.
     pub fn is_healthy(&self, i: usize) -> bool {
         !self.health_check || !self.unhealthy.get(i).copied().unwrap_or(false)
+    }
+
+    /// Whether visitors must pass a password or consent page first.
+    pub fn is_protected(&self) -> bool {
+        !self.protection.is_none()
     }
 
     pub fn weights(&self) -> Vec<u32> {

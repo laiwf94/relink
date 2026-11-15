@@ -311,6 +311,7 @@ mod tests {
             unhealthy: vec![false],
             rules: Default::default(),
             app: Default::default(),
+            protection: Default::default(),
         }
     }
 

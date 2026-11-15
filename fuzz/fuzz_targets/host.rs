@@ -105,6 +105,12 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             Target::Miss => {}
+            // A preview is a code's own path and a `+`, nothing else.
+            Target::Preview(c) => {
+                let own = s.strip_suffix('+').unwrap();
+                assert!(is_plausible_code(&c));
+                assert_eq!(target(own, on), Target::Code(c));
+            }
             // Association files exist only on custom domains, at exactly
             // their paths.
             Target::AppFile(f) => {

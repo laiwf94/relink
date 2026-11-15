@@ -15,6 +15,9 @@ name = "relink"
 path = "src/main.rs"
 
 [dependencies]
+# Password hashing for protected links (src/protect.rs): memory-hard by
+# design, which is the point; verification runs off the async workers.
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "password-hash", "getrandom"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
 chrono = { workspace = true, features = ["std", "clock"] }
 getrandom = "=0.4.3"

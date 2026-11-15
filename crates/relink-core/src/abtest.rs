@@ -12,10 +12,10 @@ use sha2::Sha256;
 
 use crate::hex;
 
-type HmacSha256 = Hmac<Sha256>;
+pub(crate) type HmacSha256 = Hmac<Sha256>;
 
 /// Bytes of the HMAC kept in the cookie (128 bits).
-const TAG_LEN: usize = 16;
+pub(crate) const TAG_LEN: usize = 16;
 
 /// Longest accepted cookie value: variant digits, dot, hex tag.
 const MAX_VALUE_LEN: usize = 3 + 1 + TAG_LEN * 2;
@@ -31,8 +31,14 @@ impl Signer {
         Signer { key }
     }
 
+    /// A fresh HMAC under this key. Every use starts with its own
+    /// domain-separation label, so tags never transfer between uses.
+    pub(crate) fn hmac(&self) -> HmacSha256 {
+        HmacSha256::new_from_slice(&self.key).expect("HMAC accepts any key length")
+    }
+
     fn mac(&self, link_id: i64, version: i32, variant: usize) -> HmacSha256 {
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts any key length");
+        let mut mac = self.hmac();
         mac.update(b"relink-ab\0");
         mac.update(&link_id.to_be_bytes());
         mac.update(&version.to_be_bytes());

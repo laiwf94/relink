@@ -32,6 +32,7 @@ use crate::kvsync::{CloudflareHostnames, CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
 use crate::metrics::{DbOp, Gauges, Metrics};
 use crate::oidc::{self, Oidc};
+use crate::protect::{self, Hasher};
 use crate::ratelimit::{KeyedLimiter, Rate};
 use crate::redirect;
 use crate::resolver::{LinkSource, Resolver};
@@ -74,6 +75,8 @@ pub struct App {
     pub sealer: Option<Arc<Sealer>>,
     /// Certificates for the TLS listener, when there is one.
     pub tls: Option<Tls>,
+    /// Hashes and checks protected links' passwords.
+    pub hasher: Hasher,
 }
 
 /// Credentials tracked by the API rate limiter (one bucket per key or person).
@@ -136,6 +139,7 @@ impl App {
             acme_wake: Arc::new(Notify::new()),
             sealer: cfg.key_encryption_key.map(|k| Arc::new(Sealer::new(&k))),
             tls: cfg.tls.clone().map(Tls::new),
+            hasher: Hasher::default(),
             shutting_down: AtomicBool::new(false),
             change_feed: AtomicBool::new(false),
             kv_wake: Arc::new(Notify::new()),
@@ -231,10 +235,11 @@ pub fn public_router(app: Arc<App>) -> Router {
         .route("/readyz", get(api::readyz))
         .route("/openapi.json", get(api::openapi))
         .route("/.well-known/acme-challenge/{token}", get(acme::http01))
-        .route("/{code}", get(redirect::redirect))
+        .route("/{code}", get(redirect::redirect).post(protect::submit))
         // Any other GET may be a custom domain's `/` or `/{prefix}/{code}`
-        // or its 404 page (src/redirect.rs); on the default domain, and for
-        // other methods, it is an unknown path as before.
+        // or its 404 page (src/redirect.rs), and a POST a protected link's
+        // form there (src/protect.rs); on the default domain, and for other
+        // methods, it is an unknown path as before.
         .fallback(redirect::fallback)
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),

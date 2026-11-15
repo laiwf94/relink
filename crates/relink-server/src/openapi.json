@@ -14,9 +14,10 @@
         "summary": "Follow a short link",
         "operationId": "redirect",
         "security": [],
-        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's. A custom domain's settings also apply: / redirects to its root_url, /{prefix}/{code} serves a code behind one of its prefixes, codes ignore case when case_insensitive is set, and its not_found_page and gone_page replace the plain-text 404 and 410 (as text/html, under a Content-Security-Policy that allows no scripts). On the default domain / and two-segment paths are unknown paths. A custom domain whose settings name apps also serves their association files, as application/json: /.well-known/apple-app-site-association (and /apple-app-site-association) for iOS universal links, /.well-known/assetlinks.json for Android app links; without apps for that platform they are its 404. A link's app targets send iPhones and iPads to its App Store page and Android browsers to an intent: URL that opens the app or its store fallback, after targeting rules and before the destinations; crawlers and other systems follow the destinations.",
+        "description": "The Host header picks the domain: a custom domain a workspace has verified serves its own codes, and any other host the default domain's. A custom domain's settings also apply: / redirects to its root_url, /{prefix}/{code} serves a code behind one of its prefixes, codes ignore case when case_insensitive is set, and its not_found_page and gone_page replace the plain-text 404 and 410 (as text/html, under a Content-Security-Policy that allows no scripts). On the default domain / and two-segment paths are unknown paths. A custom domain whose settings name apps also serves their association files, as application/json: /.well-known/apple-app-site-association (and /apple-app-site-association) for iOS universal links, /.well-known/assetlinks.json for Android app links; without apps for that platform they are its 404. A link's app targets send iPhones and iPads to its App Store page and Android browsers to an intent: URL that opens the app or its store fallback, after targeting rules and before the destinations; crawlers and other systems follow the destinations. A protected link (its protection is set) answers 200 with its password or consent page until the visitor holds the grant cookie its form sets; disabled, expired and geo-blocked links answer as they would without it. /{code}+ (and /{prefix}/{code}+ on a custom domain) is the link's preview page: 200 text/html naming where this visit would go, or only that the link is protected, without a click. Both pages run no script and are sent with Cache-Control: no-store.",
         "parameters": [{ "$ref": "#/components/parameters/Code" }],
         "responses": {
+          "200": { "description": "A protected link's password or consent page, or a preview page.", "content": { "text/html": { "schema": { "type": "string" } } } },
           "301": { "$ref": "#/components/responses/Redirect" },
           "302": { "$ref": "#/components/responses/Redirect" },
           "307": { "$ref": "#/components/responses/Redirect" },
@@ -25,6 +26,39 @@
           "410": { "description": "Expired or click limit reached.", "content": { "text/plain": { "schema": { "type": "string" } } } },
           "451": { "description": "Not available in the visitor's country and no fallback URL is set.", "content": { "text/plain": { "schema": { "type": "string" } } } },
           "503": { "description": "The link is not cached and the database is unavailable, or the host may be a custom domain and the verified domains have not been loaded yet.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/plain": { "schema": { "type": "string" } } } }
+        }
+      },
+      "post": {
+        "summary": "Submit a protected link's password or consent",
+        "operationId": "submitProtection",
+        "security": [],
+        "description": "The form a protected link's page posts to its own path. password is checked against the link's argon2id hash, and every check takes one of the link's attempts for the hour (max_attempts, 10 by default), counted across instances; a right password gives its attempt back, so only wrong ones use the limit. consent must be yes when the link has consent text. Accepted, it answers 303 back to the same path and query with a grant cookie (rl.{code}, HttpOnly, SameSite=Lax), valid 12 hours with a password and 30 days for consent alone, and revoked when the link's password or consent text changes. A link without protection answers 303 back at once. Disabled, expired and geo-blocked links answer as a GET would.",
+        "parameters": [{ "$ref": "#/components/parameters/Code" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": { "type": "string" },
+                  "consent": { "const": "yes" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "303": { "description": "Accepted: back to the link, which now redirects.", "headers": { "Location": { "schema": { "type": "string" } }, "Set-Cookie": { "schema": { "type": "string" } } } },
+          "400": { "description": "The consent field is missing; the page again.", "content": { "text/html": { "schema": { "type": "string" } } } },
+          "401": { "description": "Wrong or missing password; the page again.", "content": { "text/html": { "schema": { "type": "string" } } } },
+          "404": { "description": "Unknown or disabled code.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "410": { "description": "Expired.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "413": { "description": "The form is larger than 4 KiB.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "415": { "description": "Not an application/x-www-form-urlencoded form.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "429": { "description": "The link's attempts for the hour are used up; the password was not checked.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/html": { "schema": { "type": "string" } } } },
+          "451": { "description": "Not available in the visitor's country and no fallback URL is set.", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "503": { "description": "The attempt could not be recorded, or the link could not be loaded.", "headers": { "Retry-After": { "schema": { "type": "integer" } } }, "content": { "text/plain": { "schema": { "type": "string" } } } }
         }
       }
     },
@@ -783,7 +817,27 @@
           "health_check": { "type": "boolean", "default": false },
           "domain": { "type": ["string", "null"], "maxLength": 253, "description": "A custom domain the workspace has verified; absent or null for the default domain." },
           "rules": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/Rule" }, "description": "Targeting rules, tried in order. A refused list is invalid_argument with the JSON path of the part at fault, such as rules[1].if.all[0].country[2]." },
-          "app": { "$ref": "#/components/schemas/AppTargets" }
+          "app": { "$ref": "#/components/schemas/AppTargets" },
+          "protection": { "$ref": "#/components/schemas/ProtectionInput" }
+        }
+      },
+      "ProtectionInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "A password or consent page in front of the redirect. On PATCH an absent field is kept and null removes it. A refused field is invalid_argument naming it, such as protection.password.",
+        "properties": {
+          "password": { "type": ["string", "null"], "minLength": 4, "maxLength": 256, "description": "4 to 256 bytes without control characters. Stored only as an argon2id hash and never returned. Protected links are served by the origin, never the edge." },
+          "max_attempts": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Wrong passwords accepted per hour, across instances; 10 when a password is set without it. Needs a password; ignored on PATCH while the link has none." },
+          "consent": { "type": ["string", "null"], "minLength": 1, "maxLength": 1000, "description": "Text the visitor agrees to before continuing, shown as plain text with its line breaks. Trimmed; control characters other than newlines are refused." }
+        }
+      },
+      "Protection": {
+        "type": "object",
+        "description": "A link's password and consent page as returned: never the password.",
+        "properties": {
+          "password": { "const": true, "description": "Present when the link asks for a password." },
+          "max_attempts": { "type": "integer", "description": "With a password: wrong passwords accepted per hour." },
+          "consent": { "type": "string" }
         }
       },
       "PatchLink": {
@@ -801,12 +855,13 @@
           "enabled": { "type": "boolean" },
           "health_check": { "type": "boolean" },
           "rules": { "type": ["array", "null"], "maxItems": 32, "items": { "$ref": "#/components/schemas/Rule" }, "description": "Replaces the whole list; null or [] removes the rules." },
-          "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }], "description": "Replaces the app targets; null or {} removes them." }
+          "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }], "description": "Replaces the app targets; null or {} removes them." },
+          "protection": { "oneOf": [{ "$ref": "#/components/schemas/ProtectionInput" }, { "type": "null" }], "description": "Changes the password and consent page field by field; null removes both. Not part of the link's versions, so a rollback leaves it as it is." }
         }
       },
       "Link": {
         "type": "object",
-        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "rules", "app", "version", "created_at", "updated_at"],
+        "required": ["code", "domain", "short_url", "destinations", "redirect_type", "expires_at", "max_clicks", "geo", "fallback_url", "enabled", "health_check", "health_checked_at", "rules", "app", "protection", "version", "created_at", "updated_at"],
         "properties": {
           "code": { "type": "string" },
           "domain": { "type": ["string", "null"], "description": "The custom domain the link is on; null for the default domain." },
@@ -833,6 +888,7 @@
           "health_checked_at": { "type": ["string", "null"], "format": "date-time" },
           "rules": { "type": "array", "items": { "$ref": "#/components/schemas/Rule" }, "description": "Targeting rules in order, with destinations normalised; [] for none." },
           "app": { "oneOf": [{ "$ref": "#/components/schemas/AppTargets" }, { "type": "null" }], "description": "App targets, with store URLs normalised; null for none." },
+          "protection": { "oneOf": [{ "$ref": "#/components/schemas/Protection" }, { "type": "null" }], "description": "The password (only that there is one) and consent page; null for none." },
           "version": { "type": "integer", "minimum": 1, "description": "The link's current version; see GET /v1/links/{code}/versions." },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }

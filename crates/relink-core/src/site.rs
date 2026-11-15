@@ -182,6 +182,9 @@ pub enum Target<'a> {
     /// One of the domain's app association files
     /// ([`crate::deeplink::app_file`]), answered from its settings.
     AppFile(AppFile),
+    /// `/{code}+` (or `/{prefix}/{code}+`): the link's preview page
+    /// ([`crate::gate::preview_page`]), on any domain.
+    Preview(Cow<'a, str>),
 }
 
 /// Reads `path` (without the leading `/`, still percent-encoded) on a
@@ -195,6 +198,12 @@ pub fn target<'a>(path: &'a str, settings: Option<&DomainSettings>) -> Target<'a
         && let Some(file) = app_file_at(path)
     {
         return Target::AppFile(file);
+    }
+    if let Some(link) = path.strip_suffix('+') {
+        return match target(link, settings) {
+            Target::Code(code) => Target::Preview(code),
+            _ => Target::Miss,
+        };
     }
     let code = match (path.split_once('/'), settings) {
         (None, _) => path,
@@ -447,6 +456,7 @@ mod tests {
         let s = settings();
         let plain = DomainSettings::default();
         let code = |c: &str| Target::Code(Cow::Owned(c.to_owned()));
+        let preview = |c: &str| Target::Preview(Cow::Owned(c.to_owned()));
         for (path, on, want) in [
             ("", Some(&s), Target::Root),
             ("", None, Target::Root),
@@ -489,6 +499,19 @@ mod tests {
                 None,
                 code("apple-app-site-association"),
             ),
+            // Previews: a code and a `+`, on any domain, behind a prefix
+            // too; nothing else ends in `+`.
+            ("abc+", None, preview("abc")),
+            ("ABC+", Some(&s), preview("abc")),
+            ("campaign/AbC+", Some(&s), preview("abc")),
+            ("campaign/abc+", None, Target::Miss),
+            ("abc++", None, Target::Miss),
+            ("+", None, Target::Miss),
+            ("+", Some(&s), Target::Miss),
+            ("ab+", None, Target::Miss),
+            ("abc%2B", None, Target::Miss),
+            ("+abc", None, Target::Miss),
+            (".well-known/assetlinks.json+", Some(&s), Target::Miss),
         ] {
             assert_eq!(target(path, on), want, "{path:?}");
         }

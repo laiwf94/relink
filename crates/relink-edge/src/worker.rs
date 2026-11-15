@@ -23,6 +23,13 @@ use crate::logic::{
 const BATCH_MAX: usize = 50;
 const BATCH_AGE: Duration = Duration::from_secs(5);
 
+/// The only body the edge forwards: a protected link's form.
+const FORM_TYPE: &str = "application/x-www-form-urlencoded";
+
+/// Largest form body forwarded; a password and a consent field fit many
+/// times over.
+const MAX_FORM_BYTES: usize = 4096;
+
 thread_local! {
     // Workers run one request at a time per isolate thread, so a RefCell is
     // enough; the batch is shared by the requests an isolate serves.
@@ -101,8 +108,17 @@ impl Origin for WorkerOrigin {
                 .map_err(err)?;
         }
         let mut init = RequestInit::new();
-        init.with_method(Method::Get)
-            .with_headers(headers)
+        match &req.form {
+            Some(body) => {
+                headers.set("content-type", FORM_TYPE).map_err(err)?;
+                init.with_method(Method::Post)
+                    .with_body(Some(JsValue::from_str(body)));
+            }
+            None => {
+                init.with_method(Method::Get);
+            }
+        }
+        init.with_headers(headers)
             .with_redirect(RequestRedirect::Manual);
         let request = Request::new_with_init(&format!("{}/{}", self.base, origin_path(req)), &init)
             .map_err(err)?;
@@ -116,6 +132,7 @@ impl Origin for WorkerOrigin {
             "content-type",
             "content-security-policy",
             "x-content-type-options",
+            "referrer-policy",
         ] {
             if let Some(v) = resp.headers().get(name).map_err(err)? {
                 out.push((name.to_owned(), v));
@@ -158,10 +175,26 @@ async fn send_clicks(origin: String, token: String, batch: ClickBatch) {
 }
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    if !matches!(req.method(), Method::Get | Method::Head) {
-        return Response::error("method not allowed\n", 405);
-    }
+async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
+    // A POST is a protected link's form, passed to the origin as it came.
+    let form = match req.method() {
+        Method::Get | Method::Head => None,
+        Method::Post => {
+            let is_form = req
+                .headers()
+                .get("content-type")?
+                .is_some_and(|t| t.split(';').next().is_some_and(|t| t.trim() == FORM_TYPE));
+            if !is_form {
+                return Response::error("unsupported media type\n", 415);
+            }
+            let body = req.bytes().await?;
+            if body.len() > MAX_FORM_BYTES {
+                return Response::error("form too large\n", 413);
+            }
+            Some(String::from_utf8_lossy(&body).into_owned())
+        }
+        _ => return Response::error("method not allowed\n", 405),
+    };
     let path = req.path();
     let code = path.trim_start_matches('/');
     if code == "healthz" {
@@ -219,6 +252,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             .map(String::into_bytes),
         accept_language: headers.get("accept-language")?.map(String::into_bytes),
         query: url.query().map(str::to_owned),
+        form,
         now_ms: worker::Date::now().as_millis() as i64,
         random: random_u64(),
     };

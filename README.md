@@ -45,7 +45,9 @@ of rotation, targeting rules, and app targets for phones: iPhones go to the
 App Store page and Android browsers get an `intent:` URL that opens the app or
 its store. A custom domain can name the iOS and Android apps it belongs to and
 then serves their `apple-app-site-association` and `assetlinks.json`, so an
-installed app opens its links directly.
+installed app opens its links directly. A link can also ask for a password
+(argon2id-hashed, with a per-link limit on wrong guesses) or for consent before
+it redirects, and `/{code}+` previews where any link goes without following it.
 
 The origin answers `/{code}` from a bounded in-process cache with
 stale-while-revalidate, stale-if-error, negative caching and one coalesced
@@ -220,11 +222,13 @@ $ curl -s localhost:8080/v1/domains/go.example.com -H "Authorization: Bearer $KE
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /{code}` | Redirect, on the domain named by `Host`. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. |
-| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`, `rules` (targeting rules; see [docs/DESIGN.md](docs/DESIGN.md#targeting-rules)), `app` (app targets; see [docs/DESIGN.md](docs/DESIGN.md#deep-links)). |
+| `GET /{code}` | Redirect, on the domain named by `Host`. 404 unknown or disabled, 410 expired or over its limit, 451 geo-blocked without a fallback, 503 when not cached and the database is down. A protected link answers 200 with its password or consent page until the visitor holds a grant. |
+| `POST /{code}` | A protected link's form (`password`, `consent=yes`): 303 back to the link with a grant cookie, 401 for a wrong password, 429 once the link's wrong guesses for the hour are used up. See [docs/DESIGN.md](docs/DESIGN.md#protected-links). |
+| `GET /{code}+` | The link's preview page: where this visit would go, or only that the link is protected. No click is counted. |
+| `POST /v1/links` | Create: `url` or `destinations`, optional `alias`, `redirect_type`, `expires_at`, `max_clicks`, `geo`, `fallback_url`, `enabled`, `health_check`, `domain`, `rules` (targeting rules; see [docs/DESIGN.md](docs/DESIGN.md#targeting-rules)), `app` (app targets; see [docs/DESIGN.md](docs/DESIGN.md#deep-links)), `protection` (`password`, `max_attempts`, `consent`; see [docs/DESIGN.md](docs/DESIGN.md#protected-links)). |
 | `GET /v1/links?limit=&cursor=` | Your links, newest first. |
 | `GET /v1/links/{code}?domain=` | One link, with per-destination health; `domain` for a link on a custom domain. |
-| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. `rules` and `app` replace the whole list or object. |
+| `PATCH /v1/links/{code}?domain=` | Change fields; `null` clears optional ones. `rules` and `app` replace the whole list or object; `protection` changes field by field, and `null` removes it. |
 | `DELETE /v1/links/{code}?domain=` | Delete the link and its statistics. |
 | `GET /v1/links/{code}/stats?from=&to=&domain=` | Clicks per UTC day with unique visitors, top countries, devices and referrers. |
 | `GET /v1/links/{code}/versions?domain=&limit=&cursor=` | The link's versions, newest first: its settings after each change that altered them, who made it and how. The newest 100 are kept. |

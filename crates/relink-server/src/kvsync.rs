@@ -472,10 +472,14 @@ impl KvSync {
     }
 
     /// The JSON of the link with `code` on `domain` (the default domain when
-    /// `None`), if there is one.
+    /// `None`), if there is one to publish. A protected link is not: only
+    /// the origin can check its password, and an edge deployed before
+    /// protection existed would redirect without asking. Its key is
+    /// deleted, so the edge sends its visitors to the origin.
     async fn link_json(&self, code: &str, domain: Option<i64>) -> Result<Option<String>, KvError> {
         let key = link_key(domain, code);
         match self.db.link_by_key(&key).await {
+            Ok(Some(stored)) if stored.is_protected() => Ok(None),
             Ok(Some(stored)) => serde_json::to_string(&stored.link)
                 .map(Some)
                 .map_err(|e| KvError(format!("encoding {key}: {e}"))),

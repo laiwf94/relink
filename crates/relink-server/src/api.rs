@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tracing::Instrument;
 
 use relink_core::deeplink::{self, AppLink};
+use relink_core::gate::{self, Protection};
 use relink_core::rules_v2::{self, Rule, RuleSet};
 use relink_core::wire::{ClickBatch, MAX_BATCH, WireClick};
 use sha2::{Digest, Sha256};
@@ -35,7 +36,7 @@ use crate::destination::normalize;
 use crate::model::{Destination, GeoMode, GeoRule};
 use crate::server::App;
 use crate::session;
-use crate::store::{DbError, LinkPatch, NewLink, Stats, StoredLink, link_key};
+use crate::store::{DbError, LinkPatch, NewLink, ProtectionPatch, Stats, StoredLink, link_key};
 use crate::tenant::{Allowed, LinksRead, LinksWrite, StatsRead};
 use crate::util::{fast_random, hex_decode, hex_encode, now_ms, utc_day};
 
@@ -474,6 +475,8 @@ pub struct CreateLink {
     pub rules: Option<Vec<Rule>>,
     /// Where phones go instead of the destinations ([`deeplink`]).
     pub app: Option<AppInput>,
+    /// A password or consent page in front of the redirect ([`gate`]).
+    pub protection: Option<ProtectionInput>,
     /// A verified custom domain of the workspace to create the link on;
     /// absent or null for the default domain.
     pub domain: Option<String>,
@@ -508,6 +511,22 @@ pub struct PatchLink {
     /// Replaces the app targets; `null` or `{}` removes them.
     #[serde(default, deserialize_with = "nullable")]
     pub app: Option<Option<AppInput>>,
+    /// Changes the password or consent page field by field; `null`
+    /// removes both.
+    #[serde(default, deserialize_with = "nullable")]
+    pub protection: Option<Option<ProtectionInput>>,
+}
+
+/// A link's password and consent page as the API takes them. On a `PATCH`
+/// an absent field is left as it is and `null` removes it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionInput {
+    #[serde(default, deserialize_with = "nullable")]
+    pub password: Option<Option<String>>,
+    pub max_attempts: Option<u32>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub consent: Option<Option<String>>,
 }
 
 /// A link's app targets as the API takes them ([`deeplink::AppLink`]).
@@ -566,6 +585,9 @@ pub struct LinkView {
     pub rules: Vec<Rule>,
     /// App targets for phones; `null` for none.
     pub app: Option<AppLink>,
+    /// The password (never shown, only whether there is one) and consent
+    /// page; `null` for none.
+    pub protection: Option<Protection>,
     /// The link's current version (`GET /v1/links/{code}/versions`).
     pub version: i32,
     pub created_at: DateTime<Utc>,
@@ -610,6 +632,7 @@ impl LinkView {
             health_checked_at: link.health_checked_at,
             rules: link.rules.rules().to_vec(),
             app: link.app.clone(),
+            protection: link.is_protected().then(|| link.protection.clone()),
             version: link.version,
             created_at: link.created_at,
             updated_at: link.updated_at,
@@ -787,6 +810,48 @@ fn validate_rules(app: &App, mut rules: Vec<Rule>) -> Result<RuleSet, ApiError> 
     RuleSet::new(rules).map_err(invalid)
 }
 
+/// Validates a password and consent page and hashes the password, into
+/// the change it makes. On a create (`create`), `null` and absent mean the
+/// same, and an attempt limit needs a password with it.
+async fn validate_protection(
+    app: &App,
+    input: ProtectionInput,
+    create: bool,
+) -> Result<ProtectionPatch, ApiError> {
+    let invalid = |e: gate::ProtectionError| ApiError::invalid(e.to_string());
+    if let Some(Some(p)) = &input.password {
+        gate::check_password(p).map_err(invalid)?;
+    }
+    let consent = match input.consent {
+        Some(Some(c)) => Some(Some(gate::check_consent(&c).map_err(invalid)?)),
+        other => other,
+    };
+    let max_attempts = input
+        .max_attempts
+        .map(gate::check_attempts)
+        .transpose()
+        .map_err(invalid)?;
+    let removes_password = matches!(input.password, Some(None));
+    let sets_password = matches!(input.password, Some(Some(_)));
+    if max_attempts.is_some() && (removes_password || (create && !sets_password)) {
+        return Err(ApiError::invalid(
+            "protection.max_attempts: needs a password",
+        ));
+    }
+    let password_hash = match input.password {
+        Some(Some(p)) => Some(Some(app.hasher.hash(p).await.map_err(|e| {
+            tracing::error!(error = %e.0, "password hashing failed");
+            ApiError::internal()
+        })?)),
+        other => other,
+    };
+    Ok(ProtectionPatch {
+        password_hash,
+        max_attempts,
+        consent,
+    })
+}
+
 /// Validates app targets: `None` when neither platform is set. Errors name
 /// the part at fault, `app.android.package: ...`.
 fn validate_app(app: &App, input: AppInput) -> Result<Option<AppLink>, ApiError> {
@@ -822,30 +887,45 @@ pub async fn create_link(
     }
     let destinations = validate_destinations(&app, req.url, req.destinations, true)?
         .expect("required destinations are present");
+    // Checked before the password is hashed, so a bad request costs no hash.
+    let rules = req
+        .rules
+        .map(|r| validate_rules(&app, r))
+        .transpose()?
+        .unwrap_or_default();
+    let app_link = req
+        .app
+        .map(|a| validate_app(&app, a))
+        .transpose()?
+        .flatten();
+    let redirect_status = validate_status(req.redirect_type.unwrap_or(302))?;
+    let expires_at = req.expires_at.map(validate_expiry).transpose()?;
+    let max_clicks = req.max_clicks.map(validate_max_clicks).transpose()?;
+    let geo = req.geo.map(validate_geo).transpose()?;
+    let fallback_url = req
+        .fallback_url
+        .map(|u| validate_fallback(&app, u))
+        .transpose()?;
+    let protection = match req.protection {
+        Some(p) => validate_protection(&app, p, true)
+            .await?
+            .apply(&Protection::default()),
+        None => Protection::default(),
+    };
     let new = NewLink {
         owner: ws.principal.owner.clone(),
         alias: req.alias,
         destinations,
-        redirect_status: validate_status(req.redirect_type.unwrap_or(302))?,
-        expires_at: req.expires_at.map(validate_expiry).transpose()?,
-        max_clicks: req.max_clicks.map(validate_max_clicks).transpose()?,
-        geo: req.geo.map(validate_geo).transpose()?,
-        fallback_url: req
-            .fallback_url
-            .map(|u| validate_fallback(&app, u))
-            .transpose()?,
+        redirect_status,
+        expires_at,
+        max_clicks,
+        geo,
+        fallback_url,
         enabled: req.enabled.unwrap_or(true),
         health_check: req.health_check.unwrap_or(false),
-        rules: req
-            .rules
-            .map(|r| validate_rules(&app, r))
-            .transpose()?
-            .unwrap_or_default(),
-        app: req
-            .app
-            .map(|a| validate_app(&app, a))
-            .transpose()?
-            .flatten(),
+        rules,
+        app: app_link,
+        protection,
         domain: domain_param(req.domain),
     };
     let link = ws
@@ -932,7 +1012,7 @@ pub async fn update_link(
     StrictQuery(q): StrictQuery<DomainQuery>,
     StrictJson(req): StrictJson<PatchLink>,
 ) -> Result<Response, ApiError> {
-    let patch = LinkPatch {
+    let mut patch = LinkPatch {
         destinations: validate_destinations(&app, req.url, req.destinations, false)?,
         redirect_status: req.redirect_type.map(validate_status).transpose()?,
         expires_at: req
@@ -965,6 +1045,13 @@ pub async fn update_link(
                     .map(Option::flatten)
             })
             .transpose()?,
+        protection: None,
+    };
+    // Last, so a bad request costs no hash.
+    patch.protection = match req.protection {
+        None => None,
+        Some(None) => Some(ProtectionPatch::CLEAR),
+        Some(Some(p)) => Some(validate_protection(&app, p, false).await?),
     };
     let empty = patch.destinations.is_none()
         && patch.redirect_status.is_none()
@@ -975,7 +1062,11 @@ pub async fn update_link(
         && patch.enabled.is_none()
         && patch.health_check.is_none()
         && patch.rules.is_none()
-        && patch.app.is_none();
+        && patch.app.is_none()
+        && patch
+            .protection
+            .as_ref()
+            .is_none_or(|p| *p == ProtectionPatch::default());
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }
@@ -1200,6 +1291,7 @@ pub async fn openapi() -> Response {
 /// described under `/{code}`.
 pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/{code}"),
+    ("post", "/{code}"),
     ("get", "/healthz"),
     ("get", "/readyz"),
     ("get", "/openapi.json"),

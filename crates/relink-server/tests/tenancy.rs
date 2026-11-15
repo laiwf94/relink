@@ -44,6 +44,7 @@ fn new_link(owner: &str, alias: &str) -> NewLink {
         health_check: false,
         rules: Default::default(),
         app: Default::default(),
+        protection: Default::default(),
         domain: None,
     }
 }

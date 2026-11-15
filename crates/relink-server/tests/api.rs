@@ -741,10 +741,14 @@ async fn openapi_matches_the_router_and_responses() {
             );
             continue;
         }
-        assert!(
-            matches!(status, 200 | 201 | 202 | 204 | 302),
-            "{method} {path} returned {status}"
-        );
+        // A form posted to a link without protection is sent straight
+        // back to it (tests/protect.rs drives protected ones).
+        let ok: &[u16] = if path == "/{code}" && method == "post" {
+            &[303]
+        } else {
+            &[200, 201, 202, 204, 302]
+        };
+        assert!(ok.contains(&status), "{method} {path} returned {status}");
     }
 
     // Response bodies carry exactly the documented required fields.

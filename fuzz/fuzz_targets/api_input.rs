@@ -8,6 +8,26 @@ use relink_server::api::{CreateLink, PatchLink, click_from_wire, decode_cursor, 
 use relink_server::store::{link_key, parse_change, split_link_key};
 
 fuzz_target!(|data: &[u8]| {
+    // A protected link's form and grant cookie, as visitors send them.
+    let _ = relink_core::gate::form_field(data, "password");
+    if let Ok(s) = std::str::from_utf8(data) {
+        let signer = relink_core::abtest::Signer::new([3; 32]);
+        let p = relink_core::gate::Protection {
+            password: true,
+            ..Default::default()
+        };
+        // Only the signer's own grants pass, exactly as it wrote them.
+        if signer.verify_grant(1, &p, s, 0) {
+            let expires: i64 = s.split_once('.').unwrap().0.parse().unwrap();
+            assert_eq!(s, signer.grant(1, &p, expires));
+        }
+        if relink_core::gate::check_password(s).is_ok() {
+            assert!(s.len() >= relink_core::gate::MIN_PASSWORD_LEN);
+        }
+        if let Ok(c) = relink_core::gate::check_consent(s) {
+            assert_eq!(relink_core::gate::check_consent(&c).as_deref(), Ok(&*c));
+        }
+    }
     let _ = serde_json::from_slice::<CreateLink>(data);
     let _ = serde_json::from_slice::<PatchLink>(data);
     // KV records as the edge reads them.

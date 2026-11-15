@@ -9,6 +9,10 @@
 //! case-insensitive domain. Its own 404 and 410 pages replace the built-in
 //! ones. On the default domain nothing changes: `/` and two-segment paths
 //! are unknown API paths, as before.
+//!
+//! `/{code}+` is the link's preview (`relink_core::gate::preview`), and a
+//! protected link shows its password or consent page (src/protect.rs)
+//! until the visitor holds a grant for it.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -21,16 +25,18 @@ use axum::response::{IntoResponse, Response};
 use crate::api::ApiError;
 use crate::classify::{UNKNOWN_COUNTRY, country, device_class, referrer_host};
 use crate::clicks::{ClickEvent, fingerprint};
-use crate::domains::Route;
+use crate::domains::{Route, Site};
 use crate::limiter::Admit;
 use crate::metrics::Outcome;
 use crate::model::Link;
+use crate::protect;
 use crate::resolver::Resolved;
 use crate::rules::{Decision, Settings, Visit, evaluate};
 use crate::server::App;
 use crate::store::link_key;
 use crate::util::{fast_random, now_ms, utc_day};
 use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file};
+use relink_core::gate::preview;
 use relink_core::site::{
     DomainSettings, EXPIRED_TEXT, HTML, PAGE_CSP, PageKind, Target, page, target,
 };
@@ -95,15 +101,16 @@ pub fn visitor_region<'a>(app: &App, headers: &'a HeaderMap, peer: IpAddr) -> Op
     headers.get(name).map(HeaderValue::as_bytes)
 }
 
-/// The public router's fallback: a GET or HEAD is read as a redirect path
-/// (so a custom domain answers it as the edge would), anything else is an
-/// unknown path.
+/// The public router's fallback: on a custom domain a GET or HEAD is read
+/// as a redirect path (so it is answered as the edge would) and a POST as
+/// a protected link's form; anything else is an unknown path.
 pub async fn fallback(
     State(app): State<Arc<App>>,
     method: Method,
     uri: Uri,
     connect: ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    body: axum::body::Body,
 ) -> Response {
     let ConnectInfo(peer) = connect;
     let host = request_host(&app, &headers, peer.ip());
@@ -115,6 +122,8 @@ pub async fn fallback(
     );
     if custom && (method == Method::GET || method == Method::HEAD) {
         redirect(State(app), uri, connect, headers).await
+    } else if custom && method == Method::POST {
+        protect::submit(State(app), uri, connect, headers, body).await
     } else {
         ApiError::not_found().into_response()
     }
@@ -164,6 +173,128 @@ fn error_page(
     (resp, outcome)
 }
 
+/// A request routed to a link.
+pub struct Located<'h> {
+    /// The request's host header, for the domain's pages.
+    host: Option<&'h [u8]>,
+    /// The custom domain, `None` on the default domain.
+    site: Option<Arc<Site>>,
+    pub link: Arc<Link>,
+    /// The path is the link's preview, `/{code}+`.
+    pub preview: bool,
+}
+
+impl Located<'_> {
+    /// Where the link's error pages come from: the domain's settings.
+    pub fn pages(&self) -> Option<(Option<&[u8]>, &DomainSettings)> {
+        self.site.as_ref().map(|s| (self.host, &s.settings))
+    }
+}
+
+/// Routes `path` (without the leading `/`, as sent) to a link: by `Host`
+/// to a custom domain, then the code. Anything else (the domain's root,
+/// an association file, an unknown code) is answered here.
+pub async fn locate<'h>(
+    app: &App,
+    path: &str,
+    headers: &'h HeaderMap,
+    peer: IpAddr,
+) -> Result<Located<'h>, (Response, Outcome)> {
+    let host_header = request_host(app, headers, peer);
+    let site = match app.domains.route(host_header, &app.cfg.default_host) {
+        Route::Default => None,
+        Route::Domain(site) => Some(site),
+        Route::Unavailable => return Err((unavailable(), Outcome::Unavailable)),
+    };
+    let pages = site.as_ref().map(|s| (host_header, &s.settings));
+    let (code, preview) = match (target(path, site.as_ref().map(|s| &s.settings)), &site) {
+        (Target::Code(code), _) => (code, false),
+        (Target::Preview(code), _) => (code, true),
+        (Target::Root, Some(s)) => match &s.settings.root_url {
+            Some(url) => return Err((location(302, url, None, None), Outcome::Root)),
+            None => return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT)),
+        },
+        (Target::Miss, Some(_)) => {
+            return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT));
+        }
+        (Target::AppFile(file), Some(s)) => match app_file(file, &s.settings.apps) {
+            Some(body) => return Err((json_file(body), Outcome::AppFile)),
+            None => return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT)),
+        },
+        // The default domain: `/` and paths with a `/` were never
+        // redirects, and are answered as unknown paths, as before.
+        (_, None) if path.is_empty() || path.contains('/') => {
+            return Err((ApiError::not_found().into_response(), Outcome::NotFound));
+        }
+        (_, None) => return Err(error_page(PageKind::NotFound, None, path, EXPIRED_TEXT)),
+    };
+    let key = site.as_ref().map(|s| link_key(Some(s.id), &code));
+    let link = match app.resolver.resolve(key.as_deref().unwrap_or(&code)).await {
+        Resolved::Found(link) => link,
+        Resolved::NotFound => {
+            return Err(error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT));
+        }
+        Resolved::Unavailable => return Err((unavailable(), Outcome::Unavailable)),
+    };
+    Ok(Located {
+        host: host_header,
+        site,
+        link,
+        preview,
+    })
+}
+
+/// The facts the decisions read from a request, and the cookie settings.
+pub fn visit_settings<'a>(
+    app: &'a App,
+    query: Option<&'a str>,
+    headers: &'a HeaderMap,
+    peer: IpAddr,
+    cookies: &'a [&'a [u8]],
+) -> (Visit<'a>, Settings<'a>) {
+    let raw = |name| headers.get(name).map(HeaderValue::as_bytes);
+    let visit = Visit {
+        now_ms: now_ms(),
+        country: visitor_country(app, headers, peer),
+        region: visitor_region(app, headers, peer),
+        user_agent: raw(header::USER_AGENT),
+        accept_language: raw(header::ACCEPT_LANGUAGE),
+        referer: raw(header::REFERER),
+        query: query.map(str::as_bytes),
+        cookies,
+        random: fast_random(),
+    };
+    let settings = Settings {
+        signer: &app.signer,
+        cookie_secure: app.cfg.cookie_secure,
+    };
+    (visit, settings)
+}
+
+/// The answer to a decision that is not a redirect.
+pub fn stopped(
+    decision: Decision<'_>,
+    pages: Option<(Option<&[u8]>, &DomainSettings)>,
+    path: &str,
+) -> (Response, Outcome) {
+    match decision {
+        Decision::NotFound | Decision::Redirect(_) => {
+            error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT)
+        }
+        Decision::Expired => error_page(PageKind::Gone, pages, path, EXPIRED_TEXT),
+        Decision::GeoBlocked {
+            fallback: Some(url),
+        } => (location(302, url, None, None), Outcome::GeoBlocked),
+        Decision::GeoBlocked { fallback: None } => (
+            plain(
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                "this link is not available in your region\n",
+            ),
+            Outcome::GeoBlocked,
+        ),
+    }
+}
+
 /// Evaluates a request for `path` (without the leading `/`, as sent) with
 /// the query string `query` (without the `?`). Separate from the handler so
 /// tests and benchmarks can call it without a socket.
@@ -174,83 +305,34 @@ pub async fn handle(
     headers: &HeaderMap,
     peer: IpAddr,
 ) -> (Response, Outcome) {
-    let host_header = request_host(app, headers, peer);
-    let route = app.domains.route(host_header, &app.cfg.default_host);
-    let site = match &route {
-        Route::Default => None,
-        Route::Domain(site) => Some(site),
-        Route::Unavailable => return (unavailable(), Outcome::Unavailable),
+    let found = match locate(app, path, headers, peer).await {
+        Ok(found) => found,
+        Err(answer) => return answer,
     };
-    let pages = site.map(|s| (host_header, &s.settings));
-    let code = match (target(path, site.map(|s| &s.settings)), site) {
-        (Target::Code(code), _) => code,
-        (Target::Root, Some(s)) => match &s.settings.root_url {
-            Some(url) => return (location(302, url, None, None), Outcome::Root),
-            None => return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT),
-        },
-        (Target::Miss, Some(_)) => {
-            return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
-        }
-        (Target::AppFile(file), Some(s)) => match app_file(file, &s.settings.apps) {
-            Some(body) => return (json_file(body), Outcome::AppFile),
-            None => return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT),
-        },
-        // The default domain: `/` and paths with a `/` were never
-        // redirects, and are answered as unknown paths, as before.
-        (_, None) if path.is_empty() || path.contains('/') => {
-            return (ApiError::not_found().into_response(), Outcome::NotFound);
-        }
-        (_, None) => return error_page(PageKind::NotFound, None, path, EXPIRED_TEXT),
-    };
-    let key = site.map(|s| link_key(Some(s.id), &code));
-    let link = match app.resolver.resolve(key.as_deref().unwrap_or(&code)).await {
-        Resolved::Found(link) => link,
-        Resolved::NotFound => {
-            return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
-        }
-        Resolved::Unavailable => return (unavailable(), Outcome::Unavailable),
-    };
-    let country = visitor_country(app, headers, peer);
+    let link = &found.link;
+    let pages = found.pages();
     let cookies: Vec<&[u8]> = headers
         .get_all(header::COOKIE)
         .iter()
         .map(HeaderValue::as_bytes)
         .collect();
-    let raw = |name| headers.get(name).map(HeaderValue::as_bytes);
-    let visit = Visit {
-        now_ms: now_ms(),
-        country,
-        region: visitor_region(app, headers, peer),
-        user_agent: raw(header::USER_AGENT),
-        accept_language: raw(header::ACCEPT_LANGUAGE),
-        referer: raw(header::REFERER),
-        query: query.map(str::as_bytes),
-        cookies: &cookies,
-        random: fast_random(),
-    };
-    let settings = Settings {
-        signer: &app.signer,
-        cookie_secure: app.cfg.cookie_secure,
-    };
-    let redirect = match evaluate(&link, &visit, &settings) {
-        Decision::NotFound => {
-            return error_page(PageKind::NotFound, pages, path, EXPIRED_TEXT);
-        }
-        Decision::Expired => return error_page(PageKind::Gone, pages, path, EXPIRED_TEXT),
-        Decision::GeoBlocked {
-            fallback: Some(url),
-        } => return (location(302, url, None, None), Outcome::GeoBlocked),
-        Decision::GeoBlocked { fallback: None } => {
-            return (
-                plain(
-                    StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-                    "this link is not available in your region\n",
-                ),
-                Outcome::GeoBlocked,
-            );
-        }
+    let (visit, settings) = visit_settings(app, query, headers, peer, &cookies);
+    if found.preview {
+        let own = path.strip_suffix('+').unwrap_or(path);
+        return match preview(link, own, &visit, &settings) {
+            Ok(page) => (protect::html(StatusCode::OK, page), Outcome::Preview),
+            Err(decision) => stopped(decision, pages, path),
+        };
+    }
+    let redirect = match evaluate(link, &visit, &settings) {
         Decision::Redirect(r) => r,
+        other => return stopped(other, pages, path),
     };
+    // Disabled, expired and geo-blocked links answered as they would
+    // without protection; a protected one asks before it redirects.
+    if link.is_protected() && !protect::granted(app, link, &cookies) {
+        return (protect::gate(link, None), Outcome::Gate);
+    }
     if redirect.needs_admission {
         match app.limiter.admit(link.id).await {
             Admit::Yes => {}
@@ -260,7 +342,7 @@ pub async fn handle(
             Admit::Unavailable => return (unavailable(), Outcome::Unavailable),
         }
     }
-    record_click(app, &link, headers, peer, country);
+    record_click(app, link, headers, peer, visit.country);
     let cookie = redirect
         .set_cookie
         .as_deref()

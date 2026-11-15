@@ -195,6 +195,7 @@ fn link(id: i64, code: String, state: State) -> Link {
         unhealthy: vec![false],
         rules: Default::default(),
         app: Default::default(),
+        protection: Default::default(),
     }
 }
 

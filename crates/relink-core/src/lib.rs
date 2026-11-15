@@ -7,6 +7,7 @@ pub mod classify;
 pub mod code;
 pub mod deeplink;
 pub mod destination;
+pub mod gate;
 pub mod hex;
 pub mod host;
 pub mod model;

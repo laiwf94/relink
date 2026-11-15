@@ -152,6 +152,7 @@ async fn reconciliation_repairs_drift() {
                 health_check: false,
                 rules: Default::default(),
                 app: Default::default(),
+                protection: Default::default(),
                 domain: None,
             },
             7,
@@ -580,4 +581,88 @@ async fn outbox_entries_queued_before_the_migration_keep_working() {
         .collect();
     due.sort();
     assert_eq!(due, ["host:go.example.com", "link:promo"]);
+}
+
+#[tokio::test]
+async fn protected_links_are_never_published() {
+    let Some(admin) = admin_url() else { return };
+    let (addr, kv) = fake_kv().await;
+    let base = format!("http://{addr}/client/v4");
+    let mut h = Harness::start(
+        &admin,
+        &[
+            ("RELINK_KV_ACCOUNT_ID", "acct1"),
+            ("RELINK_KV_NAMESPACE_ID", "ns1"),
+            ("RELINK_KV_API_TOKEN", TOKEN),
+            ("RELINK_KV_API_BASE", &base),
+            ("RELINK_KV_POLL_MS", "50"),
+        ],
+    )
+    .await;
+    let drained = || async {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM kv_outbox")
+            .fetch_one(h.store.pool())
+            .await
+            .unwrap();
+        n == 0
+    };
+    h.create(json!({"url": "https://example.com/open", "alias": "open-door"}))
+        .await;
+    h.create(
+        json!({"url": "https://example.com/shut", "alias": "shut-door",
+                    "protection": {"password": "sesame!"}}),
+    )
+    .await;
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            record(&kv, "open-door").is_some() && drained().await
+        })
+        .await
+    );
+    assert!(record(&kv, "shut-door").is_none());
+
+    // Protecting a published link takes it off the edge; unprotecting it
+    // puts it back.
+    let set = |code: &'static str, body: Value| {
+        let h = &h;
+        async move {
+            let (status, b) = h
+                .api(
+                    Method::PATCH,
+                    &format!("/v1/links/{code}"),
+                    &h.alice,
+                    Some(body),
+                )
+                .await;
+            assert_eq!(status, 200, "{b}");
+        }
+    };
+    set("open-door", json!({"protection": {"consent": "Sure?"}})).await;
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            record(&kv, "open-door").is_none()
+        })
+        .await,
+        "a protected link must leave KV"
+    );
+    set("shut-door", json!({"protection": null})).await;
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            record(&kv, "shut-door").is_some()
+        })
+        .await,
+        "an unprotected link must reach KV"
+    );
+    let text = kv
+        .values
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<String>();
+    assert!(
+        !text.contains("argon2") && !text.contains("protection"),
+        "{text}"
+    );
+    h.shutdown().await;
 }

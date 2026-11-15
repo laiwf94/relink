@@ -436,6 +436,7 @@ pub fn new_link_for(owner: &str, alias: &str) -> relink_server::store::NewLink {
         health_check: false,
         rules: Default::default(),
         app: Default::default(),
+        protection: Default::default(),
         domain: None,
     }
 }

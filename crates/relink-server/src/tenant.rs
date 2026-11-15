@@ -40,7 +40,7 @@ use crate::schedule::{self, Source};
 use crate::server::App;
 use crate::store::{
     Bucket, DayStats, Db, DbError, LinkPatch, NewLink, STATS_COUNTRY, STATS_DEVICE, STATS_REFERRER,
-    STATS_TOP_N, Stats, StoredLink, api_columns, columns, geo_columns,
+    STATS_TOP_N, Stats, StoredLink, api_columns, columns, geo_columns, protection_columns,
 };
 
 /// `WHERE` clause finding a link by code (`$1`) on a domain named by its
@@ -309,6 +309,7 @@ impl<'a> Tenant<'a> {
                 .clone()
                 .unwrap_or_else(|| crate::code::random_code(code_len));
             let (geo_mode, geo_countries) = geo_columns(new.geo.as_ref());
+            let (hash, attempts, consent) = protection_columns(&new.protection);
             let res = self
                 .db
                 .timed(async {
@@ -350,8 +351,9 @@ impl<'a> Tenant<'a> {
                     let row = sqlx::query(concat!(
                         "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
                          max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-                         domain_id, rules, app) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                         domain_id, rules, app, password_hash, password_attempts, consent) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                         $15, $16, $17) \
                          RETURNING ",
                         api_columns!()
                     ))
@@ -369,6 +371,9 @@ impl<'a> Tenant<'a> {
                     .bind(domain_id)
                     .bind(Json(&new.rules))
                     .bind(new.app.as_ref().map(Json))
+                    .bind(hash)
+                    .bind(attempts)
+                    .bind(consent)
                     .fetch_one(&mut *tx)
                     .await?;
                     let mut link = self.db.row_to_link(&row)?;
@@ -495,14 +500,19 @@ impl<'a> Tenant<'a> {
         if let Some(a) = &patch.app {
             link.app = a.clone();
         }
+        if let Some(p) = &patch.protection {
+            link.protection = p.apply(&link.protection);
+        }
         let (geo_mode, geo_countries) = geo_columns(link.geo.as_ref());
+        let (hash, attempts, consent) = protection_columns(&link.protection);
         let row = sqlx::query(concat!(
             "UPDATE links SET destinations = $2, \
              destinations_version = destinations_version + CASE WHEN $3 THEN 1 ELSE 0 END, \
              health_failures = CASE WHEN $3 THEN '{}'::smallint[] ELSE health_failures END, \
              redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
              geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
-             rules = $12, app = $13, updated_at = now() WHERE id = $1 RETURNING ",
+             rules = $12, app = $13, password_hash = $14, password_attempts = $15, \
+             consent = $16, updated_at = now() WHERE id = $1 RETURNING ",
             api_columns!()
         ))
         .bind(link.id)
@@ -518,6 +528,9 @@ impl<'a> Tenant<'a> {
         .bind(link.health_check)
         .bind(Json(&link.rules))
         .bind(link.app.as_ref().map(Json))
+        .bind(hash)
+        .bind(attempts)
+        .bind(consent)
         .fetch_one(&mut **tx)
         .await?;
         let mut updated = self.db.row_to_link(&row)?;

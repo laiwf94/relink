@@ -95,10 +95,20 @@ pub enum Outcome {
     App,
     /// A custom domain's app association file.
     AppFile,
+    /// A link's preview page (`/{code}+`).
+    Preview,
+    /// A protected link's password or consent page, shown.
+    Gate,
+    /// A protected link's form accepted: the visitor is let through.
+    GateAccepted,
+    /// A wrong password, or a form without the consent.
+    GateRejected,
+    /// A password refused unchecked: the link's attempts are used up.
+    GateLocked,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 10] = [
+    const ALL: [Outcome; 15] = [
         Outcome::Redirect,
         Outcome::Fallback,
         Outcome::NotFound,
@@ -109,6 +119,11 @@ impl Outcome {
         Outcome::Rule,
         Outcome::App,
         Outcome::AppFile,
+        Outcome::Preview,
+        Outcome::Gate,
+        Outcome::GateAccepted,
+        Outcome::GateRejected,
+        Outcome::GateLocked,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -122,6 +137,11 @@ impl Outcome {
             Outcome::Rule => "rule",
             Outcome::App => "app",
             Outcome::AppFile => "app_file",
+            Outcome::Preview => "preview",
+            Outcome::Gate => "gate",
+            Outcome::GateAccepted => "gate_accepted",
+            Outcome::GateRejected => "gate_rejected",
+            Outcome::GateLocked => "gate_locked",
         }
     }
 }

@@ -182,6 +182,7 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
     let cacheable = link.geo.is_none()
         && link.rules.is_empty()
         && link.app.is_empty()
+        && !link.is_protected()
         && link.destinations.len() == 1
         && link.max_clicks.is_none()
         && link.expires_at.is_none()
@@ -242,6 +243,7 @@ mod tests {
             unhealthy: vec![false; urls.len()],
             rules: RuleSet::default(),
             app: Default::default(),
+            protection: Default::default(),
         }
     }
 

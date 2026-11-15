@@ -25,6 +25,7 @@ use crate::limiter::{LeaseStore, StoreUnavailable};
 use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
 use relink_core::deeplink::AppLink;
+use relink_core::gate::{DEFAULT_MAX_ATTEMPTS, Protection};
 use relink_core::rules_v2::RuleSet;
 use relink_core::wire::{domain_kv_key, host_kv_key, kv_key};
 
@@ -33,7 +34,8 @@ macro_rules! columns {
     () => {
         "id, code, owner, workspace_id, domain_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-         health_failures, health_checked_at, created_at, updated_at, rules, app, version"
+         health_failures, health_checked_at, created_at, updated_at, rules, app, version, \
+         password_hash, password_attempts, consent"
     };
 }
 pub(crate) use columns;
@@ -224,6 +226,8 @@ pub struct NewLink {
     pub rules: RuleSet,
     /// App targets for phones, validated by the API.
     pub app: Option<AppLink>,
+    /// A password (already hashed) and consent page, validated by the API.
+    pub protection: Protection,
     /// The verified custom domain (hostname) to create the link on, or
     /// `None` for the default domain.
     pub domain: Option<String>,
@@ -245,6 +249,61 @@ pub struct LinkPatch {
     pub rules: Option<RuleSet>,
     /// New app targets, or `Some(None)` to remove them.
     pub app: Option<Option<AppLink>>,
+    /// Changes to the password and consent page.
+    pub protection: Option<ProtectionPatch>,
+}
+
+/// A change to a link's [`Protection`]; each field as in [`LinkPatch`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProtectionPatch {
+    /// A new argon2id hash, or `Some(None)` to remove the password.
+    pub password_hash: Option<Option<String>>,
+    /// A new attempt limit; ignored while the link has no password.
+    pub max_attempts: Option<u32>,
+    /// New consent text, or `Some(None)` to remove the consent page.
+    pub consent: Option<Option<String>>,
+}
+
+impl ProtectionPatch {
+    /// Removes the password and the consent page.
+    pub const CLEAR: ProtectionPatch = ProtectionPatch {
+        password_hash: Some(None),
+        max_attempts: None,
+        consent: Some(None),
+    };
+
+    /// `current` with this change applied. A new password without a limit
+    /// gets the default one; removing the password removes its limit.
+    pub fn apply(&self, current: &Protection) -> Protection {
+        let mut p = current.clone();
+        if let Some(h) = &self.password_hash {
+            if h.is_some() && p.password_hash.is_none() {
+                p.max_attempts = Some(DEFAULT_MAX_ATTEMPTS);
+            }
+            p.password_hash = h.clone();
+        }
+        if let Some(n) = self.max_attempts {
+            p.max_attempts = Some(n);
+        }
+        if let Some(c) = &self.consent {
+            p.consent = c.clone();
+        }
+        p.password = p.password_hash.is_some();
+        if !p.password {
+            p.max_attempts = None;
+        }
+        p
+    }
+}
+
+/// The columns a [`Protection`] is stored in: the hash, the attempt limit
+/// and the consent text.
+pub(crate) fn protection_columns(p: &Protection) -> (Option<&str>, Option<i32>, Option<&str>) {
+    (
+        p.password_hash.as_deref(),
+        p.password_hash.as_ref().map(|_| p.attempt_limit() as i32),
+        p.consent.as_deref(),
+    )
 }
 
 /// An active API key as stored, with its owner's role in its workspace.
@@ -574,6 +633,17 @@ impl Db {
         let app: Option<AppLink> = row
             .try_get::<Option<Json<AppLink>>, _>("app")?
             .map(|Json(a)| a);
+        let password_hash: Option<String> = row.try_get("password_hash")?;
+        let attempts: Option<i32> = row.try_get("password_attempts")?;
+        let protection = Protection {
+            password: password_hash.is_some(),
+            max_attempts: password_hash
+                .as_ref()
+                .and(attempts)
+                .and_then(|n| u32::try_from(n).ok()),
+            consent: row.try_get("consent")?,
+            password_hash,
+        };
         let link = Link {
             id: row.try_get("id")?,
             code: row.try_get("code")?,
@@ -589,6 +659,7 @@ impl Db {
             unhealthy,
             rules,
             app: app.as_ref().map(AppLink::compile).unwrap_or_default(),
+            protection,
         };
         Ok(StoredLink {
             link,
@@ -669,6 +740,32 @@ impl Db {
                 Err(_) => return Err(DbError::Unavailable("query timed out".into())),
             }
         }
+    }
+
+    /// Takes one password attempt for link `id`, which accepts `limit` an
+    /// hour (migration 0019): `None` when it may go ahead, otherwise the
+    /// seconds until attempts are allowed again. Shared by every instance.
+    pub async fn password_attempt(&self, id: i64, limit: u32) -> Result<Option<u32>, DbError> {
+        let wait: i32 = self
+            .timed(
+                sqlx::query_scalar("SELECT relink_password_attempt($1, $2)")
+                    .bind(id)
+                    .bind(limit as i32)
+                    .fetch_one(&self.pool),
+            )
+            .await?;
+        Ok((wait > 0).then_some(wait as u32))
+    }
+
+    /// Gives back the attempt a right password took.
+    pub async fn password_refund(&self, id: i64) -> Result<(), DbError> {
+        self.timed(
+            sqlx::query("SELECT relink_password_refund($1)")
+                .bind(id)
+                .execute(&self.pool),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Records that link `code` on `domain_id` changed, inside the caller's
