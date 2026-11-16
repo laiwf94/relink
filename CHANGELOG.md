@@ -5,6 +5,87 @@ issue has the details of every task.
 
 ## Unreleased
 
+### Week 3 (2026-11-16 to 2026-11-22): targeting rules, deep links, versions, schedules and protected links (#24)
+
+Added:
+
+- **Targeting rules.** Links take `rules`: an ordered list of
+  `{"if": condition, "url": ...}`. Conditions combine `all`, `any` and
+  `not` over country, ISO 3166-2 region, device, OS, browser, preferred
+  language, referrer host, time window (instants, weekdays and hours at a
+  UTC offset) and query parameters. `relink_core::rules_v2` compiles a list
+  to a flat decision list with forward jumps only. A list may hold at most
+  64 leaf conditions, so no visit tests more than 64. The API refuses a bad
+  list with the JSON path of the part at fault (migration 0016).
+- **Rules on the redirect path, at the origin and the edge.** The origin
+  compiles a link's rules once, when the row enters its cache. KV records
+  carry the compiled decision list, which the Worker checks but never
+  compiles. Both read the same facts: region (`RELINK_REGION_HEADER`,
+  trusted only from `RELINK_TRUSTED_PROXIES`), User-Agent,
+  Accept-Language, Referer and the query string, which the Worker now
+  forwards. Answers from links with rules are `no-store`. A one-leaf list
+  takes about 26 ns; the worst case, 64 leaves with every fact read, takes
+  about 0.8 µs.
+- **Mobile deep links.** Custom domains take `apps` and serve
+  `apple-app-site-association` (at both paths) and `assetlinks.json` for
+  them. Links take `app` targets: iPhones and iPads go to the App Store, and
+  Android browsers get an intent URL that opens the app or falls back to
+  the store. The origin and the edge both do this, and the Worker reads
+  only the pre-built `Location` values and files (migration 0017).
+- **Version history and schedules.** Every change to a link is a version,
+  built by the database in the same transaction (the newest 100 are kept).
+  New routes: `GET /v1/links/{code}/versions`,
+  `POST /v1/links/{code}/rollback`, and `POST/GET/DELETE` on
+  `/v1/links/{code}/schedules`, which swap destinations or enable or
+  disable a link at a set time. A scheduler on every instance applies each
+  change exactly once, using `FOR UPDATE SKIP LOCKED`, and applies changes
+  that fell due during a database outage once it is back
+  (`RELINK_SCHEDULE_POLL_MS`, migration 0018).
+- **Protected links.** `protection` sets a password, a consent text or
+  both. Passwords are hashed with argon2id (19 MiB, t=2), with at most two
+  hashes at once. Wrong guesses are limited per link per hour across
+  instances (`max_attempts`, default 10), after which the link answers 429.
+  A signed grant cookie lets the visitor through, and any change of
+  password or text revokes it. Protected links are never published to KV,
+  so the edge forwards their forms to the origin (migration 0019).
+- **Previews.** `/{code}+` shows where a link goes without a click, at the
+  origin and rendered from KV at the edge. A protected link's preview says
+  only that it is protected.
+- **End to end.** `tests/smart_links.rs` walks the whole week on two
+  instances, with the edge's own request logic in front of them:
+  - association files
+  - 16 kinds of visitor routed alike by rules and app targets
+  - an edit, a scheduled swap that both schedulers race to apply, and a
+    rollback, each followed by the edge
+  - a password and consent page, with its attempt limit shared across
+    instances and its grant working at both
+  - previews and the audit chain
+
+  `examples/demo.sh` has a new step 7 showing the same from the command
+  line.
+- **Tests.** A property test compares the compiled rules with a naive
+  tree-walking interpreter over 100,000 generated requests, in all three
+  forms the rules are loaded. Another requires the origin and the edge to
+  give equal answers for random rule lists. 31 invalid-rule and 15
+  invalid-app cases are tested through the API.
+
+Changed:
+
+- The Worker forwards the visitor's query string, `Accept-Language`, region
+  and POSTed forms (at most 4 KiB) to the origin.
+- `Link.expires_at` is parsed with chrono's strict RFC 3339 parser, which
+  keeps the Worker bundle under 250 KB gzipped (246,885 to 247,272 bytes,
+  depending on the toolchain).
+- `apple-app-site-association` is a reserved word.
+
+Fixed:
+
+- Adding a redirect outcome or a database operation panicked, because
+  their metric counters were fixed-size arrays. They are now sized from the
+  enums.
+- Newer clippy refused a `Result` with a large error on the redirect path.
+  The redirect path now uses an explicit `Routed` enum.
+
 ### Week 2 (2026-11-09 to 2026-11-15): custom domains, verification, automatic TLS and per-domain behaviour (#23)
 
 Added:

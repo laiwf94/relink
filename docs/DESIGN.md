@@ -1123,6 +1123,47 @@ mostly the preview page and the form forwarding.
 `gate_accepted`, `gate_rejected` (a wrong password or missing consent),
 `gate_locked` and `preview`.
 
+### A routed link, start to finish
+
+Week 3's features meet on one visit, in this order, at the origin and at
+the edge alike:
+
+1. **Which link.** `site` reads the path on the host: a code, a
+   `/{code}+` preview, or on a custom domain one of its app association
+   files, which are answered from the domain's record without a link.
+2. **May they.** A protected link shows its password or consent page
+   until the visitor holds a grant cookie for its current password and
+   text. Only the origin holds the hash, so the edge forwards these.
+3. **Is it live.** Disabled, expired, click-limited and geo rules answer
+   as they did before.
+4. **Targeting rules.** The compiled decision list runs over the visit's
+   facts; the first rule that holds picks the destination.
+5. **App targets.** With no rule holding, iPhones and iPads go to the App
+   Store and Android browsers to the intent URL with its store fallback.
+6. **Destinations.** Everyone else gets the link's own destinations, with
+   A/B and health checks as before.
+
+Any answer from steps 4 and 5, or from a link that has either, is
+`no-store`, so no cache keeps an answer meant for another visitor. Edits,
+rollbacks and applied schedules all go through the `PATCH` path. They
+update the cache on every instance, notify the other instances and queue
+the KV record, so the next visit at either target sees the new version.
+
+`tests/smart_links.rs` walks this on two instances, with the edge's
+request logic in front of them reading what the KV sync published:
+
+- a verified domain's association files
+- a link with rules over every kind of fact and app targets, giving 16
+  visitors the same answer from either instance and the edge (the edge
+  answers all of them itself)
+- an edit, a schedule both schedulers race to apply, and a rollback, each
+  followed by the edge
+- a password and consent page that the edge never holds, wrong guesses
+  limited across instances, and a grant that works at both
+- previews, and the audit chain verified by the binary
+
+Step 7 of `examples/demo.sh` shows the same from the command line.
+
 ## Click limits without a write per click
 
 This is escrow (O'Neil, "The Escrow Transactional Method"). Each instance

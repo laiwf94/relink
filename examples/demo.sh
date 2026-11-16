@@ -4,10 +4,12 @@
 # stats, then workspace isolation, scoped and rotated API keys, a plan limit
 # and the audit chain, then a custom domain proved by a DNS TXT record (from
 # a one-record DNS server, examples/txt-dns.py) with its own codes, root
-# redirect, path prefix, case-free codes and 404 and 410 pages, then stops
-# Postgres to show redirects still being
-# served from memory while writes fail cleanly, and finally restarts Postgres
-# to show recovery.
+# redirect, path prefix, case-free codes and 404 and 410 pages, then a link
+# on that domain with targeting rules, app links for iPhones and Android, a
+# version history with a scheduled swap and a rollback, a password and
+# consent page and a preview, then stops Postgres to show redirects still
+# being served from memory while writes fail cleanly, and finally restarts
+# Postgres to show recovery.
 #
 # Needs: docker, cargo, curl, python3. Uses ports 18080, 19090 and 55432 by
 # default (RELINK_DEMO_PORT, RELINK_DEMO_ADMIN_PORT, RELINK_DEMO_PG_PORT),
@@ -37,6 +39,7 @@ export RELINK_DB_TIMEOUT_MS=1000
 # curl plays the CDN here, so loopback is the trusted proxy.
 export RELINK_TRUSTED_PROXIES="127.0.0.1,::1"
 export RELINK_COUNTRY_HEADER=cf-ipcountry
+export RELINK_REGION_HEADER=cf-region-code
 # Custom domains are proved against the demo's own DNS server.
 export RELINK_DNS_SERVERS="127.0.0.1:$DNS_PORT"
 
@@ -61,6 +64,10 @@ on_domain() { # path -> "status location-or-body" as seen on $DOMAIN
 import sys
 out = sys.stdin.read().rsplit(" ", 2)
 print(out[1], out[2] or out[0])'
+}
+as_visitor() { # path [curl args...] -> "status location" on $DOMAIN
+  local path="$1"; shift
+  curl -sS -o /dev/null -w '%{http_code} %header{location}' -H "Host: $DOMAIN" "$@" "$URL/$path"
 }
 follow() { # code [curl args...] -> "status location"
   local code="$1"; shift
@@ -170,7 +177,53 @@ on_domain flash >/dev/null
 echo "   /flash after its click -> $(on_domain flash)"
 echo "   certificate: $(api GET "/v1/domains/$DOMAIN" | field "['certificate']['status']") (set RELINK_ACME_DIRECTORY to have one issued)"
 
-echo "== 7. Stop Postgres"
+echo "== 7. Targeting rules, app links, versions, a schedule and a protected link"
+api PATCH "/v1/domains/$DOMAIN" '{"apps":{
+  "ios":[{"team_id":"ABCDE12345","bundle_id":"net.relinkdemo.app"}],
+  "android":[{"package":"net.relinkdemo.app","sha256_cert_fingerprints":
+    ["14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5"]}]}}' >/dev/null
+echo "   /.well-known/apple-app-site-association -> appIDs $(curl -sS -H "Host: $DOMAIN" \
+  "$URL/.well-known/apple-app-site-association" | field "['applinks']['details'][0]['appIDs']")"
+echo "   /.well-known/assetlinks.json            -> package $(curl -sS -H "Host: $DOMAIN" \
+  "$URL/.well-known/assetlinks.json" | field "[0]['target']['package_name']")"
+api POST /v1/links "{\"url\":\"https://example.com/launch\",\"alias\":\"launch\",\"domain\":\"$DOMAIN\",
+  \"rules\":[
+    {\"if\":{\"all\":[{\"country\":[\"DE\",\"AT\"]},{\"language\":[\"de\"]}]},\"url\":\"https://example.com/de/launch\"},
+    {\"if\":{\"region\":[\"US-CA\"]},\"url\":\"https://example.com/launch-party-sf\"},
+    {\"if\":{\"query\":{\"name\":\"utm_source\",\"values\":[\"newsletter\"]}},\"url\":\"https://example.com/subscribers\"}],
+  \"app\":{\"ios\":{\"store_url\":\"https://apps.apple.com/app/id6400000001\"},
+         \"android\":{\"package\":\"net.relinkdemo.app\",\"url\":\"relinkdemo://launch\"}}}" >/dev/null
+IPHONE='Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1'
+PIXEL='Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36'
+echo "   launch, German in Germany    -> $(as_visitor launch -H 'cf-ipcountry: DE' -H 'Accept-Language: de-DE,de;q=0.9')"
+echo "   launch, English in Germany   -> $(as_visitor launch -H 'cf-ipcountry: DE' -H 'Accept-Language: en-GB')"
+echo "   launch, from California      -> $(as_visitor launch -H 'cf-ipcountry: US' -H 'cf-region-code: CA')"
+echo "   launch?utm_source=newsletter -> $(as_visitor 'launch?utm_source=newsletter')"
+echo "   launch, iPhone               -> $(as_visitor launch -A "$IPHONE")"
+echo "   launch, Android              -> $(as_visitor launch -A "$PIXEL" | cut -c1-80)..."
+echo "   cache-control: $(curl -sS -o /dev/null -D - -H "Host: $DOMAIN" "$URL/launch" | tr -d '\r' | sed -n 's/^cache-control: //Ip') (answers that depend on the visitor are never cached)"
+api PATCH "/v1/links/launch?domain=$DOMAIN" '{"url":"https://example.com/launch-v2"}' >/dev/null
+RUN_AT=$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(seconds=2)).isoformat())')
+api POST "/v1/links/launch/schedules?domain=$DOMAIN" \
+  "{\"run_at\":\"$RUN_AT\",\"destinations\":[{\"url\":\"https://example.com/launch-live\"}]}" >/dev/null
+echo "   edited, then a swap scheduled in 2 s: now -> $(as_visitor launch)"
+for _ in $(seq 1 40); do case "$(as_visitor launch)" in *launch-live) break;; esac; sleep 0.25; done
+echo "   after the schedule ran                   -> $(as_visitor launch)"
+api POST "/v1/links/launch/rollback?domain=$DOMAIN" '{"version":1}' >/dev/null
+echo "   rolled back to version 1                 -> $(as_visitor launch)"
+echo "   versions: $(api GET "/v1/links/launch/versions?domain=$DOMAIN" | python3 -c 'import sys, json
+print(", ".join("%d %s" % (v["version"], v["source"]) for v in json.load(sys.stdin)["versions"]))')"
+echo "   preview /launch+ -> $(curl -sS -H "Host: $DOMAIN" "$URL/launch+" | grep -o 'https://example.com/launch' | head -1) (no click counted)"
+api POST /v1/links "{\"url\":\"https://example.com/press-kit\",\"alias\":\"press-kit\",\"domain\":\"$DOMAIN\",
+  \"protection\":{\"password\":\"embargo\",\"max_attempts\":3,\"consent\":\"Under embargo until launch.\"}}" >/dev/null
+echo "   press-kit                    -> $(as_visitor press-kit) (the password and consent page)"
+echo "   wrong password               -> $(as_visitor press-kit -d 'password=guess&consent=yes')"
+JAR="$(mktemp -t relink-demo-jar.XXXXXX)"
+echo "   right password and consent   -> $(as_visitor press-kit -c "$JAR" -d 'password=embargo&consent=yes')"
+echo "   press-kit with the grant     -> $(as_visitor press-kit -b "$JAR")"
+rm -f "$JAR"
+
+echo "== 8. Stop Postgres"
 docker stop "$PG_NAME" >/dev/null
 echo "   $RANDOM_CODE          -> $(follow "$RANDOM_CODE")   (served from memory)"
 echo "   summer-sale      -> $(follow summer-sale)"
@@ -179,7 +232,7 @@ echo "   create link      -> HTTP $(status POST /v1/links '{"url":"https://examp
 echo "   not cached       -> $(follow never-seen)"
 echo "   readyz           -> $(curl -sS "$URL/readyz")"
 
-echo "== 8. Start Postgres again"
+echo "== 9. Start Postgres again"
 docker start "$PG_NAME" >/dev/null
 for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 0.5; done
 for _ in $(seq 1 40); do [ "$(status POST /v1/links '{"url":"https://example.com/new"}')" = 201 ] && break; sleep 0.5; done
