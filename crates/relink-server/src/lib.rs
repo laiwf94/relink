@@ -37,6 +37,7 @@ pub mod kvsync;
 pub mod limiter;
 pub mod metrics;
 pub mod oidc;
+pub mod partitions;
 pub mod protect;
 pub mod quota;
 pub mod ratelimit;

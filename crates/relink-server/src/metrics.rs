@@ -346,6 +346,10 @@ pub struct Metrics {
     pub schedules_applied: Counter,
     /// Scheduled link changes that could not be applied and were marked failed.
     pub schedules_failed: Counter,
+    /// Monthly partitions of click_events created by the partition manager.
+    pub partitions_created: Counter,
+    /// Monthly partitions of click_events dropped for retention.
+    pub partitions_dropped: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -391,6 +395,8 @@ impl Default for Metrics {
             late_visitors: Counter::default(),
             schedules_applied: Counter::default(),
             schedules_failed: Counter::default(),
+            partitions_created: Counter::default(),
+            partitions_dropped: Counter::default(),
             backlog: AtomicU64::new(0),
         }
     }
@@ -507,7 +513,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 31] = [
+        let counters: [(&str, &str, u64); 33] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -587,6 +593,16 @@ impl Metrics {
                 "relink_schedules_failed_total",
                 "Scheduled link changes that could not be applied and were marked failed.",
                 self.schedules_failed.get(),
+            ),
+            (
+                "relink_click_partitions_created_total",
+                "Monthly click event partitions created.",
+                self.partitions_created.get(),
+            ),
+            (
+                "relink_click_partitions_dropped_total",
+                "Monthly click event partitions dropped because they were older than the retention.",
+                self.partitions_dropped.get(),
             ),
             (
                 "relink_lookups_coalesced_total",

@@ -52,6 +52,7 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `visitor_daily` | Visitor hashes for unique counts, today and yesterday only. |
 | `visitor_rollup` | Unique visitor counts for older days. |
 | `visitor_salts` | One random salt per UTC day. |
+| `click_events` | Raw clicks, one row each: time, workspace, link, domain, country, device class, referrer host, visitor hash and a bot flag. Partitioned by UTC calendar month (`click_events_pYYYYMM`); retention drops whole months. |
 | `kv_outbox` | Codes whose KV copy must be rewritten or deleted. |
 | `users` | People who signed in: issuer and subject at the provider, their member name, email address and display name. |
 | `oidc_logins` | Sign-ins between the redirect to the provider and its return: SHA-256 of `state`, nonce, PKCE verifier, return path, expiry. |
@@ -77,6 +78,7 @@ read, so a hand-edited row produces an error instead of a panic.
 | `api_keys (key_hash)` unique | One probe per uncached key. |
 | `click_daily` primary key | The flusher's upsert; stats use its `(link_id, day)` prefix. |
 | `visitor_daily` primary key | `ON CONFLICT DO NOTHING` deduplication; the table holds two days, so the roll-up scan by day stays small. |
+| `click_events (link_id, at)`, `(workspace_id, at)`, on every partition | One link's events over a time range; a workspace's events over a time range, which is also the row-level security predicate. Partition pruning on `at` limits either to the months asked for. |
 | `kv_outbox (next_attempt_at)` | The sync worker's "what is due". |
 | `link_versions (link_id, version)` primary key | A link's history newest first, by keyset; the current version's snapshot for the "did anything change" check; pruning the oldest. |
 | `link_schedules (run_at, id) WHERE state = 'pending'` | The scheduler's "what is due"; finished schedules cost nothing. |
@@ -1445,6 +1447,67 @@ counted in `relink_visitors_dropped_total`; creating a fresh salt for the old
 day would count those visitors twice. Unique visitors are therefore per day
 only.
 
+### Raw events and partitions
+
+The daily aggregates answer one question each. To slice by any dimension
+over any period, every click is also kept as a row in `click_events`
+(migration 0020). The table is partitioned by range on `at`, one partition
+per UTC calendar month, named `click_events_pYYYYMM`.
+
+Retention is in whole months, counting the current one:
+`RELINK_CLICK_EVENTS_RETENTION_MONTHS`, 13 by default, so a full year
+before the current month is always there. Expiring a month is a
+`DROP TABLE` of its partition. It frees the space at once, writes no WAL
+per row, leaves no dead tuples for vacuum and takes the same time for a
+million rows as for ten. A `DELETE ... WHERE at < cutoff` on one large
+table does none of that.
+
+The partition manager (`src/partitions.rs`) runs in every instance's
+housekeeping loop, once a minute. It creates the partitions for the
+current month and the two after it, and drops those older than the
+retention. Months are created two ahead, so a month boundary never finds
+its partition missing, even after the servers were stopped for weeks.
+Without a partition an insert fails, and the table has no default
+partition. A default partition would hide the problem, and Postgres would
+then have to scan it before it could create the missing month.
+
+Each run is one transaction, in which the manager:
+
+- takes `pg_try_advisory_xact_lock`. If another instance holds it, the run
+  does nothing, so instances never race to create the same month;
+- sets `lock_timeout = '1s'`. Creating or dropping a partition takes a
+  strong lock, and Postgres queues every later insert behind a waiting
+  lock request. Behind a long analytics query the run gives up after one
+  second, rolls back everything, and tries again a minute later;
+- creates months through `relink_click_events_partition(date)`. The
+  migration uses the same function for its first three months. It writes
+  the bounds in UTC with an explicit offset, so the session's time zone
+  cannot move a month boundary;
+- drops only partitions whose name is exactly `click_events_p` and six
+  digits. An operator's own partition, for example an archive attached by
+  hand, is reported and left alone.
+
+`relink_click_partitions_created_total` and
+`relink_click_partitions_dropped_total` count the changes.
+
+An event holds no client address, for the same reason the aggregates do.
+`visitor` is the HMAC of the day's salt, the link and the fingerprint,
+the value stored in `visitor_daily`. Two days later the salt is destroyed,
+and from then on nobody can link the hash to an address. Within one link
+and day it still tells visitors apart, which unique counts over any slice
+need.
+
+There is no foreign key to `links`. Checking one would add a lookup to
+every insert, and `ON DELETE CASCADE` would search every partition when a
+link is deleted. Events of a deleted link leave with their month.
+`workspace_id` is stored on each event, so the tenant policy
+(`workspace_id = relink_current_workspace()`) needs no join and uses the
+`(workspace_id, at)` index. Neither policies nor grants pass from a
+partitioned table to its partitions, and `relink_tenant` holds no grant on
+any partition. A tenant transaction therefore reads events only through
+`click_events` and its policy, and reading a partition by name is refused.
+Tenants cannot write events.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -1562,6 +1625,7 @@ and counts the clicks it could not write.
 | Stats range | 366 days, top 50 per dimension |
 | Cache | 100,000 entries |
 | Click queue / backlog | 65,536 clicks / 200,000 aggregated rows |
+| Raw click events | 13 calendar months, the current one included (`RELINK_CLICK_EVENTS_RETENTION_MONTHS`, 1 to 120); partitions created two months ahead |
 | Flush transaction | 5,000 count rows and 5,000 visitor rows |
 | User-Agent scanned | 512 bytes (256 in the fingerprint) |
 | Lookup concurrency | 32 |

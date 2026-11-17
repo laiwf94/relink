@@ -14,6 +14,7 @@ use crate::clicks::FlushConfig;
 use crate::code::{MAX_CODE_LEN, MIN_CODE_LEN};
 use crate::destination::Policy;
 use crate::oidc::OidcConfig;
+use crate::partitions;
 use crate::ratelimit::Rate;
 use crate::tls::TlsConfig;
 use crate::trust::TrustedProxies;
@@ -98,6 +99,8 @@ pub struct Config {
     pub health: HealthConfig,
     /// How often the scheduler looks for due link schedules.
     pub schedule_poll: Duration,
+    /// Calendar months of raw click events kept, the current one included.
+    pub click_events_retention_months: u32,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -156,6 +159,10 @@ impl fmt::Debug for Config {
             .field("flush", &self.flush)
             .field("max_lease", &self.max_lease)
             .field("health", &self.health)
+            .field(
+                "click_events_retention_months",
+                &self.click_events_retention_months,
+            )
             .field("api_rate", &self.api_rate)
             .field("auth_lookup_rate", &self.auth_lookup_rate)
             .field("auth_lookup_rate_per_ip", &self.auth_lookup_rate_per_ip)
@@ -534,6 +541,12 @@ impl Config {
                 batch: v.parse("RELINK_HEALTH_BATCH", 100, 1, 10_000)?,
             },
             schedule_poll: v.millis("RELINK_SCHEDULE_POLL_MS", 1_000, 10, 60_000)?,
+            click_events_retention_months: v.parse(
+                "RELINK_CLICK_EVENTS_RETENTION_MONTHS",
+                13,
+                1,
+                partitions::MAX_RETENTION_MONTHS,
+            )?,
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
                 burst: v.parse("RELINK_API_BURST", 20.0, 1.0, 1_000_000.0)?,

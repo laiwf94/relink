@@ -32,6 +32,7 @@ use crate::kvsync::{CloudflareHostnames, CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
 use crate::metrics::{DbOp, Gauges, Metrics};
 use crate::oidc::{self, Oidc};
+use crate::partitions;
 use crate::protect::{self, Hasher};
 use crate::ratelimit::{KeyedLimiter, Rate};
 use crate::redirect;
@@ -613,7 +614,8 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     }
 }
 
-/// Periodic housekeeping: visitor-hash roll-up and salt deletion, expired
+/// Periodic housekeeping: visitor-hash roll-up and salt deletion, click
+/// event partitions created ahead and dropped past retention, expired
 /// sessions and sign-ins, idle lease return, rate limiter cleanup, and a
 /// reload of the verified domains, pending ACME challenges and certificates
 /// in case a notification was lost (and of the default certificate files,
@@ -629,6 +631,24 @@ async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
         if let Err(e) = app.db.maintain_visitors(utc_day(now_ms())).await {
             app.metrics.db_error(DbOp::Maintenance);
             tracing::warn!(error = %e, "visitor maintenance failed");
+        }
+        let today = utc_day(now_ms());
+        match partitions::maintain(&app.db, today, app.cfg.click_events_retention_months).await {
+            Ok(partitions::Outcome::Done(r)) => {
+                app.metrics.partitions_created.add(r.created.len() as u64);
+                app.metrics.partitions_dropped.add(r.dropped.len() as u64);
+                for m in &r.created {
+                    tracing::info!(partition = %m.table(), "click event partition created");
+                }
+                for m in &r.dropped {
+                    tracing::info!(partition = %m.table(), "click event partition dropped for retention");
+                }
+            }
+            Ok(partitions::Outcome::Busy) => {}
+            Err(e) => {
+                app.metrics.db_error(DbOp::Maintenance);
+                tracing::warn!(error = %e, "click event partition maintenance failed");
+            }
         }
         if let Err(e) = app.db.purge_expired_sessions().await {
             app.metrics.db_error(DbOp::Maintenance);
