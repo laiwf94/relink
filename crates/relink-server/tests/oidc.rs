@@ -739,7 +739,24 @@ async fn bad_session_cookies_and_expiry() {
         .execute(h.store.pool())
         .await
         .unwrap();
-    assert_eq!(h.store.purge_expired_sessions().await.unwrap(), 2);
+    // The instance's own housekeeping runs the same clean-up when it
+    // starts and every minute, and may get to a row first, so the count
+    // here is at most 2; what matters is that nothing expired is left.
+    let purged = h.store.purge_expired_sessions().await.unwrap();
+    assert!(purged <= 2, "purged {purged}");
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM sessions WHERE expires_at <= now()) \
+              + (SELECT count(*) FROM oidc_logins WHERE expires_at <= now())",
+    )
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "expired sessions or sign-ins left behind");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "the expired session row is gone");
     assert_eq!(h.store.purge_expired_sessions().await.unwrap(), 0);
 
     // An instance that has never seen the session refuses it.
