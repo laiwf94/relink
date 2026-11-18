@@ -18,6 +18,7 @@ use relink_server::cache::{Cache, Config as CacheConfig};
 use relink_server::classify::{device_class, referrer_host};
 use relink_server::config::Config;
 use relink_server::destination::{Policy, normalize};
+use relink_server::hll::Hll;
 use relink_server::limiter::{LeaseStore, StoreUnavailable};
 use relink_server::metrics::Metrics;
 use relink_server::model::{Destination, Link};
@@ -217,6 +218,78 @@ fn components(c: &mut Criterion) {
     });
 
     rules(c);
+    sketches(c);
+}
+
+/// HyperLogLog++ unique-visitor sketches: adding a visitor, merging a
+/// month of daily sketches, estimating and the stored form.
+fn sketches(c: &mut Criterion) {
+    let mix = |mut z: u64| {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let sketch = |from: u64, n: u64| {
+        let mut s = Hll::new();
+        for i in from..from + n {
+            s.insert_hash(mix(i));
+        }
+        s
+    };
+    let mut sparse = sketch(0, 1_000);
+    let mut i = 0u64;
+    c.bench_function("hll_insert_sparse_1000", |b| {
+        b.iter(|| {
+            // Re-adding known visitors keeps the sketch at 1,000 entries.
+            i = (i + 7) % 1_000;
+            sparse.insert_hash(mix(i));
+        })
+    });
+    let mut dense = sketch(0, 100_000);
+    c.bench_function("hll_insert_dense", |b| {
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            dense.insert_hash(mix(i));
+        })
+    });
+    c.bench_function("hll_insert_bytes_sha256", |b| {
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            dense.insert(&i.to_le_bytes());
+        })
+    });
+    let small_days: Vec<Hll> = (0..30).map(|d| sketch(d * 50, 100)).collect();
+    c.bench_function("hll_merge_30_sparse_days", |b| {
+        b.iter(|| {
+            let mut total = Hll::new();
+            for d in &small_days {
+                total.merge(d);
+            }
+            total
+        })
+    });
+    let busy_days: Vec<Hll> = (0..30).map(|d| sketch(d * 5_000, 10_000)).collect();
+    c.bench_function("hll_merge_30_dense_days", |b| {
+        b.iter(|| {
+            let mut total = Hll::new();
+            for d in &busy_days {
+                total.merge(d);
+            }
+            total
+        })
+    });
+    c.bench_function("hll_estimate_sparse", |b| b.iter(|| sparse.estimate()));
+    c.bench_function("hll_estimate_dense", |b| b.iter(|| dense.estimate()));
+    let stored = dense.to_bytes();
+    c.bench_function("hll_encode_dense", |b| b.iter(|| dense.to_bytes()));
+    c.bench_function("hll_decode_dense", |b| {
+        b.iter(|| Hll::from_bytes(&stored).unwrap())
+    });
+    let stored_sparse = sparse.to_bytes();
+    c.bench_function("hll_decode_sparse_1000", |b| {
+        b.iter(|| Hll::from_bytes(&stored_sparse).unwrap())
+    });
 }
 
 /// Targeting rules: a typical one-leaf list, and the worst case the bound

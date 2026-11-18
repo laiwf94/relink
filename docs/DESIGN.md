@@ -16,6 +16,8 @@ Out of scope for now: a web console, and storage other than Postgres.
 `relink-core` holds everything that decides what a redirect does: alias and
 URL validation, expiry, the geo rule, health-aware destination choice, A/B
 assignment and the cookie that makes it sticky, and the JSON shape of a link.
+It also holds the HyperLogLog++ sketches for unique counts, so the origin
+and the edge build the same bytes.
 It does no I/O, owns no clock and no random source (callers pass both in), and
 depends only on `url`, `chrono` without its clock, `serde`, `sha2` and `hmac`.
 That is what lets it build for `wasm32-unknown-unknown`, and CI checks that
@@ -1508,6 +1510,74 @@ any partition. A tenant transaction therefore reads events only through
 `click_events` and its policy, and reading a partition by name is refused.
 Tenants cannot write events.
 
+### Unique visitor sketches
+
+Counting unique visitors from `visitor_daily` rows costs a row per visitor
+per link and day, and a count over many links or days has to read and
+de-duplicate all of them. A HyperLogLog sketch holds a fixed amount of state
+per link and period instead, and the sketches of two periods merge into the
+sketch of their union. `relink-core/src/hll.rs` implements HyperLogLog++
+(Heule, Nunkesser and Hall, "HyperLogLog in Practice", EDBT 2013), in the
+core so the edge can build the same bytes:
+
+- **Hash.** 64 bits. Visitor hashes are already uniform keyed hashes, so
+  their first 8 bytes are used as they are (`insert_hash`); any other item
+  goes through the first 8 bytes of SHA-256 (`insert`), which never changes
+  between builds, as stored sketches require.
+- **Dense form.** Precision 14: the first 14 bits pick one of 16,384
+  registers, and a register keeps the longest run of leading zeros, plus
+  one, seen in the remaining 50 bits (0 to 51, 6 bits). In memory a byte per
+  register, 16 KiB; stored packed, 12,288 bytes.
+- **Sparse form.** For small sets, a sorted list of the first 25 bits of
+  each hash, with the run length of the remaining 39 bits kept only when the
+  11 bits after the dense index are all zero (otherwise the dense value can
+  be read from the index itself). The estimate is linear counting over 2^25
+  buckets, which is exact but for two hashes sharing 25 bits: about
+  n²/2^26 pairs, 0.14 at the limit. Past 3,072 entries, where 4 bytes each
+  would outgrow the dense registers, the sketch converts to dense, and
+  converting gives exactly the registers a dense sketch of the same hashes
+  would hold. Most links get far fewer visitors than that per hour or day,
+  so most sketches stay sparse, at 2 to 3 bytes per visitor stored.
+- **Estimate.** The paper corrects the dense estimate with empirical bias
+  tables for each precision. Here the dense estimate is Ertl's improved
+  estimator ("New cardinality estimation algorithms for HyperLogLog
+  sketches", 2017, algorithm 6), computed from the histogram of register
+  values. It needs no tables and is unbiased from a few thousand items to
+  billions. The relative standard error is 1.04/√16384 = 0.81%.
+- **Merge.** Sparse with sparse is the union of two sorted lists, keeping
+  the larger value per index; anything with a dense sketch is a
+  register-wise maximum. A sketch depends only on the set of hashes put
+  into it, not on their order or on how it was assembled from merges, so a
+  merged sketch is byte for byte the sketch of the union. A property test
+  checks this, together with commutativity, associativity and idempotence.
+- **Stored form.** Version, precision and kind bytes, then either the
+  entry count and per entry the varint gap from the previous index (and the
+  run-length byte where there is one), or the packed registers. Decoding
+  refuses anything the encoder could not have written: another version or
+  precision, unsorted or out-of-range indexes, non-minimal varints,
+  impossible values and trailing bytes.
+
+Accuracy is tested against exact counts from fixed seeds
+(`crates/relink-core/tests/hll.rs`). Sparse sketches up to 3,000 items are
+within 0.1% in every trial. From 3,500 to 1,000,000 items, 384 dense
+sketches have an RMS relative error of 0.65% and a bias of −0.03%; the
+worst single sketch is 2.2% off, under three standard errors. Merging 40
+links over 30 days, or 48 trials of 30 overlapping daily sketches, gives the
+sketch of the union exactly, with an RMS error of 0.65%.
+
+The sparse form keeps 25 bits of each hash, enough to test whether a known
+item is in a sketch. Sketches are therefore only ever fed keyed hashes
+whose key is not stored next to them, such as the salted visitor hash,
+never addresses or fingerprints.
+
+On the benchmark machine (4 cores of a 2.1 GHz Xeon; `cargo bench --bench
+hot_path -- hll`), adding a visitor hash takes 3 ns to a dense sketch and
+21 ns to a sparse one with 1,000 entries; through SHA-256, 78 ns. Merging
+30 daily sketches into a month takes 13 µs when they are dense and 38 µs
+when they are sparse with 100 visitors each (the list is rebuilt on every
+merge). A dense estimate takes 11 µs, a sparse one 25 ns. Decoding a stored
+dense sketch takes 10 µs and a 1,000-entry sparse one 2.8 µs.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -1624,6 +1694,7 @@ and counts the clicks it could not write.
 | Page size | 1 to 100, default 50 |
 | Stats range | 366 days, top 50 per dimension |
 | Cache | 100,000 entries |
+| Unique-count sketch | precision 14; sparse up to 3,072 entries (4 bytes each in memory), then dense: 16 KiB in memory, 12,291 bytes stored |
 | Click queue / backlog | 65,536 clicks / 200,000 aggregated rows |
 | Raw click events | 13 calendar months, the current one included (`RELINK_CLICK_EVENTS_RETENTION_MONTHS`, 1 to 120); partitions created two months ahead |
 | Flush transaction | 5,000 count rows and 5,000 visitor rows |
@@ -1694,9 +1765,7 @@ A membership filter (Bloom or cuckoo) of all codes, maintained from the change
 feed, would answer most made-up codes without a query; it needs an answer for
 codes created on another instance before the filter hears about them. The
 miss path is a single-row read by unique key and could go to read replicas,
-with notifications still from the primary. HyperLogLog sketches (Flajolet et
-al., "HyperLogLog: the analysis of a near-optimal cardinality estimation
-algorithm") would replace per-visitor rows with a fixed size per link and day.
+with notifications still from the primary.
 Partitioning `click_daily` by month would make retention a `DROP PARTITION`.
 Per-key rate limits are per instance; a global limit needs a shared counter.
 And at the edge, a link with a click limit could be served from a Durable

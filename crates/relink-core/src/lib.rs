@@ -9,6 +9,7 @@ pub mod deeplink;
 pub mod destination;
 pub mod gate;
 pub mod hex;
+pub mod hll;
 pub mod host;
 pub mod model;
 pub mod netguard;

@@ -53,4 +53,4 @@ pub mod tls;
 pub mod trust;
 pub mod util;
 
-pub use relink_core::{abtest, classify, destination, model, netguard, rules, rules_v2};
+pub use relink_core::{abtest, classify, destination, hll, model, netguard, rules, rules_v2};
