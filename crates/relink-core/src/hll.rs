@@ -333,7 +333,7 @@ impl Hll {
                 let mut out = vec![0u8; HEADER + DENSE_BYTES];
                 out[..HEADER].copy_from_slice(&[FORMAT_VERSION, PRECISION as u8, KIND_DENSE]);
                 let packed = &mut out[HEADER..];
-                for (i, chunk) in regs.chunks_exact(4).enumerate() {
+                for (i, chunk) in regs.as_chunks::<4>().0.iter().enumerate() {
                     let v = chunk[0] as u32
                         | (chunk[1] as u32) << 6
                         | (chunk[2] as u32) << 12
@@ -404,7 +404,7 @@ impl Hll {
                     return Err(DecodeError::TrailingBytes);
                 }
                 let mut regs = vec![0u8; M].into_boxed_slice();
-                for (i, chunk) in body.chunks_exact(3).enumerate() {
+                for (i, chunk) in body.as_chunks::<3>().0.iter().enumerate() {
                     let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
                     for j in 0..4 {
                         let r = ((v >> (6 * j)) & 63) as u8;
