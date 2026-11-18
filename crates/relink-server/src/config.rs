@@ -637,6 +637,7 @@ mod tests {
         assert_eq!(c.dns_servers, None);
         assert_eq!(c.dns_timeout, Duration::from_secs(2));
         assert_eq!(c.acme, None);
+        assert_eq!(c.click_events_retention_months, 13);
         let c = from(&[
             ("RELINK_DATABASE_URL", "postgres://x/y"),
             ("RELINK_PUBLIC_BASE_URL", "https://Go.Example.com:8443"),
@@ -898,6 +899,23 @@ mod tests {
             ],
         ] {
             assert!(from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn click_event_retention_is_bounded() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let max = partitions::MAX_RETENTION_MONTHS.to_string();
+        for (raw, months) in [("1", 1), (" 24 ", 24), (max.as_str(), 120), ("", 13)] {
+            let c = from(&[base, ("RELINK_CLICK_EVENTS_RETENTION_MONTHS", raw)]).unwrap();
+            assert_eq!(c.click_events_retention_months, months, "{raw:?}");
+        }
+        for bad in ["0", "121", "-1", "1.5", "a year"] {
+            let e = from(&[base, ("RELINK_CLICK_EVENTS_RETENTION_MONTHS", bad)]).unwrap_err();
+            assert!(
+                e.starts_with("RELINK_CLICK_EVENTS_RETENTION_MONTHS:"),
+                "{bad:?}: {e}"
+            );
         }
     }
 }
