@@ -86,8 +86,9 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(batch) = serde_json::from_slice::<ClickBatch>(data) {
         for c in &batch.clicks {
-            if let Ok(ev) = click_from_wire(c, c.day) {
+            if let Ok(ev) = click_from_wire(c, i64::from(c.day) * 86_400_000) {
                 assert!(ev.link_id > 0);
+                assert_eq!(ev.day(), c.day);
             }
         }
     }

@@ -59,6 +59,7 @@
 //! | `RELINK_CLICK_FLUSH_MS` | `1000` | Longest time between click flushes |
 //! | `RELINK_CLICK_BATCH` | `5000` | Clicks that trigger an early flush |
 //! | `RELINK_CLICK_BACKLOG` | `200000` | Aggregated rows kept in memory while the database is down |
+//! | `RELINK_CLICK_EVENT_BACKLOG` | `200000` | Raw click events kept in memory while the database is down; past it a click still reaches every rollup and only its raw event is dropped (0 turns raw events off) |
 //! | `RELINK_LEASE_MAX` | `100` | Largest click lease for max-click links |
 //! | `RELINK_HEALTH_ENABLED` | `true` | Run the destination health worker |
 //! | `RELINK_HEALTH_INTERVAL_S` | `300` | Seconds between checks of one link |
@@ -69,6 +70,7 @@
 //! | `RELINK_HEALTH_BATCH` | `100` | Links claimed per round |
 //! | `RELINK_SCHEDULE_POLL_MS` | `1000` | How often scheduled link changes that are due are looked for and applied |
 //! | `RELINK_CLICK_EVENTS_RETENTION_MONTHS` | `13` | Calendar months of raw click events kept, the current one included (1 to 120); older monthly partitions are dropped |
+//! | `RELINK_CLICK_HOURLY_RETENTION_DAYS` | `92` | Days of hourly click rollups and hourly visitor sketches kept (1 to 3660); daily rollups are kept as long as their link |
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |

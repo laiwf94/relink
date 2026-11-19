@@ -70,6 +70,9 @@ pub struct HealthConfig {
     pub batch: i64,
 }
 
+/// Longest retention of hourly click rollups, in days (ten years).
+pub const MAX_HOURLY_RETENTION_DAYS: u32 = 3_660;
+
 /// Everything the server needs.
 #[derive(Clone)]
 pub struct Config {
@@ -101,6 +104,8 @@ pub struct Config {
     pub schedule_poll: Duration,
     /// Calendar months of raw click events kept, the current one included.
     pub click_events_retention_months: u32,
+    /// Days of hourly click rollups and hourly visitor sketches kept.
+    pub click_hourly_retention_days: u32,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -162,6 +167,10 @@ impl fmt::Debug for Config {
             .field(
                 "click_events_retention_months",
                 &self.click_events_retention_months,
+            )
+            .field(
+                "click_hourly_retention_days",
+                &self.click_hourly_retention_days,
             )
             .field("api_rate", &self.api_rate)
             .field("auth_lookup_rate", &self.auth_lookup_rate)
@@ -523,6 +532,7 @@ impl Config {
                 interval: v.millis("RELINK_CLICK_FLUSH_MS", 1_000, 10, 60_000)?,
                 batch: v.parse("RELINK_CLICK_BATCH", 5_000, 1, 1_000_000)?,
                 max_backlog: v.parse("RELINK_CLICK_BACKLOG", 200_000, 2, 50_000_000)?,
+                max_events: v.parse("RELINK_CLICK_EVENT_BACKLOG", 200_000, 0, 50_000_000)?,
                 max_backoff: Duration::from_secs(30),
             },
             max_lease: v.parse("RELINK_LEASE_MAX", 100, 1, 1_000_000)?,
@@ -546,6 +556,12 @@ impl Config {
                 13,
                 1,
                 partitions::MAX_RETENTION_MONTHS,
+            )?,
+            click_hourly_retention_days: v.parse(
+                "RELINK_CLICK_HOURLY_RETENTION_DAYS",
+                92,
+                1,
+                MAX_HOURLY_RETENTION_DAYS,
             )?,
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
@@ -638,6 +654,8 @@ mod tests {
         assert_eq!(c.dns_timeout, Duration::from_secs(2));
         assert_eq!(c.acme, None);
         assert_eq!(c.click_events_retention_months, 13);
+        assert_eq!(c.click_hourly_retention_days, 92);
+        assert_eq!(c.flush.max_events, 200_000);
         let c = from(&[
             ("RELINK_DATABASE_URL", "postgres://x/y"),
             ("RELINK_PUBLIC_BASE_URL", "https://Go.Example.com:8443"),
@@ -916,6 +934,31 @@ mod tests {
                 e.starts_with("RELINK_CLICK_EVENTS_RETENTION_MONTHS:"),
                 "{bad:?}: {e}"
             );
+        }
+    }
+
+    #[test]
+    fn hourly_retention_and_event_backlog_are_bounded() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        for (raw, days) in [("1", 1), (" 30 ", 30), ("3660", 3660), ("", 92)] {
+            let c = from(&[base, ("RELINK_CLICK_HOURLY_RETENTION_DAYS", raw)]).unwrap();
+            assert_eq!(c.click_hourly_retention_days, days, "{raw:?}");
+        }
+        for bad in ["0", "3661", "-1", "1.5", "a week"] {
+            let e = from(&[base, ("RELINK_CLICK_HOURLY_RETENTION_DAYS", bad)]).unwrap_err();
+            assert!(
+                e.starts_with("RELINK_CLICK_HOURLY_RETENTION_DAYS:"),
+                "{bad:?}: {e}"
+            );
+        }
+        // 0 turns raw events off; the rollups still get every click.
+        for (raw, n) in [("0", 0), ("1000", 1000), ("50000000", 50_000_000)] {
+            let c = from(&[base, ("RELINK_CLICK_EVENT_BACKLOG", raw)]).unwrap();
+            assert_eq!(c.flush.max_events, n, "{raw:?}");
+        }
+        for bad in ["-1", "50000001", "many"] {
+            let e = from(&[base, ("RELINK_CLICK_EVENT_BACKLOG", bad)]).unwrap_err();
+            assert!(e.starts_with("RELINK_CLICK_EVENT_BACKLOG:"), "{bad:?}: {e}");
         }
     }
 }

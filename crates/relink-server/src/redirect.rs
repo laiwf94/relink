@@ -34,7 +34,7 @@ use crate::resolver::Resolved;
 use crate::rules::{Decision, Settings, Visit, evaluate};
 use crate::server::App;
 use crate::store::link_key;
-use crate::util::{fast_random, now_ms, utc_day};
+use crate::util::{fast_random, now_ms};
 use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file};
 use relink_core::gate::preview;
 use relink_core::site::{
@@ -505,7 +505,7 @@ fn record_click(
     let referrer = referrer_host(headers.get(header::REFERER).map(HeaderValue::as_bytes));
     app.clicks.record(ClickEvent {
         link_id: link.id,
-        day: utc_day(now_ms()),
+        at_ms: now_ms(),
         country: country.unwrap_or(UNKNOWN_COUNTRY),
         device: device_class(ua),
         referrer: referrer.map(String::into_boxed_str),

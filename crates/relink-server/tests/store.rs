@@ -402,7 +402,7 @@ async fn malformed_rows_are_errors_not_panics() {
 fn click(link_id: i64, day: i32, referrer: Option<&str>, fingerprint: [u8; 16]) -> ClickEvent {
     ClickEvent {
         link_id,
-        day,
+        at_ms: i64::from(day) * 86_400_000 + 60_000,
         country: *b"DE",
         device: Device::Mobile,
         referrer: referrer.map(Into::into),
@@ -415,6 +415,7 @@ fn flush_cfg() -> FlushConfig {
         interval: Duration::from_millis(50),
         batch: 1000,
         max_backlog: 1_000_000,
+        max_events: 1_000_000,
         max_backoff: Duration::from_secs(1),
     }
 }

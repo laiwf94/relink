@@ -26,6 +26,7 @@ use crate::model::{Destination, GeoMode, GeoRule, Link};
 use crate::util::BoxFuture;
 use relink_core::deeplink::AppLink;
 use relink_core::gate::{DEFAULT_MAX_ATTEMPTS, Protection};
+use relink_core::hll::Hll;
 use relink_core::rules_v2::RuleSet;
 use relink_core::wire::{domain_kv_key, host_kv_key, kv_key};
 
@@ -443,6 +444,436 @@ pub struct ClickRow {
     pub country: [u8; 2],
     pub device: &'static str,
     pub referrer: Option<Box<str>>,
+}
+
+/// One aggregated hourly click row: [`ClickRow`] at the resolution of a
+/// UTC hour.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HourRow {
+    pub link_id: i64,
+    /// UTC hours since the Unix epoch.
+    pub hour: i32,
+    pub country: [u8; 2],
+    pub device: &'static str,
+    pub referrer: Option<Box<str>>,
+}
+
+impl HourRow {
+    /// The daily row this hour belongs to.
+    pub fn daily(&self) -> ClickRow {
+        ClickRow {
+            link_id: self.link_id,
+            day: self.hour.div_euclid(24),
+            country: self.country,
+            device: self.device,
+            referrer: self.referrer.clone(),
+        }
+    }
+}
+
+/// One click as stored in `click_events`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEvent {
+    /// Milliseconds since the Unix epoch.
+    pub at_ms: i64,
+    pub link_id: i64,
+    pub country: [u8; 2],
+    pub device: &'static str,
+    pub referrer: Option<Box<str>>,
+    /// The day's visitor hash, or `None` if that day's salt was gone.
+    pub visitor: Option<[u8; 16]>,
+}
+
+/// Everything one flush writes, in one transaction, under one replay key
+/// ([`Db::write_batch`]).
+#[derive(Clone, Debug, Default)]
+pub struct FlushBatch {
+    /// Random; the same on every attempt of this batch.
+    pub id: [u8; 16],
+    pub daily: Vec<(ClickRow, i64)>,
+    pub hourly: Vec<(HourRow, i64)>,
+    /// (link, day, visitor hash) for `visitor_daily`.
+    pub visitors: Vec<(i64, i32, [u8; 16])>,
+    pub events: Vec<StoredEvent>,
+    /// Visitor sketches to merge into `visitor_sketch_hourly`, by (link, hour).
+    pub hour_sketches: Vec<(i64, i32, Hll)>,
+    /// Visitor sketches to merge into `visitor_sketch_daily`, by (link, day).
+    pub day_sketches: Vec<(i64, i32, Hll)>,
+}
+
+impl FlushBatch {
+    /// Clicks this batch counts.
+    pub fn clicks(&self) -> i64 {
+        self.hourly.iter().map(|(_, n)| n).sum::<i64>()
+            + if self.hourly.is_empty() {
+                self.daily.iter().map(|(_, n)| n).sum::<i64>()
+            } else {
+                0
+            }
+    }
+
+    /// Rows this batch holds, as counted against the flusher's backlog.
+    pub fn size(&self) -> usize {
+        self.hourly.len().max(self.daily.len()) + self.visitors.len()
+    }
+}
+
+/// What [`Db::write_batch`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    Written,
+    /// An earlier attempt of the same batch had committed; nothing changed.
+    Replayed,
+}
+
+/// How long replay keys are kept. A batch is retried only by the flusher
+/// that made it, which gives up at shutdown, so a week is far more than
+/// enough.
+pub const BATCH_KEY_RETENTION: Duration = Duration::from_secs(7 * 86_400);
+
+fn ms_to_time(ms: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(ms).expect("time within chrono's range")
+}
+
+fn hour_to_time(hour: i32) -> DateTime<Utc> {
+    ms_to_time(i64::from(hour) * 3_600_000)
+}
+
+fn referrer_or_direct(r: &Option<Box<str>>) -> String {
+    r.as_deref().unwrap_or(DIRECT).to_owned()
+}
+
+/// [`ClickRow`]s as columns for UNNEST, one entry per stored key:
+/// `ON CONFLICT DO UPDATE` refuses to touch the same row twice in one
+/// statement.
+struct DailyColumns {
+    ids: Vec<i64>,
+    days: Vec<NaiveDate>,
+    countries: Vec<String>,
+    devices: Vec<&'static str>,
+    referrers: Vec<String>,
+    counts: Vec<i64>,
+}
+
+impl DailyColumns {
+    fn new(rows: &[(ClickRow, i64)]) -> DailyColumns {
+        let mut merged: HashMap<(i64, i32, [u8; 2], &'static str, String), i64> =
+            HashMap::with_capacity(rows.len());
+        for (row, n) in rows {
+            let key = (
+                row.link_id,
+                row.day,
+                row.country,
+                row.device,
+                referrer_or_direct(&row.referrer),
+            );
+            *merged.entry(key).or_insert(0) += *n;
+        }
+        let mut c = DailyColumns {
+            ids: Vec::with_capacity(merged.len()),
+            days: Vec::with_capacity(merged.len()),
+            countries: Vec::with_capacity(merged.len()),
+            devices: Vec::with_capacity(merged.len()),
+            referrers: Vec::with_capacity(merged.len()),
+            counts: Vec::with_capacity(merged.len()),
+        };
+        for ((id, day, country, device, referrer), n) in merged {
+            c.ids.push(id);
+            c.days.push(day_to_date(day));
+            c.countries
+                .push(String::from_utf8_lossy(&country).into_owned());
+            c.devices.push(device);
+            c.referrers.push(referrer);
+            c.counts.push(n);
+        }
+        c
+    }
+
+    async fn write(&self, tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO click_daily (link_id, day, country, device, referrer_host, clicks)
+             SELECT u.link_id, u.day, u.country, u.device, u.referrer_host, u.clicks
+               FROM UNNEST($1::bigint[], $2::date[], $3::text[], $4::text[], $5::text[], $6::bigint[])
+                    AS u(link_id, day, country, device, referrer_host, clicks)
+               JOIN links l ON l.id = u.link_id
+             ON CONFLICT (link_id, day, country, device, referrer_host)
+             DO UPDATE SET clicks = click_daily.clicks + EXCLUDED.clicks",
+        )
+        .bind(&self.ids)
+        .bind(&self.days)
+        .bind(&self.countries)
+        .bind(&self.devices)
+        .bind(&self.referrers)
+        .bind(&self.counts)
+        .execute(&mut **tx)
+        .await?;
+        // The quota meter (src/quota.rs): the same clicks, summed per
+        // workspace and month of the click's day. Rows in a fixed order, so
+        // concurrent flushers lock them in the same order.
+        sqlx::query(
+            "INSERT INTO workspace_usage (workspace_id, month, clicks)
+             SELECT l.workspace_id, u.day - (extract(day FROM u.day)::int - 1), sum(u.clicks)::bigint
+               FROM UNNEST($1::bigint[], $2::date[], $3::bigint[]) AS u(link_id, day, clicks)
+               JOIN links l ON l.id = u.link_id
+              GROUP BY 1, 2
+              ORDER BY 1, 2
+             ON CONFLICT (workspace_id, month)
+             DO UPDATE SET clicks = workspace_usage.clicks + EXCLUDED.clicks",
+        )
+        .bind(&self.ids)
+        .bind(&self.days)
+        .bind(&self.counts)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
+
+/// [`HourRow`]s as columns for UNNEST, one entry per stored key.
+struct HourlyColumns {
+    ids: Vec<i64>,
+    hours: Vec<DateTime<Utc>>,
+    countries: Vec<String>,
+    devices: Vec<&'static str>,
+    referrers: Vec<String>,
+    counts: Vec<i64>,
+}
+
+impl HourlyColumns {
+    fn new(rows: &[(HourRow, i64)]) -> HourlyColumns {
+        let mut merged: HashMap<(i64, i32, [u8; 2], &'static str, String), i64> =
+            HashMap::with_capacity(rows.len());
+        for (row, n) in rows {
+            let key = (
+                row.link_id,
+                row.hour,
+                row.country,
+                row.device,
+                referrer_or_direct(&row.referrer),
+            );
+            *merged.entry(key).or_insert(0) += *n;
+        }
+        let mut c = HourlyColumns {
+            ids: Vec::with_capacity(merged.len()),
+            hours: Vec::with_capacity(merged.len()),
+            countries: Vec::with_capacity(merged.len()),
+            devices: Vec::with_capacity(merged.len()),
+            referrers: Vec::with_capacity(merged.len()),
+            counts: Vec::with_capacity(merged.len()),
+        };
+        for ((id, hour, country, device, referrer), n) in merged {
+            c.ids.push(id);
+            c.hours.push(hour_to_time(hour));
+            c.countries
+                .push(String::from_utf8_lossy(&country).into_owned());
+            c.devices.push(device);
+            c.referrers.push(referrer);
+            c.counts.push(n);
+        }
+        c
+    }
+
+    async fn write(&self, tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO click_hourly (link_id, workspace_id, hour, country, device, referrer_host, clicks)
+             SELECT u.link_id, l.workspace_id, u.hour, u.country, u.device, u.referrer_host, u.clicks
+               FROM UNNEST($1::bigint[], $2::timestamptz[], $3::text[], $4::text[], $5::text[], $6::bigint[])
+                    AS u(link_id, hour, country, device, referrer_host, clicks)
+               JOIN links l ON l.id = u.link_id
+             ON CONFLICT (link_id, hour, country, device, referrer_host)
+             DO UPDATE SET clicks = click_hourly.clicks + EXCLUDED.clicks",
+        )
+        .bind(&self.ids)
+        .bind(&self.hours)
+        .bind(&self.countries)
+        .bind(&self.devices)
+        .bind(&self.referrers)
+        .bind(&self.counts)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
+
+/// [`StoredEvent`]s as columns for UNNEST.
+struct EventColumns {
+    ats: Vec<DateTime<Utc>>,
+    ids: Vec<i64>,
+    countries: Vec<String>,
+    devices: Vec<&'static str>,
+    referrers: Vec<String>,
+    visitors: Vec<Option<Vec<u8>>>,
+}
+
+impl EventColumns {
+    fn new(events: &[StoredEvent]) -> EventColumns {
+        EventColumns {
+            ats: events.iter().map(|e| ms_to_time(e.at_ms)).collect(),
+            ids: events.iter().map(|e| e.link_id).collect(),
+            countries: events
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.country).into_owned())
+                .collect(),
+            devices: events.iter().map(|e| e.device).collect(),
+            referrers: events
+                .iter()
+                .map(|e| referrer_or_direct(&e.referrer))
+                .collect(),
+            visitors: events
+                .iter()
+                .map(|e| e.visitor.map(|v| v.to_vec()))
+                .collect(),
+        }
+    }
+
+    async fn write(&self, tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO click_events (at, workspace_id, link_id, domain_id, country, device, referrer_host, visitor)
+             SELECT u.at, l.workspace_id, u.link_id, l.domain_id, u.country, u.device, u.referrer_host, u.visitor
+               FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::text[], $6::bytea[])
+                    AS u(at, link_id, country, device, referrer_host, visitor)
+               JOIN links l ON l.id = u.link_id",
+        )
+        .bind(&self.ats)
+        .bind(&self.ids)
+        .bind(&self.countries)
+        .bind(&self.devices)
+        .bind(&self.referrers)
+        .bind(&self.visitors)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SketchTable {
+    Hourly,
+    Daily,
+}
+
+/// Merges sketches into the stored ones, by (link, hour) or (link, day).
+///
+/// A plain upsert cannot merge: the new value depends on the stored one.
+/// So the rows are first created empty where missing (in key order, which
+/// also waits for any other transaction inserting the same key), then
+/// locked and read in key order, merged here, and written back. Concurrent
+/// flushers therefore lock the same rows in the same order and never lose
+/// each other's visitors. Keys of links deleted meanwhile are skipped.
+async fn merge_sketches(
+    tx: &mut Transaction<'_, Postgres>,
+    table: SketchTable,
+    sketches: &[(i64, i32, Hll)],
+) -> Result<(), sqlx::Error> {
+    if sketches.is_empty() {
+        return Ok(());
+    }
+    let mut incoming: std::collections::BTreeMap<(i64, i32), Hll> = Default::default();
+    for (link, period, sketch) in sketches {
+        incoming.entry((*link, *period)).or_default().merge(sketch);
+    }
+    let ids: Vec<i64> = incoming.keys().map(|k| k.0).collect();
+    let empty = Hll::new().to_bytes();
+    let (create, lock, update) = match table {
+        SketchTable::Hourly => (
+            "INSERT INTO visitor_sketch_hourly (link_id, hour, sketch)
+             SELECT u.link_id, u.hour, $3 FROM UNNEST($1::bigint[], $2::timestamptz[]) AS u(link_id, hour)
+               JOIN links l ON l.id = u.link_id
+              ORDER BY 1, 2
+             ON CONFLICT DO NOTHING",
+            "SELECT s.link_id, s.hour AS period, s.sketch FROM visitor_sketch_hourly s
+               JOIN UNNEST($1::bigint[], $2::timestamptz[]) AS u(link_id, hour)
+                 ON s.link_id = u.link_id AND s.hour = u.hour
+              ORDER BY 1, 2
+                FOR UPDATE OF s",
+            "UPDATE visitor_sketch_hourly s SET sketch = u.sketch
+               FROM UNNEST($1::bigint[], $2::timestamptz[], $3::bytea[]) AS u(link_id, hour, sketch)
+              WHERE s.link_id = u.link_id AND s.hour = u.hour",
+        ),
+        SketchTable::Daily => (
+            "INSERT INTO visitor_sketch_daily (link_id, day, sketch)
+             SELECT u.link_id, u.day, $3 FROM UNNEST($1::bigint[], $2::date[]) AS u(link_id, day)
+               JOIN links l ON l.id = u.link_id
+              ORDER BY 1, 2
+             ON CONFLICT DO NOTHING",
+            "SELECT s.link_id, s.day AS period, s.sketch FROM visitor_sketch_daily s
+               JOIN UNNEST($1::bigint[], $2::date[]) AS u(link_id, day)
+                 ON s.link_id = u.link_id AND s.day = u.day
+              ORDER BY 1, 2
+                FOR UPDATE OF s",
+            "UPDATE visitor_sketch_daily s SET sketch = u.sketch
+               FROM UNNEST($1::bigint[], $2::date[], $3::bytea[]) AS u(link_id, day, sketch)
+              WHERE s.link_id = u.link_id AND s.day = u.day",
+        ),
+    };
+    macro_rules! with_periods {
+        ($q:expr) => {
+            match table {
+                SketchTable::Hourly => $q.bind(
+                    incoming
+                        .keys()
+                        .map(|k| hour_to_time(k.1))
+                        .collect::<Vec<_>>(),
+                ),
+                SketchTable::Daily => $q.bind(
+                    incoming
+                        .keys()
+                        .map(|k| day_to_date(k.1))
+                        .collect::<Vec<_>>(),
+                ),
+            }
+        };
+    }
+    with_periods!(sqlx::query(create).bind(&ids))
+        .bind(&empty)
+        .execute(&mut **tx)
+        .await?;
+    let stored = with_periods!(sqlx::query(lock).bind(&ids))
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut out_ids = Vec::with_capacity(stored.len());
+    let mut out_periods = Vec::with_capacity(stored.len());
+    let mut out_sketches = Vec::with_capacity(stored.len());
+    for row in &stored {
+        let link: i64 = row.try_get("link_id")?;
+        let period = match table {
+            SketchTable::Hourly => {
+                let t: DateTime<Utc> = row.try_get("period")?;
+                (t.timestamp().div_euclid(3_600)) as i32
+            }
+            SketchTable::Daily => {
+                let d: NaiveDate = row.try_get("period")?;
+                (d - NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch")).num_days() as i32
+            }
+        };
+        let bytes: Vec<u8> = row.try_get("sketch")?;
+        let mut merged = Hll::from_bytes(&bytes)
+            .map_err(|e| sqlx::Error::Decode(format!("stored visitor sketch: {e}").into()))?;
+        let Some(new) = incoming.get(&(link, period)) else {
+            continue;
+        };
+        merged.merge(new);
+        out_ids.push(link);
+        out_periods.push(period);
+        out_sketches.push(merged.to_bytes());
+    }
+    let q = sqlx::query(update).bind(&out_ids);
+    let q = match table {
+        SketchTable::Hourly => q.bind(
+            out_periods
+                .iter()
+                .map(|&h| hour_to_time(h))
+                .collect::<Vec<_>>(),
+        ),
+        SketchTable::Daily => q.bind(
+            out_periods
+                .iter()
+                .map(|&d| day_to_date(d))
+                .collect::<Vec<_>>(),
+        ),
+    };
+    q.bind(&out_sketches).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// A link claimed by the health worker.
@@ -1016,84 +1447,56 @@ impl Db {
 
     /// Adds aggregated click counts and visitor hashes in one transaction, so
     /// a failed flush can be retried without double counting. Rows for links
-    /// deleted in the meantime are skipped.
+    /// deleted in the meantime are skipped. A shorthand for
+    /// [`Db::write_batch`] with a fresh key and only daily rows.
     pub async fn flush_clicks(
         &self,
         rows: &[(ClickRow, i64)],
         visitors: &[(i64, i32, [u8; 16])],
     ) -> Result<(), DbError> {
-        // One input row per stored key: ON CONFLICT DO UPDATE refuses to
-        // touch the same row twice in one statement.
-        let mut merged: HashMap<(i64, i32, String, &'static str, String), i64> =
-            HashMap::with_capacity(rows.len());
-        for (row, n) in rows {
-            let key = (
-                row.link_id,
-                row.day,
-                String::from_utf8_lossy(&row.country).into_owned(),
-                row.device,
-                row.referrer.as_deref().unwrap_or(DIRECT).to_owned(),
-            );
-            *merged.entry(key).or_insert(0) += *n;
-        }
-        let mut ids = Vec::with_capacity(merged.len());
-        let mut days = Vec::with_capacity(merged.len());
-        let mut countries = Vec::with_capacity(merged.len());
-        let mut devices = Vec::with_capacity(merged.len());
-        let mut referrers = Vec::with_capacity(merged.len());
-        let mut counts = Vec::with_capacity(merged.len());
-        for ((id, day, country, device, referrer), n) in merged {
-            ids.push(id);
-            days.push(day_to_date(day));
-            countries.push(country);
-            devices.push(device);
-            referrers.push(referrer);
-            counts.push(n);
-        }
-        let v_ids: Vec<i64> = visitors.iter().map(|v| v.0).collect();
-        let v_days: Vec<NaiveDate> = visitors.iter().map(|v| day_to_date(v.1)).collect();
-        let v_hashes: Vec<Vec<u8>> = visitors.iter().map(|v| v.2.to_vec()).collect();
+        let mut id = [0u8; 16];
+        crate::util::secure_random(&mut id);
+        let batch = FlushBatch {
+            id,
+            daily: rows.to_vec(),
+            visitors: visitors.to_vec(),
+            ..FlushBatch::default()
+        };
+        self.write_batch(&batch).await.map(|_| ())
+    }
+
+    /// Writes one batch of clicks to every rollup and to `click_events` in a
+    /// single transaction that starts by recording the batch's key in
+    /// `click_batches`. If the key is already there, an earlier attempt of
+    /// this batch committed (its acknowledgement was lost), so nothing is
+    /// written again and [`Applied::Replayed`] is returned. Rows for links
+    /// deleted in the meantime are skipped.
+    pub async fn write_batch(&self, batch: &FlushBatch) -> Result<Applied, DbError> {
+        let daily = DailyColumns::new(&batch.daily);
+        let hourly = HourlyColumns::new(&batch.hourly);
+        let v_ids: Vec<i64> = batch.visitors.iter().map(|v| v.0).collect();
+        let v_days: Vec<NaiveDate> = batch.visitors.iter().map(|v| day_to_date(v.1)).collect();
+        let v_hashes: Vec<Vec<u8>> = batch.visitors.iter().map(|v| v.2.to_vec()).collect();
+        let events = EventColumns::new(&batch.events);
 
         let run = || async {
             let mut tx = self.pool.begin().await?;
-            if !ids.is_empty() {
-                sqlx::query(
-                    "INSERT INTO click_daily (link_id, day, country, device, referrer_host, clicks)
-                     SELECT u.link_id, u.day, u.country, u.device, u.referrer_host, u.clicks
-                       FROM UNNEST($1::bigint[], $2::date[], $3::text[], $4::text[], $5::text[], $6::bigint[])
-                            AS u(link_id, day, country, device, referrer_host, clicks)
-                       JOIN links l ON l.id = u.link_id
-                     ON CONFLICT (link_id, day, country, device, referrer_host)
-                     DO UPDATE SET clicks = click_daily.clicks + EXCLUDED.clicks",
-                )
-                .bind(&ids)
-                .bind(&days)
-                .bind(&countries)
-                .bind(&devices)
-                .bind(&referrers)
-                .bind(&counts)
-                .execute(&mut *tx)
-                .await?;
+            let fresh =
+                sqlx::query("INSERT INTO click_batches (id) VALUES ($1) ON CONFLICT DO NOTHING")
+                    .bind(&batch.id[..])
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+                    == 1;
+            if !fresh {
+                tx.rollback().await?;
+                return Ok(Applied::Replayed);
             }
-            if !ids.is_empty() {
-                // The quota meter (src/quota.rs): the same clicks, summed per
-                // workspace and month of the click's day. Rows in a fixed
-                // order, so concurrent flushers lock them in the same order.
-                sqlx::query(
-                    "INSERT INTO workspace_usage (workspace_id, month, clicks)
-                     SELECT l.workspace_id, u.day - (extract(day FROM u.day)::int - 1), sum(u.clicks)::bigint
-                       FROM UNNEST($1::bigint[], $2::date[], $3::bigint[]) AS u(link_id, day, clicks)
-                       JOIN links l ON l.id = u.link_id
-                      GROUP BY 1, 2
-                      ORDER BY 1, 2
-                     ON CONFLICT (workspace_id, month)
-                     DO UPDATE SET clicks = workspace_usage.clicks + EXCLUDED.clicks",
-                )
-                .bind(&ids)
-                .bind(&days)
-                .bind(&counts)
-                .execute(&mut *tx)
-                .await?;
+            if !daily.ids.is_empty() {
+                daily.write(&mut tx).await?;
+            }
+            if !hourly.ids.is_empty() {
+                hourly.write(&mut tx).await?;
             }
             if !v_ids.is_empty() {
                 sqlx::query(
@@ -1109,7 +1512,13 @@ impl Db {
                 .execute(&mut *tx)
                 .await?;
             }
-            tx.commit().await
+            if !events.ats.is_empty() {
+                events.write(&mut tx).await?;
+            }
+            merge_sketches(&mut tx, SketchTable::Hourly, &batch.hour_sketches).await?;
+            merge_sketches(&mut tx, SketchTable::Daily, &batch.day_sketches).await?;
+            tx.commit().await?;
+            Ok(Applied::Written)
         };
         // A link deleted between the JOIN and the foreign-key check makes the
         // batch fail once; the retry's JOIN no longer sees it.
@@ -1118,6 +1527,49 @@ impl Db {
             Ok(r) => r.map_err(DbError::from),
             Err(_) => Err(DbError::Unavailable("query timed out".into())),
         }
+    }
+
+    /// Housekeeping for the rollups: deletes hourly rows and sketches older
+    /// than `hourly_retention_days` before `now_ms`, and replay keys older
+    /// than [`BATCH_KEY_RETENTION`], at most `limit` rows per table per call
+    /// so one run never holds locks for long. Returns the rows deleted.
+    pub async fn maintain_rollups(
+        &self,
+        now_ms: i64,
+        hourly_retention_days: u32,
+        limit: i64,
+    ) -> Result<u64, DbError> {
+        let hour_cutoff = ms_to_time(now_ms - i64::from(hourly_retention_days) * 86_400_000);
+        let key_cutoff = ms_to_time(now_ms - BATCH_KEY_RETENTION.as_millis() as i64);
+        self.timed(async {
+            let mut n = 0;
+            for (sql, cutoff) in [
+                (
+                    "DELETE FROM click_hourly WHERE ctid = ANY (ARRAY(
+                         SELECT ctid FROM click_hourly WHERE hour < $1 LIMIT $2))",
+                    hour_cutoff,
+                ),
+                (
+                    "DELETE FROM visitor_sketch_hourly WHERE ctid = ANY (ARRAY(
+                         SELECT ctid FROM visitor_sketch_hourly WHERE hour < $1 LIMIT $2))",
+                    hour_cutoff,
+                ),
+                (
+                    "DELETE FROM click_batches WHERE ctid = ANY (ARRAY(
+                         SELECT ctid FROM click_batches WHERE at < $1 LIMIT $2))",
+                    key_cutoff,
+                ),
+            ] {
+                n += sqlx::query(sql)
+                    .bind(cutoff)
+                    .bind(limit)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
+            }
+            Ok(n)
+        })
+        .await
     }
 
     /// Claims up to `limit` links due for a health check (not checked within

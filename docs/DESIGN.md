@@ -54,6 +54,9 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `visitor_daily` | Visitor hashes for unique counts, today and yesterday only. |
 | `visitor_rollup` | Unique visitor counts for older days. |
 | `visitor_salts` | One random salt per UTC day. |
+| `click_hourly` | `click_daily` at the resolution of a UTC hour, with the link's workspace. Kept for `RELINK_CLICK_HOURLY_RETENTION_DAYS`. |
+| `visitor_sketch_hourly`, `visitor_sketch_daily` | A HyperLogLog++ sketch of each link's visitors per UTC hour and per UTC day. |
+| `click_batches` | The random key of every click batch written in the last week, so a retried batch is applied once. Server role only. |
 | `click_events` | Raw clicks, one row each: time, workspace, link, domain, country, device class, referrer host, visitor hash and a bot flag. Partitioned by UTC calendar month (`click_events_pYYYYMM`); retention drops whole months. |
 | `kv_outbox` | Codes whose KV copy must be rewritten or deleted. |
 | `users` | People who signed in: issuer and subject at the provider, their member name, email address and display name. |
@@ -80,6 +83,9 @@ read, so a hand-edited row produces an error instead of a panic.
 | `api_keys (key_hash)` unique | One probe per uncached key. |
 | `click_daily` primary key | The flusher's upsert; stats use its `(link_id, day)` prefix. |
 | `visitor_daily` primary key | `ON CONFLICT DO NOTHING` deduplication; the table holds two days, so the roll-up scan by day stays small. |
+| `click_hourly` primary key `(link_id, hour, country, device, referrer_host)`; `(workspace_id, hour)`; `(hour)` | The flusher's upsert and one link's hours; a workspace's hours, also the row-level security predicate; retention. |
+| `visitor_sketch_hourly (link_id, hour)`, `visitor_sketch_daily (link_id, day)` primary keys; `visitor_sketch_hourly (hour)` | Locking a sketch to merge into it, and one link's sketches over a range; retention. |
+| `click_batches (id)` primary key, `(at)` | The replay check that opens every flush transaction; expiring old keys. |
 | `click_events (link_id, at)`, `(workspace_id, at)`, on every partition | One link's events over a time range; a workspace's events over a time range, which is also the row-level security predicate. Partition pruning on `at` limits either to the months asked for. |
 | `kv_outbox (next_attempt_at)` | The sync worker's "what is due". |
 | `link_versions (link_id, version)` primary key | A link's history newest first, by keyset; the current version's snapshot for the "did anything change" check; pruning the oldest. |
@@ -1410,20 +1416,24 @@ is the better trade.
 
 A redirect computes the click's dimensions and a visitor fingerprint, then
 calls `try_send` on a bounded channel; a full channel counts a drop rather
-than delaying the visitor. One flusher aggregates by `(link, day, country,
-device, referrer)` and, every second or 5,000 clicks, writes with
-`INSERT ... SELECT FROM UNNEST(...) ON CONFLICT DO UPDATE`. Rows are merged by
+than delaying the visitor. One flusher aggregates by `(link, hour, country,
+device, referrer)`, keeps the raw events, and every second or 5,000 clicks
+writes with `INSERT ... SELECT FROM UNNEST(...) ON CONFLICT DO UPDATE`
+(see "Rollups" below for everything one write feeds). Rows are merged by
 their stored key first, because Postgres refuses a statement that updates the
 same row twice; a missing referrer is stored as `(direct)`, which no parsed
 host can equal.
 
-Writes go in transactions of at most 5,000 count rows and 5,000 visitor rows,
-so a large backlog after an outage never needs one statement that outlives
-the query timeout. Measured against Postgres in Docker: 100,000 count rows and
-100,000 visitor rows drain in about 3 s. On failure the rest stays pending and
-is retried with backoff, bounded by `RELINK_CLICK_BACKLOG` rows; past that,
-clicks are dropped and counted. A chunk the database refuses three times for a
-reason other than unavailability is dropped and counted as `rejected`,
+Writes go in transactions of at most 5,000 hourly count rows, 5,000 visitor
+rows and 5,000 raw events, so a large backlog after an outage never needs
+one statement that outlives the query timeout. On failure the batch is kept
+whole and retried with backoff, and the rest stays pending, bounded by
+`RELINK_CLICK_BACKLOG` rows; past that, clicks are dropped and counted. Raw
+events take one entry per click, so they have their own bound,
+`RELINK_CLICK_EVENT_BACKLOG`; past it a click still reaches every rollup and
+only its raw event is dropped, counted in
+`relink_click_events_dropped_total`. A batch the database refuses three times
+for a reason other than unavailability is dropped and counted as `rejected`,
 because retrying it forever would block every later click.
 
 What counts as a click: a redirect to a destination, or to the fallback when
@@ -1448,6 +1458,79 @@ delayed past that window keeps its click counts but drops its visitor hashes,
 counted in `relink_visitors_dropped_total`; creating a fresh salt for the old
 day would count those visitors twice. Unique visitors are therefore per day
 only.
+
+### Rollups
+
+One flush transaction feeds everything at once, so the tables never
+disagree about which clicks they hold:
+
+| Table | Written as |
+|---|---|
+| `click_daily` | Upsert adding counts per link, day and dimension. |
+| `click_hourly` | The same per UTC hour, with the link's workspace. |
+| `workspace_usage` | The quota meter: the day's clicks added to the workspace's month. |
+| `visitor_daily` | Visitor hashes, `ON CONFLICT DO NOTHING`. |
+| `visitor_sketch_hourly`, `visitor_sketch_daily` | Sketches merged into the stored ones. |
+| `click_events` | One row per click. |
+
+The daily rows of a batch are its hourly rows added up by day, so the two
+always agree, and both agree with the raw events per dimension; a test
+checks that against Postgres.
+
+**Idempotent on replay.** A batch gets 16 random bytes as its key when it
+is formed, and its transaction starts with `INSERT INTO click_batches ...
+ON CONFLICT DO NOTHING`. A failed batch is kept whole, with its key, and is
+the first thing written on the next attempt. Most failures roll the
+transaction back, and the retry simply writes it. But a connection can drop
+after `COMMIT` reached the server and before its answer came back. Then the
+retry finds its key, writes nothing and reports a replay
+(`relink_click_batches_replayed_total`), so no count, quota or event is added
+twice. Keys are kept a week (a batch is only ever retried by the flusher
+that made it, which gives up at shutdown) and deleted by housekeeping.
+
+**Visitor sketches.** Each batch builds, per link, a sketch for every hour
+and every day it covers, and merges them into `visitor_sketch_hourly` and
+`visitor_sketch_daily`. A plain upsert cannot merge, because the new value
+depends on the stored one, so the transaction:
+
+1. creates the missing rows empty with `ON CONFLICT DO NOTHING`, in key
+   order, which also waits for any other flusher inserting the same key;
+2. locks and reads the rows with `SELECT ... FOR UPDATE`, in key order;
+3. merges here and writes the results back.
+
+Concurrent flushers therefore lock the same rows in the same order: no
+deadlock, and no flusher overwrites another's visitors. Eight flushers
+merging into the same rows at once end with exactly the sketch of all
+their visitors, in a test. Merging is idempotent too, but the batch key
+already guarantees a sketch is merged once.
+
+A sketch is fed `HMAC-SHA256(day's salt, "hll" | fingerprint)[0..8]`. This is
+the same value for every link on a day, so sketches of different links merge
+into the visitors of all of them: someone who clicked two links counts
+once. The link ID is left out on purpose here, unlike `visitor_daily`. The
+key is the day's salt, which is destroyed after two days, and a sketch keeps
+at most 25 bits of each hash (see "Unique visitor sketches"). Across days a
+returning visitor counts once per day, because the salt changes. That is the
+same rule as the daily counts.
+
+**Edge clicks** carry only their UTC day (`WireClick::day`). The origin places
+such a click at the time it arrived, moved into the reported day if that is
+yesterday or tomorrow. The edge sends within five seconds, so the hour is
+right but for clicks sent across the hour.
+
+**Retention.** Hourly rows and hourly sketches are kept for
+`RELINK_CLICK_HOURLY_RETENTION_DAYS`, 92 by default (1 to 3,660). Daily rows
+and daily sketches stay as long as their link. Housekeeping deletes at most
+50,000 expired rows per table per minute, so a lowered retention drains
+gradually and never holds locks for long.
+
+**Cost.** Against a local Postgres 16, 100,000 clicks that are each a new
+row in every table (a distinct referrer and visitor per click, the worst
+case) drain in 7.9 s, in 20 transactions of about 0.4 s. Before this, when
+only the daily tables and visitor hashes were written, the same clicks took
+3.5 s. Raw events are the largest part. Typical traffic repeats its
+dimension keys, so most clicks add to an existing hourly row and only the
+raw event is new.
 
 ### Raw events and partitions
 
@@ -1697,7 +1780,9 @@ and counts the clicks it could not write.
 | Unique-count sketch | precision 14; sparse up to 3,072 entries (4 bytes each in memory), then dense: 16 KiB in memory, 12,291 bytes stored |
 | Click queue / backlog | 65,536 clicks / 200,000 aggregated rows |
 | Raw click events | 13 calendar months, the current one included (`RELINK_CLICK_EVENTS_RETENTION_MONTHS`, 1 to 120); partitions created two months ahead |
-| Flush transaction | 5,000 count rows and 5,000 visitor rows |
+| Flush transaction | 5,000 hourly count rows (and the daily rows they add up to), 5,000 visitor rows and 5,000 raw events |
+| Raw event backlog | 200,000 events while the database is down (`RELINK_CLICK_EVENT_BACKLOG`, 0 to 5×10⁷); past it only raw events are dropped |
+| Hourly rollups | 92 days (`RELINK_CLICK_HOURLY_RETENTION_DAYS`, 1 to 3,660); 50,000 rows per table deleted per minute; replay keys kept 7 days |
 | User-Agent scanned | 512 bytes (256 in the fingerprint) |
 | Lookup concurrency | 32 |
 | Uncached key lookups | 5/s per address, 200/s overall |
@@ -1718,6 +1803,7 @@ debug level so the hot path does not pay for a log line. Prometheus metrics on
 the admin listener cover redirect latency, redirects by outcome, cache results
 (`hit`, `negative_hit`, `stale`, `stale_on_error`, `miss`), coalesced and shed
 lookups, click queue depth, backlog, drops by reason, late visitor hashes,
+raw events dropped, click batches replayed,
 database errors by operation, lease grants, health probes, KV writes, deletes,
 custom hostnames added and removed,
 errors and reconciled drift, edge clicks, API requests and refusals, link creations refused per plan

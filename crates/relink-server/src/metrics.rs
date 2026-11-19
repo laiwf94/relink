@@ -350,6 +350,11 @@ pub struct Metrics {
     pub partitions_created: Counter,
     /// Monthly partitions of click_events dropped for retention.
     pub partitions_dropped: Counter,
+    /// Raw click events not stored because the flusher's event backlog was
+    /// full (the clicks still reached every rollup).
+    pub events_dropped: Counter,
+    /// Click batches found already committed when retried.
+    pub batches_replayed: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -397,6 +402,8 @@ impl Default for Metrics {
             schedules_failed: Counter::default(),
             partitions_created: Counter::default(),
             partitions_dropped: Counter::default(),
+            events_dropped: Counter::default(),
+            batches_replayed: Counter::default(),
             backlog: AtomicU64::new(0),
         }
     }
@@ -513,7 +520,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 33] = [
+        let counters: [(&str, &str, u64); 35] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -603,6 +610,16 @@ impl Metrics {
                 "relink_click_partitions_dropped_total",
                 "Monthly click event partitions dropped because they were older than the retention.",
                 self.partitions_dropped.get(),
+            ),
+            (
+                "relink_click_events_dropped_total",
+                "Raw click events not stored because the event backlog was full; their clicks still reached the rollups.",
+                self.events_dropped.get(),
+            ),
+            (
+                "relink_click_batches_replayed_total",
+                "Click batches retried after a lost acknowledgement and found already committed.",
+                self.batches_replayed.get(),
             ),
             (
                 "relink_lookups_coalesced_total",

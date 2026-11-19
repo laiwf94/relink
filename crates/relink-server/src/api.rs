@@ -1180,7 +1180,13 @@ impl FromRequestParts<Arc<App>> for EdgeAuthed {
 /// Checks one click reported by the edge and turns it into a queue event.
 /// The edge is trusted to have measured honestly, not to send well-formed
 /// data, so every field is checked as strictly as on the origin.
-pub fn click_from_wire(w: &WireClick, today: i32) -> Result<ClickEvent, String> {
+///
+/// The edge reports the click's UTC day only. It sends its clicks within
+/// seconds, so the click is placed at `now_ms`, the time it arrived, moved
+/// into the reported day when that is yesterday or tomorrow (the last or
+/// first millisecond of it), so that its day never changes.
+pub fn click_from_wire(w: &WireClick, now_ms: i64) -> Result<ClickEvent, String> {
+    let today = utc_day(now_ms);
     if w.link_id <= 0 {
         return Err("link_id must be positive".into());
     }
@@ -1207,9 +1213,10 @@ pub fn click_from_wire(w: &WireClick, today: i32) -> Result<ClickEvent, String> 
     let fingerprint: [u8; 16] = hex_decode(&w.fingerprint)
         .and_then(|b| b.try_into().ok())
         .ok_or("fingerprint must be 32 hex characters")?;
+    let start = i64::from(w.day) * 86_400_000;
     Ok(ClickEvent {
         link_id: w.link_id,
-        day: w.day,
+        at_ms: now_ms.clamp(start, start + 86_400_000 - 1),
         country,
         device,
         referrer,
@@ -1227,13 +1234,13 @@ pub async fn edge_clicks(
             "at most {MAX_BATCH} clicks per batch"
         )));
     }
-    let today = utc_day(now_ms());
+    let now = now_ms();
     let events = batch
         .clicks
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            click_from_wire(c, today).map_err(|e| ApiError::invalid(format!("clicks[{i}]: {e}")))
+            click_from_wire(c, now).map_err(|e| ApiError::invalid(format!("clicks[{i}]: {e}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let accepted = events.len();
@@ -1365,23 +1372,31 @@ mod tests {
             referrer: Some("news.example.org".into()),
             fingerprint: "ab".repeat(16),
         };
-        let ev = click_from_wire(&ok, 100).unwrap();
+        const DAY: i64 = 86_400_000;
+        let ev = click_from_wire(&ok, 100 * DAY + 3_600_000).unwrap();
         assert_eq!(
             (ev.link_id, ev.country, ev.device),
             (3, *b"DE", Device::Mobile)
         );
         assert_eq!(ev.fingerprint, [0xab; 16]);
-        assert!(
-            click_from_wire(
-                &WireClick {
-                    country: "XX".into(),
-                    referrer: None,
-                    ..ok.clone()
-                },
-                101
-            )
-            .is_ok()
+        // Placed when it arrived, inside the reported day.
+        assert_eq!(
+            (ev.at_ms, ev.day(), ev.hour()),
+            (100 * DAY + 3_600_000, 100, 2401)
         );
+        // Reported for yesterday or tomorrow: the nearest end of that day.
+        let late = click_from_wire(
+            &WireClick {
+                country: "XX".into(),
+                referrer: None,
+                ..ok.clone()
+            },
+            101 * DAY + 5,
+        )
+        .unwrap();
+        assert_eq!((late.at_ms, late.day()), (101 * DAY - 1, 100));
+        let early = click_from_wire(&ok, 99 * DAY + 7).unwrap();
+        assert_eq!((early.at_ms, early.day()), (100 * DAY, 100));
         let bad = [
             WireClick {
                 link_id: 0,
@@ -1425,7 +1440,7 @@ mod tests {
             },
         ];
         for b in bad {
-            assert!(click_from_wire(&b, 100).is_err(), "{b:?}");
+            assert!(click_from_wire(&b, 100 * DAY).is_err(), "{b:?}");
         }
     }
 

@@ -614,8 +614,13 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
     }
 }
 
+/// Most rows of each rollup table deleted for retention per housekeeping
+/// run; a backlog after a lowered retention drains over several minutes.
+const ROLLUP_PURGE_LIMIT: i64 = 50_000;
+
 /// Periodic housekeeping: visitor-hash roll-up and salt deletion, click
-/// event partitions created ahead and dropped past retention, expired
+/// event partitions created ahead and dropped past retention, expired hourly
+/// rollups and old batch replay keys deleted, expired
 /// sessions and sign-ins, idle lease return, rate limiter cleanup, and a
 /// reload of the verified domains, pending ACME challenges and certificates
 /// in case a notification was lost (and of the default certificate files,
@@ -648,6 +653,22 @@ async fn maintain(app: Arc<App>, mut stop: watch::Receiver<bool>) {
             Err(e) => {
                 app.metrics.db_error(DbOp::Maintenance);
                 tracing::warn!(error = %e, "click event partition maintenance failed");
+            }
+        }
+        match app
+            .db
+            .maintain_rollups(
+                now_ms(),
+                app.cfg.click_hourly_retention_days,
+                ROLLUP_PURGE_LIMIT,
+            )
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(rows = n, "expired click rollups deleted"),
+            Err(e) => {
+                app.metrics.db_error(DbOp::Maintenance);
+                tracing::warn!(error = %e, "click rollup maintenance failed");
             }
         }
         if let Err(e) = app.db.purge_expired_sessions().await {
