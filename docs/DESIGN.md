@@ -1661,6 +1661,90 @@ when they are sparse with 100 visitors each (the list is rebuilt on every
 merge). A dense estimate takes 11 µs, a sparse one 25 ns. Decoding a stored
 dense sketch takes 10 µs and a 1,000-entry sparse one 2.8 µs.
 
+### Querying analytics
+
+`GET /v1/analytics` (`src/analytics.rs`) answers the questions the daily
+stats endpoint cannot: any period of whole UTC hours, a series by hour,
+day, ISO week, month or one point for the whole period, grouped by up to
+three of link, country, device and referrer, filtered on any of them, the
+top N groups by clicks, and the same numbers for the period just before or
+a year earlier. It needs `stats:read`.
+
+```console
+$ curl -s "localhost:8080/v1/analytics?from=2026-11-01&to=2026-11-30&group_by=country&device=mobile&compare=previous" \
+    -H "Authorization: Bearer $KEY"
+```
+
+**Which rollups answer it.** A period of whole days at a granularity of a
+day or longer reads `click_daily` and `visitor_sketch_daily`, which are
+kept as long as their link. Anything else reads `click_hourly` and
+`visitor_sketch_hourly`, and is refused with a clear message if it reaches
+further back than `RELINK_CLICK_HOURLY_RETENTION_DAYS`, rather than
+returning a silently short answer. Dates as `to` are included (the period
+ends at the next midnight); RFC 3339 times must be whole hours, and `to` is
+excluded. Points start where `date_trunc` puts them in UTC, the series has
+every point with 0 for those without clicks, and the period is at most 366
+days and 1,000 points.
+
+**Unique visitors** are the merge of the sketches the period covers (see
+"Unique visitor sketches"), estimated once per point, per top link and for
+the total. Sketches exist per link and hour or day, not per country, device
+or referrer, so `visitors` is null whenever the query groups or filters by
+one of those: a number there would be wrong, not approximate. Sketches are
+fed a hash keyed by the day's salt, so over several days a visitor counts
+once per day, as in the daily stats. The sketches are streamed in time
+order and merged one point at a time, so a query holds at most one sketch
+per point being built, per top link and for the totals (16 KiB each when
+dense), never all the rows it reads.
+
+**One statement for the clicks.** The clicks query is a single statement
+over a `MATERIALIZED` CTE that reads the rollup rows once. From it the
+statement returns, tagged by kind: the number of rows read, the total per
+point, the compared period's total, and, for the top N groups (ranked by
+clicks, ties in byte order of their values so the database and the server
+agree), their clicks per point and in the compared period. The compared
+period is read in the same scan (`cur` marks rows of the period itself), so
+it costs no second query. Dimension names and `date_trunc` units come from
+fixed lists in the code; every value is a bound parameter. Without a link
+filter the scan goes through `link_id IN (SELECT id FROM links)`, which
+row-level security limits to the workspace, so the rollups' primary keys
+(which start with `link_id`) serve it. Links in a filter are named `code` or
+`hostname/code` and resolved first; one the workspace does not have is a
+404, as everywhere else.
+
+**Cost limit.** A query may read at most `RELINK_ANALYTICS_MAX_ROWS`
+rollup rows and sketches in total (1,000,000 by default, 1,000 to 10⁸). The
+CTE carries `LIMIT max + 1`, and the sketch scan `LIMIT` of what remains, so
+however broad the query, Postgres stops one row past the limit, and the
+query is refused with 422 `query_too_expensive` and a hint to narrow it.
+The answer reports `rows_scanned`, so callers can see how close they are.
+Everything runs in one `REPEATABLE READ, READ ONLY` transaction, so the
+clicks, the sketches and the link names come from the same snapshot, and
+within the query timeout like every other API query.
+`relink_analytics_queries_total`, `relink_analytics_queries_refused_total`
+and `relink_analytics_rows_scanned_total` count them.
+
+**Cost.** On the benchmark machine (4 cores of a 2.1 GHz Xeon, local
+Postgres 16), with one workspace of 1,000 links, 1.2 million hourly rows
+over 30 days and a sparse daily sketch per link and day, measured over HTTP:
+
+| Query | Rows read | Time |
+|---|---|---|
+| 30 days by day, grouped by country | 60,000 | 60 ms |
+| 30 days by day, grouped by link, with visitors | 89,000 | 140 ms |
+| 15 days by hour, total only | 603,000 | 330 ms |
+| 15 days by hour, grouped by country | 603,000 | 470 ms |
+| 26 days by hour, refused at the limit | 1,000,001 | 550 ms |
+| 26 days by hour, two links named | 2,087 | 50 ms |
+
+A refused query costs about as much as the largest one allowed, well inside
+the 2-second query timeout. The transaction turns JIT off: the planner's
+estimates for scans under row-level security cross JIT's threshold, and
+compiling took about 300 ms, longer than the 60 ms query it was compiling.
+
+Bot clicks are still counted like any other in this release; classifying
+them and leaving them out by default comes next.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -1782,6 +1866,7 @@ and counts the clicks it could not write.
 | Raw click events | 13 calendar months, the current one included (`RELINK_CLICK_EVENTS_RETENTION_MONTHS`, 1 to 120); partitions created two months ahead |
 | Flush transaction | 5,000 hourly count rows (and the daily rows they add up to), 5,000 visitor rows and 5,000 raw events |
 | Raw event backlog | 200,000 events while the database is down (`RELINK_CLICK_EVENT_BACKLOG`, 0 to 5×10⁷); past it only raw events are dropped |
+| Analytics queries | 1,000,000 rollup rows and sketches read (`RELINK_ANALYTICS_MAX_ROWS`, 1,000 to 10⁸); 366 days and 1,000 points; 3 group-by dimensions; 50 values per filter; top 1 to 100 groups |
 | Hourly rollups | 92 days (`RELINK_CLICK_HOURLY_RETENTION_DAYS`, 1 to 3,660); 50,000 rows per table deleted per minute; replay keys kept 7 days |
 | User-Agent scanned | 512 bytes (256 in the fingerprint) |
 | Lookup concurrency | 32 |
@@ -1803,7 +1888,8 @@ debug level so the hot path does not pay for a log line. Prometheus metrics on
 the admin listener cover redirect latency, redirects by outcome, cache results
 (`hit`, `negative_hit`, `stale`, `stale_on_error`, `miss`), coalesced and shed
 lookups, click queue depth, backlog, drops by reason, late visitor hashes,
-raw events dropped, click batches replayed,
+raw events dropped, click batches replayed, analytics queries answered and
+refused and the rows they read,
 database errors by operation, lease grants, health probes, KV writes, deletes,
 custom hostnames added and removed,
 errors and reconciled drift, edge clicks, API requests and refusals, link creations refused per plan
@@ -1833,6 +1919,7 @@ audit` known advisories.
 | `hmac`, `sha2`, `subtle` | HMAC-SHA256 for A/B cookies and visitor hashes, SHA-256 for keys and the audit chain, constant-time comparison. |
 | `getrandom` | The OS CSPRNG for codes, keys and salts. |
 | `argon2` | argon2id for protected links' passwords. A password people choose needs a memory-hard hash, and argon2 is not code to hand-roll; it shares `digest` and `getrandom` with crates already in the tree, so it adds only itself, `blake2`, `password-hash` and `base64ct`. Built at `opt-level = 3` in the dev profile too, so tests hash in milliseconds. |
+| `futures-util` | Reads a query's rows as a stream, so sketches are merged as they arrive instead of all held at once; already in the tree through axum and sqlx. |
 | `chrono` | Timestamps and UTC dates; the core uses it without its clock so it stays wasm-friendly. |
 | `tracing`, `tracing-subscriber` | Structured JSON logs with request-scoped spans. |
 | `worker` | The workers-rs binding to the Cloudflare Workers runtime; wasm32 only. |

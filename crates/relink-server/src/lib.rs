@@ -20,6 +20,7 @@
 //! re-exported below.
 
 pub mod acme;
+pub mod analytics;
 pub mod api;
 pub mod audit;
 pub mod auth;

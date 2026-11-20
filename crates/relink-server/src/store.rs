@@ -1923,6 +1923,22 @@ impl Db {
         self.pool.begin_with(sqlx::AssertSqlSafe(begin)).await
     }
 
+    /// Like [`Db::begin_tenant_untimed`], but read-only and at `REPEATABLE
+    /// READ`, so several queries see one snapshot (src/analytics.rs). JIT
+    /// is off: the planner's estimates for scans under row-level security
+    /// cross its threshold, and compiling takes longer (about 300 ms) than
+    /// the queries it would speed up.
+    pub(crate) async fn begin_tenant_snapshot_untimed(
+        &self,
+        workspace_id: i64,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        let begin = format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY; SET LOCAL ROLE {TENANT_ROLE}; \
+             SET LOCAL jit = off; SET LOCAL {WORKSPACE_SETTING} = '{workspace_id}'"
+        );
+        self.pool.begin_with(sqlx::AssertSqlSafe(begin)).await
+    }
+
     /// The tenant-scoped queries for one workspace.
     pub fn tenant(&self, workspace_id: i64) -> crate::tenant::Tenant<'_> {
         crate::tenant::Tenant::new(self, workspace_id)

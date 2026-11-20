@@ -1699,6 +1699,7 @@ dependencies = [
  "axum",
  "chrono",
  "criterion",
+ "futures-util",
  "getrandom 0.4.3",
  "hmac",
  "proptest",

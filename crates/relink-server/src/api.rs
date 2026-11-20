@@ -28,6 +28,7 @@ use relink_core::wire::{ClickBatch, MAX_BATCH, WireClick};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::analytics;
 use crate::auth::Principal;
 use crate::classify::{self, Device, UNKNOWN_COUNTRY};
 use crate::clicks::ClickEvent;
@@ -115,6 +116,14 @@ impl ApiError {
     /// The request cannot be applied in the resource's current state.
     pub fn failed_precondition(message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::CONFLICT, "failed_precondition", message)
+    }
+    /// An analytics query over the cost limit (src/analytics.rs).
+    pub fn too_expensive(message: impl Into<String>) -> ApiError {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "query_too_expensive",
+            message,
+        )
     }
     pub fn too_large() -> ApiError {
         ApiError::new(
@@ -1136,6 +1145,61 @@ pub async fn link_stats(
     ))
 }
 
+/// `GET /v1/analytics`: clicks and unique visitors over any period, grouped
+/// and filtered by link, country, device and referrer (src/analytics.rs).
+pub async fn analytics(
+    State(app): State<Arc<App>>,
+    ws: Allowed<StatsRead>,
+    StrictQuery(p): StrictQuery<analytics::Params>,
+) -> Result<Response, ApiError> {
+    let q = analytics::parse(&p, Utc::now(), app.cfg.click_hourly_retention_days)
+        .map_err(ApiError::invalid)?;
+    let max_rows = app.cfg.analytics_max_rows;
+    match analytics::run(&app.db, ws.id, &q, max_rows).await {
+        Ok(report) => {
+            app.metrics.analytics_queries.inc();
+            app.metrics.analytics_rows.add(report.rows_scanned);
+            Ok(json(
+                StatusCode::OK,
+                &AnalyticsView {
+                    from: q.from,
+                    to: q.to,
+                    granularity: q.granularity,
+                    group_by: &q.group_by,
+                    compare: q.previous.map(|(from, to)| Period { from, to }),
+                    report,
+                },
+            ))
+        }
+        Err(analytics::QueryError::TooExpensive { max_rows }) => {
+            app.metrics.analytics_refused.inc();
+            Err(ApiError::too_expensive(format!(
+                "this query would read more than {max_rows} rollup rows; \
+                 narrow the period, filter by link or use a longer granularity"
+            )))
+        }
+        Err(analytics::QueryError::Db(e)) => Err(e.into()),
+    }
+}
+
+#[derive(Serialize)]
+struct Period {
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct AnalyticsView<'a> {
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    granularity: analytics::Granularity,
+    group_by: &'a [analytics::Dimension],
+    /// The compared period, when there is one.
+    compare: Option<Period>,
+    #[serde(flatten)]
+    report: analytics::Report,
+}
+
 /// `GET /v1/usage`: the workspace's plan, its limits and what it has used
 /// this month (src/quota.rs).
 pub async fn usage(
@@ -1314,6 +1378,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/links/{code}/schedules"),
     ("post", "/v1/links/{code}/schedules"),
     ("delete", "/v1/links/{code}/schedules/{id}"),
+    ("get", "/v1/analytics"),
     ("get", "/v1/usage"),
     ("post", "/v1/domains"),
     ("get", "/v1/domains"),

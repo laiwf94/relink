@@ -71,6 +71,7 @@
 //! | `RELINK_SCHEDULE_POLL_MS` | `1000` | How often scheduled link changes that are due are looked for and applied |
 //! | `RELINK_CLICK_EVENTS_RETENTION_MONTHS` | `13` | Calendar months of raw click events kept, the current one included (1 to 120); older monthly partitions are dropped |
 //! | `RELINK_CLICK_HOURLY_RETENTION_DAYS` | `92` | Days of hourly click rollups and hourly visitor sketches kept (1 to 3660); daily rollups are kept as long as their link |
+//! | `RELINK_ANALYTICS_MAX_ROWS` | `1000000` | Rollup rows and visitor sketches one `GET /v1/analytics` query may read (1000 to 100000000); a broader query is refused with 422 |
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |

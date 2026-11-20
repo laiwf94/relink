@@ -192,6 +192,37 @@
         }
       }
     },
+    "/v1/analytics": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "Query clicks and unique visitors",
+        "operationId": "analytics",
+        "security": [{ "apiKey": ["stats:read"] }, { "session": [] }],
+        "description": "Clicks over any period of whole UTC hours, as a time series, grouped by up to three dimensions (top N by clicks) and filtered on any of them, optionally compared with an earlier period. Whole days at a granularity of a day or longer are answered from the daily rollups, kept as long as their link; anything else from the hourly rollups, kept for RELINK_CLICK_HOURLY_RETENTION_DAYS. Unique visitors are estimated by merging HyperLogLog++ sketches (relative standard error 0.81%) and are reported only when the query groups and filters by link alone; a visitor's hash changes every UTC day, so over several days visitors are counted once per day. A query that would read more than RELINK_ANALYTICS_MAX_ROWS rollup rows and sketches is refused with 422 query_too_expensive.",
+        "parameters": [
+          { "name": "from", "in": "query", "schema": { "type": "string" }, "description": "Start, included: a date (YYYY-MM-DD, its first moment UTC) or an RFC 3339 time on a whole hour. Default: to minus 24 hours (hour), 12 weeks (week), 365 days (month) or 30 days." },
+          { "name": "to", "in": "query", "schema": { "type": "string" }, "description": "End: a date, included, or an RFC 3339 time on a whole hour, excluded. Default: the end of the current hour (hour) or day. The period is at most 366 days." },
+          { "name": "granularity", "in": "query", "schema": { "enum": ["hour", "day", "week", "month", "all"], "default": "day" }, "description": "Weeks start on Monday. A series has at most 1000 points." },
+          { "name": "group_by", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated, at most three of link, country, device and referrer." },
+          { "name": "link", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated links, each code (default domain) or hostname/code; at most 50. A link the workspace does not have is 404." },
+          { "name": "country", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated ISO 3166-1 alpha-2 codes (XX for unknown); at most 50." },
+          { "name": "device", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated: desktop, mobile, tablet, bot, other." },
+          { "name": "referrer", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated referrer hosts, or (direct); at most 50." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 }, "description": "Groups returned." },
+          { "name": "compare", "in": "query", "schema": { "enum": ["previous", "year"] }, "description": "Also count the period of the same length just before, or the same period a year earlier." }
+        ],
+        "responses": {
+          "200": { "description": "The report.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Analytics" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/usage": {
       "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
       "get": {
@@ -1118,6 +1149,53 @@
           "devices": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "desktop, mobile, tablet, bot or other." },
           "referrers": { "type": "array", "items": { "$ref": "#/components/schemas/Bucket" }, "description": "Referrer host, or (direct) when there was none." }
         }
+      },
+      "Analytics": {
+        "type": "object",
+        "required": ["from", "to", "granularity", "group_by", "compare", "rows_scanned", "total", "series", "groups"],
+        "properties": {
+          "from": { "type": "string", "format": "date-time" },
+          "to": { "type": "string", "format": "date-time", "description": "Excluded." },
+          "granularity": { "enum": ["hour", "day", "week", "month", "all"] },
+          "group_by": { "type": "array", "items": { "enum": ["link", "country", "device", "referrer"] } },
+          "compare": { "oneOf": [{ "type": "object", "required": ["from", "to"], "properties": { "from": { "type": "string", "format": "date-time" }, "to": { "type": "string", "format": "date-time" } } }, { "type": "null" }], "description": "The compared period." },
+          "rows_scanned": { "type": "integer", "description": "Rollup rows and sketches read, counted against the cost limit." },
+          "total": {
+            "type": "object",
+            "required": ["clicks", "visitors"],
+            "properties": {
+              "clicks": { "type": "integer" },
+              "visitors": { "type": ["integer", "null"] },
+              "previous": { "$ref": "#/components/schemas/AnalyticsCounts" }
+            }
+          },
+          "series": { "type": "array", "items": { "$ref": "#/components/schemas/AnalyticsPoint" }, "description": "Every point of the period, with 0 where there were no clicks." },
+          "groups": {
+            "type": "array",
+            "description": "The top groups by clicks, most first; ties in byte order of the values.",
+            "items": {
+              "type": "object",
+              "required": ["key", "clicks", "visitors"],
+              "properties": {
+                "key": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Value per grouped dimension; a link as code or hostname/code." },
+                "clicks": { "type": "integer" },
+                "visitors": { "type": ["integer", "null"] },
+                "previous": { "$ref": "#/components/schemas/AnalyticsCounts" },
+                "series": { "type": "array", "items": { "$ref": "#/components/schemas/AnalyticsPoint" }, "description": "Points with clicks only; absent for granularity all." }
+              }
+            }
+          }
+        }
+      },
+      "AnalyticsCounts": {
+        "type": "object",
+        "required": ["clicks", "visitors"],
+        "properties": { "clicks": { "type": "integer" }, "visitors": { "type": ["integer", "null"] } }
+      },
+      "AnalyticsPoint": {
+        "type": "object",
+        "required": ["t", "clicks"],
+        "properties": { "t": { "type": "string", "format": "date-time" }, "clicks": { "type": "integer" }, "visitors": { "type": "integer" } }
       },
       "LinkSettings": {
         "type": "object",

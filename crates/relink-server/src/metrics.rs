@@ -355,6 +355,11 @@ pub struct Metrics {
     pub events_dropped: Counter,
     /// Click batches found already committed when retried.
     pub batches_replayed: Counter,
+    /// Analytics queries answered, refused by the cost limit, and the rows
+    /// they read.
+    pub analytics_queries: Counter,
+    pub analytics_refused: Counter,
+    pub analytics_rows: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -404,6 +409,9 @@ impl Default for Metrics {
             partitions_dropped: Counter::default(),
             events_dropped: Counter::default(),
             batches_replayed: Counter::default(),
+            analytics_queries: Counter::default(),
+            analytics_refused: Counter::default(),
+            analytics_rows: Counter::default(),
             backlog: AtomicU64::new(0),
         }
     }
@@ -520,7 +528,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 35] = [
+        let counters: [(&str, &str, u64); 38] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -620,6 +628,21 @@ impl Metrics {
                 "relink_click_batches_replayed_total",
                 "Click batches retried after a lost acknowledgement and found already committed.",
                 self.batches_replayed.get(),
+            ),
+            (
+                "relink_analytics_queries_total",
+                "Analytics queries answered.",
+                self.analytics_queries.get(),
+            ),
+            (
+                "relink_analytics_queries_refused_total",
+                "Analytics queries refused because they would read more than RELINK_ANALYTICS_MAX_ROWS rows.",
+                self.analytics_refused.get(),
+            ),
+            (
+                "relink_analytics_rows_scanned_total",
+                "Rollup rows and visitor sketches read by answered analytics queries.",
+                self.analytics_rows.get(),
             ),
             (
                 "relink_lookups_coalesced_total",

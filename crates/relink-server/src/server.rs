@@ -186,6 +186,7 @@ pub fn public_router(app: Arc<App>) -> Router {
                 .delete(api::delete_link),
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
+        .route("/v1/analytics", get(api::analytics))
         .route("/v1/links/{code}/versions", get(schedule::list_versions))
         .route("/v1/links/{code}/rollback", post(schedule::rollback))
         .route(

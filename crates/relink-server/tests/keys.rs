@@ -139,7 +139,7 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 18);
+    assert_eq!(routes.len(), 19);
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
     routes.sort_by_key(|(m, p, _)| (*m == "delete", p == "/v1/links/{code}"));

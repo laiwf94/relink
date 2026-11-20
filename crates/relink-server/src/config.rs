@@ -9,6 +9,7 @@ use std::time::Duration;
 use axum::http::HeaderName;
 
 use crate::acme::AcmeConfig;
+use crate::analytics;
 use crate::cache;
 use crate::clicks::FlushConfig;
 use crate::code::{MAX_CODE_LEN, MIN_CODE_LEN};
@@ -106,6 +107,8 @@ pub struct Config {
     pub click_events_retention_months: u32,
     /// Days of hourly click rollups and hourly visitor sketches kept.
     pub click_hourly_retention_days: u32,
+    /// Rollup rows and sketches one analytics query may read.
+    pub analytics_max_rows: u64,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -172,6 +175,7 @@ impl fmt::Debug for Config {
                 "click_hourly_retention_days",
                 &self.click_hourly_retention_days,
             )
+            .field("analytics_max_rows", &self.analytics_max_rows)
             .field("api_rate", &self.api_rate)
             .field("auth_lookup_rate", &self.auth_lookup_rate)
             .field("auth_lookup_rate_per_ip", &self.auth_lookup_rate_per_ip)
@@ -563,6 +567,12 @@ impl Config {
                 1,
                 MAX_HOURLY_RETENTION_DAYS,
             )?,
+            analytics_max_rows: v.parse(
+                "RELINK_ANALYTICS_MAX_ROWS",
+                analytics::DEFAULT_MAX_ROWS,
+                analytics::MIN_MAX_ROWS,
+                analytics::MAX_MAX_ROWS,
+            )?,
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
                 burst: v.parse("RELINK_API_BURST", 20.0, 1.0, 1_000_000.0)?,
@@ -655,6 +665,7 @@ mod tests {
         assert_eq!(c.acme, None);
         assert_eq!(c.click_events_retention_months, 13);
         assert_eq!(c.click_hourly_retention_days, 92);
+        assert_eq!(c.analytics_max_rows, 1_000_000);
         assert_eq!(c.flush.max_events, 200_000);
         let c = from(&[
             ("RELINK_DATABASE_URL", "postgres://x/y"),
@@ -959,6 +970,19 @@ mod tests {
         for bad in ["-1", "50000001", "many"] {
             let e = from(&[base, ("RELINK_CLICK_EVENT_BACKLOG", bad)]).unwrap_err();
             assert!(e.starts_with("RELINK_CLICK_EVENT_BACKLOG:"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn analytics_cost_limit_is_bounded() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        for (raw, n) in [("1000", 1_000), ("", 1_000_000), ("100000000", 100_000_000)] {
+            let c = from(&[base, ("RELINK_ANALYTICS_MAX_ROWS", raw)]).unwrap();
+            assert_eq!(c.analytics_max_rows, n, "{raw:?}");
+        }
+        for bad in ["999", "100000001", "-5", "lots"] {
+            let e = from(&[base, ("RELINK_ANALYTICS_MAX_ROWS", bad)]).unwrap_err();
+            assert!(e.starts_with("RELINK_ANALYTICS_MAX_ROWS:"), "{bad:?}: {e}");
         }
     }
 }
