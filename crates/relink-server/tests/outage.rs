@@ -203,9 +203,23 @@ async fn shutdown_with_the_database_down_respects_one_deadline() {
         ("RELINK_DB_TIMEOUT_MS", "500"),
         ("RELINK_LEASE_MAX", "50")
     );
-    let l = h
-        .create(json!({"url": "https://example.com/", "max_clicks": 1000}))
-        .await;
+    // The create is the first request to need a connection, and opening
+    // one can take longer than the 500 ms query timeout in instrumented
+    // builds (#82); retry while the database is still up.
+    let body = json!({"url": "https://example.com/", "max_clicks": 1000});
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let l = loop {
+        let (status, l) = h
+            .api(Method::POST, "/v1/links", &h.alice, Some(body.clone()))
+            .await;
+        match status {
+            201 => break l,
+            503 if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            _ => panic!("create failed: {status} {l}"),
+        }
+    };
     let code = l["code"].as_str().unwrap().to_owned();
     assert_eq!(h.visit(&code, &[]).await.status(), 302);
     h.proxy.cut();
