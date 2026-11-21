@@ -5,7 +5,14 @@ all-features = false
 
 [advisories]
 # Every RustSec advisory fails the build unless listed here with a reason.
-ignore = []
+ignore = [
+    # chrono is unmaintained (RUSTSEC-2026-0543). This is a notice, not a
+    # vulnerability, and no version resolves it. chrono reaches the build
+    # through relink-core, relink-server, sqlx's `chrono` feature and the
+    # Worker's `worker` crate, so the advisory stays until relink and sqlx
+    # move to `time` or `jiff`. Remove this entry then (#81).
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; replacement tracked in #81" },
+]
 
 [licenses]
 confidence-threshold = 0.9
