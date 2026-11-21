@@ -92,6 +92,16 @@ fn password(url: &str) -> String {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
+        // DROP DATABASE forces an immediate checkpoint, which writes out every
+        // dirty buffer on the server, the other tests' included. With about
+        // 150 tests that is about 150 I/O bursts, landing on whichever tests
+        // are still running; on a CI runner's disk one burst held a click
+        // flush past its 2 s timeout (#83). CI's Postgres is discarded with
+        // the job, so there the databases (about 10 MB each) are left in
+        // place instead.
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
         let admin = self.admin.clone();
         let name = self.name.clone();
         // A dedicated runtime: Drop may run inside or outside one.
