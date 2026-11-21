@@ -510,11 +510,15 @@ async fn broad_queries_are_refused_by_the_cost_limit() {
     });
     insert_rows(&h, &links, &data).await;
 
+    // Bot rows are read only when asked for: without them the period
+    // reads 865 rows and fits the limit.
     let hourly = format!(
         "from={}&to={}&granularity=hour",
         ts(midnight(first_day())),
         ts(midnight(first_day()) + ChronoDuration::days(3))
     );
+    assert_eq!(ok(&h, &hourly).await["rows_scanned"], 865);
+    let hourly = format!("{hourly}&include_bots=true");
     let (status, body) = get(&h, &h.alice, &hourly).await;
     assert_eq!(status, 422, "{body}");
     assert_eq!(body["error"]["code"], "query_too_expensive", "{body}");
@@ -632,5 +636,98 @@ async fn bad_queries_are_refused_before_the_database() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn bots_are_left_out_unless_included() {
+    let mut h = harness!(("RELINK_CLIENT_IP_HEADER", "x-client-ip"));
+    let link = h.create(json!({"url": "https://example.com/"})).await;
+    let code = link["code"].as_str().unwrap().to_owned();
+    let crawler = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+    let preview = "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)";
+    let person = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148";
+    for (ua, ip) in [
+        (person, "203.0.113.1"),
+        (person, "203.0.113.2"),
+        (crawler, "203.0.113.3"),
+        (preview, "203.0.113.4"),
+        (preview, "203.0.113.4"),
+    ] {
+        let resp = h
+            .visit(&code, &[("user-agent", ua), ("x-client-ip", ip)])
+            .await;
+        assert_eq!(resp.status(), 302);
+    }
+    let q = format!("granularity=hour&link={code}&group_by=link");
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            let (_, r) = get(&h, &h.alice, &format!("{q}&include_bots=true")).await;
+            r["total"]["clicks"] == 5
+        })
+        .await,
+        "clicks were not flushed"
+    );
+
+    // By default only the two people count, as clicks and as visitors.
+    let r = ok(&h, &q).await;
+    assert_eq!(r["include_bots"], false);
+    assert_eq!(r["bot_list_version"], 1);
+    assert_eq!(r["total"]["clicks"], 2, "{r}");
+    assert_eq!(r["total"]["visitors"], 2, "{r}");
+    assert_eq!(r["groups"][0]["clicks"], 2);
+
+    // With bots, the clicks are all there but bots are never visitors.
+    let r = ok(&h, &format!("{q}&include_bots=true")).await;
+    assert_eq!(r["include_bots"], true);
+    assert_eq!(r["total"]["clicks"], 5, "{r}");
+    assert_eq!(r["total"]["visitors"], 2, "{r}");
+    let r = ok(
+        &h,
+        &format!("granularity=hour&link={code}&group_by=device&include_bots=true"),
+    )
+    .await;
+    let by_device: BTreeMap<String, i64> = r["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["key"]["device"].as_str().unwrap().to_owned(),
+                g["clicks"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by_device,
+        BTreeMap::from([("bot".into(), 3), ("mobile".into(), 2)])
+    );
+    let r = ok(
+        &h,
+        &format!("granularity=hour&link={code}&device=bot&include_bots=true"),
+    )
+    .await;
+    assert_eq!(r["total"]["clicks"], 3, "{r}");
+    let (status, body) = get(&h, &h.alice, &format!("link={code}&device=bot")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("include_bots=true")
+    );
+
+    // Raw events carry the flag, and bots have no visitor hash.
+    let flags: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT e.device, e.bot, e.visitor IS NOT NULL FROM click_events e
+           JOIN links l ON l.id = e.link_id WHERE l.code = $1 ORDER BY 1, 2, 3",
+    )
+    .bind(&code)
+    .fetch_all(h.store.pool())
+    .await
+    .unwrap();
+    let bot = ("bot".to_owned(), true, false);
+    let human = ("mobile".to_owned(), false, true);
+    assert_eq!(flags, [bot.clone(), bot.clone(), bot, human.clone(), human]);
     h.shutdown().await;
 }

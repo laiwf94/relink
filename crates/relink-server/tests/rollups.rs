@@ -373,6 +373,7 @@ async fn write_batch_is_idempotent_and_skips_deleted_links() {
         link_id,
         country: *b"FR",
         device: "mobile",
+        bot: false,
         referrer: None,
         visitor: None,
     };

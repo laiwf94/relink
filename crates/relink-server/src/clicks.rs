@@ -21,6 +21,10 @@
 //! bound, `max_events`; past it a click still reaches every rollup and only
 //! its raw event is dropped.
 //!
+//! Clicks whose User-Agent names an automated client
+//! (`relink_core::classify::bot_kind`) are counted under the device class
+//! `bot`, flagged in their raw event, and never counted as visitors.
+//!
 //! Client addresses never reach the database. A redirect computes a 16-byte
 //! SHA-256 fingerprint of (address, User-Agent) that only lives in memory; the
 //! flusher turns it into HMAC(daily salt, link, fingerprint). Salts are random,
@@ -267,9 +271,13 @@ impl Flusher {
             referrer: ev.referrer.clone(),
         };
         *self.pending.counts.entry(row).or_insert(0) += 1;
-        self.pending
-            .visitors
-            .insert((ev.link_id, ev.hour(), ev.fingerprint));
+        // A bot is counted as a click of device class "bot", never as a
+        // visitor: sketches have no device dimension to leave it out by.
+        if ev.device != Device::Bot {
+            self.pending
+                .visitors
+                .insert((ev.link_id, ev.hour(), ev.fingerprint));
+        }
         self.pending.clicks += 1;
         if self.event_backlog() < self.cfg.max_events {
             self.pending.events.push(ev);
@@ -401,9 +409,11 @@ impl Flusher {
                 link_id: ev.link_id,
                 country: ev.country,
                 device: ev.device.as_str(),
+                bot: ev.device == Device::Bot,
                 visitor: self
                     .salts
                     .get(&ev.day())
+                    .filter(|_| ev.device != Device::Bot)
                     .map(|salt| visitor_hash(salt, ev.link_id, &ev.fingerprint)),
                 referrer: ev.referrer,
             })
@@ -710,6 +720,40 @@ mod tests {
         assert_eq!(f.event_backlog(), 0);
         assert!(f.flush().await, "nothing pending is success");
         assert_eq!(sink.attempts.lock().unwrap().len(), 1);
+    }
+
+    /// A bot's click is counted under device class "bot" and kept as a raw
+    /// event flagged as a bot, but is no visitor: no hash, no sketch.
+    #[tokio::test]
+    async fn bots_are_clicks_but_never_visitors() {
+        let sink = Arc::new(FakeSink::default());
+        let mut f = Flusher::new(sink.clone(), Arc::new(Metrics::default()), cfg());
+        f.absorb(event(7, 100, 1));
+        for v in [2, 3] {
+            f.absorb(ClickEvent {
+                device: Device::Bot,
+                ..event(7, 100, v)
+            });
+        }
+        assert!(f.flush().await);
+        let rows = sink.rows.lock().unwrap();
+        let by_device = |d: &str| -> i64 {
+            rows.iter()
+                .filter(|(k, _)| k.device == d)
+                .map(|(_, n)| n)
+                .sum()
+        };
+        assert_eq!((by_device("mobile"), by_device("bot")), (1, 2));
+        assert_eq!(sink.visitors.lock().unwrap().len(), 1);
+        assert_eq!(sink.day_sketches.lock().unwrap()[&(7, 100)].count(), 1);
+        assert_eq!(sink.hour_sketches.lock().unwrap()[&(7, 2400)].count(), 1);
+        let events = sink.events.lock().unwrap();
+        let mut flags: Vec<(bool, bool)> = events
+            .iter()
+            .map(|e| (e.bot, e.visitor.is_some()))
+            .collect();
+        flags.sort();
+        assert_eq!(flags, [(false, true), (true, false), (true, false)]);
     }
 
     /// Hourly rows keep the hour; the daily rows of the same batch add the

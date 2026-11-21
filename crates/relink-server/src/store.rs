@@ -479,8 +479,11 @@ pub struct StoredEvent {
     pub link_id: i64,
     pub country: [u8; 2],
     pub device: &'static str,
+    /// Whether the client was an automated one (device class `bot`).
+    pub bot: bool,
     pub referrer: Option<Box<str>>,
-    /// The day's visitor hash, or `None` if that day's salt was gone.
+    /// The day's visitor hash; `None` for a bot or if the day's salt was
+    /// gone.
     pub visitor: Option<[u8; 16]>,
 }
 
@@ -701,6 +704,7 @@ struct EventColumns {
     ids: Vec<i64>,
     countries: Vec<String>,
     devices: Vec<&'static str>,
+    bots: Vec<bool>,
     referrers: Vec<String>,
     visitors: Vec<Option<Vec<u8>>>,
 }
@@ -715,6 +719,7 @@ impl EventColumns {
                 .map(|e| String::from_utf8_lossy(&e.country).into_owned())
                 .collect(),
             devices: events.iter().map(|e| e.device).collect(),
+            bots: events.iter().map(|e| e.bot).collect(),
             referrers: events
                 .iter()
                 .map(|e| referrer_or_direct(&e.referrer))
@@ -728,10 +733,10 @@ impl EventColumns {
 
     async fn write(&self, tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO click_events (at, workspace_id, link_id, domain_id, country, device, referrer_host, visitor)
-             SELECT u.at, l.workspace_id, u.link_id, l.domain_id, u.country, u.device, u.referrer_host, u.visitor
-               FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::text[], $6::bytea[])
-                    AS u(at, link_id, country, device, referrer_host, visitor)
+            "INSERT INTO click_events (at, workspace_id, link_id, domain_id, country, device, referrer_host, visitor, bot)
+             SELECT u.at, l.workspace_id, u.link_id, l.domain_id, u.country, u.device, u.referrer_host, u.visitor, u.bot
+               FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::text[], $6::bytea[], $7::boolean[])
+                    AS u(at, link_id, country, device, referrer_host, visitor, bot)
                JOIN links l ON l.id = u.link_id",
         )
         .bind(&self.ats)
@@ -740,6 +745,7 @@ impl EventColumns {
         .bind(&self.devices)
         .bind(&self.referrers)
         .bind(&self.visitors)
+        .bind(&self.bots)
         .execute(&mut **tx)
         .await?;
         Ok(())

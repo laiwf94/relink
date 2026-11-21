@@ -15,6 +15,11 @@
 //!   the query groups and filters by link alone; otherwise `visitors` is
 //!   null rather than a number that would be wrong.
 //!
+//! Clicks of automated clients (device class `bot`, from the versioned
+//! list in `relink_core::classify`) are left out unless the query says
+//! `include_bots=true`; sketches never hold bots, so `visitors` are people
+//! either way.
+//!
 //! Every query has a cost limit: the rollup rows and sketches it reads,
 //! together, may not exceed `RELINK_ANALYTICS_MAX_ROWS`. The scan is a
 //! `LIMIT`ed, materialised CTE, so the database never reads more than one
@@ -28,7 +33,7 @@ use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 
-use crate::classify::Device;
+use crate::classify::{BOT_LIST_VERSION, Device};
 use crate::hll::Hll;
 use crate::store::{DIRECT, Db, DbError};
 
@@ -192,6 +197,7 @@ pub struct Params {
     pub referrer: Option<String>,
     pub limit: Option<u32>,
     pub compare: Option<String>,
+    pub include_bots: Option<String>,
 }
 
 /// A checked query.
@@ -208,6 +214,8 @@ pub struct Query {
     pub referrers: Vec<String>,
     pub limit: u32,
     pub compare: Option<Compare>,
+    /// Whether clicks of device class `bot` count; off unless asked for.
+    pub include_bots: bool,
     /// The compared period, `[from, to)`, when there is one.
     pub previous: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub source: Source,
@@ -438,6 +446,18 @@ pub fn parse(p: &Params, now: DateTime<Utc>, hourly_retention_days: u32) -> Resu
         return Err(format!("group_by takes at most {MAX_GROUP_BY} dimensions"));
     }
 
+    let include_bots = match p.include_bots.as_deref().map(str::trim) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err("include_bots must be true or false".into()),
+    };
+    let devices = filter("device", &p.device, device)?;
+    if !include_bots && devices.iter().any(|d| d == Device::Bot.as_str()) {
+        return Err(
+            "bots are left out unless include_bots=true; add it to filter by device=bot".into(),
+        );
+    }
+
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(format!("limit must be between 1 and {MAX_LIMIT}"));
@@ -493,10 +513,11 @@ pub fn parse(p: &Params, now: DateTime<Utc>, hourly_retention_days: u32) -> Resu
         group_by,
         links: filter("link", &p.link, link_ref)?,
         countries: filter("country", &p.country, country)?,
-        devices: filter("device", &p.device, device)?,
+        devices,
         referrers: filter("referrer", &p.referrer, referrer)?,
         limit,
         compare,
+        include_bots,
         previous,
         source,
     })
@@ -550,6 +571,10 @@ pub struct Total {
 pub struct Report {
     /// Rollup rows and sketches read, counted against the cost limit.
     pub rows_scanned: u64,
+    /// Whether bot clicks are counted, and the version of the list that
+    /// classified them.
+    pub include_bots: bool,
+    pub bot_list_version: u32,
     pub total: Total,
     /// Every point of the period, including those without clicks.
     pub series: Vec<Point>,
@@ -667,7 +692,13 @@ enum Table {
 
 /// The `WHERE` clause both scans share: the periods, the links and the
 /// filters. `cur` is a predicate true for rows of the period itself.
-fn push_where(qb: &mut QueryBuilder<Postgres>, q: &Query, col: &str, link_ids: &Option<Vec<i64>>) {
+fn push_where(
+    qb: &mut QueryBuilder<Postgres>,
+    q: &Query,
+    kind: Table,
+    col: &str,
+    link_ids: &Option<Vec<i64>>,
+) {
     let range = |qb: &mut QueryBuilder<Postgres>, f: DateTime<Utc>, t: DateTime<Utc>| {
         qb.push(format_args!("(x.{col} >= "));
         push_bound(qb, bound(q.source, f));
@@ -706,6 +737,11 @@ fn push_where(qb: &mut QueryBuilder<Postgres>, q: &Query, col: &str, link_ids: &
             qb.push(")");
         }
     }
+    // Sketches hold no bots, and no device column.
+    if matches!(kind, Table::Clicks) && !q.include_bots {
+        qb.push(" AND x.device <> ");
+        qb.push_bind(Device::Bot.as_str());
+    }
 }
 
 /// The four key columns of an output row: the grouped ones read from the
@@ -741,7 +777,7 @@ fn clicks_sql(q: &Query, link_ids: &Option<Vec<i64>>, scan_limit: i64) -> QueryB
         qb.push(format_args!(", x.{}", d.column()));
     }
     qb.push(format_args!(", x.clicks FROM {table} x"));
-    push_where(&mut qb, q, col, link_ids);
+    push_where(&mut qb, q, Table::Clicks, col, link_ids);
     qb.push(" LIMIT ");
     qb.push_bind(scan_limit);
     qb.push(")");
@@ -795,7 +831,7 @@ fn sketches_sql(q: &Query, link_ids: &Option<Vec<i64>>, scan_limit: i64) -> Quer
     qb.push(format_args!(
         " AS cur, {bucket} AS t, x.sketch FROM {table} x"
     ));
-    push_where(&mut qb, q, col, link_ids);
+    push_where(&mut qb, q, Table::Sketches, col, link_ids);
     qb.push(format_args!(" ORDER BY x.{col} LIMIT "));
     qb.push_bind(scan_limit);
     qb
@@ -1072,6 +1108,8 @@ pub async fn run(
             .collect();
         Ok(Report {
             rows_scanned: scanned,
+            include_bots: q.include_bots,
+            bot_list_version: BOT_LIST_VERSION,
             total: Total {
                 clicks: total_clicks,
                 visitors: total_visitors,
@@ -1290,6 +1328,31 @@ mod tests {
         assert!(err(&[("link", "host/")]).contains("link"));
         let many: Vec<String> = (0..=MAX_FILTER_VALUES).map(|i| format!("c{i}")).collect();
         assert!(err(&[("link", &many.join(","))]).contains("at most"));
+    }
+
+    #[test]
+    fn bots_are_left_out_unless_included() {
+        let q = ok(&[]);
+        assert!(!q.include_bots);
+        let sql = clicks_sql(&q, &None, 11).sql().as_str().to_owned();
+        assert!(sql.contains("AND x.device <> $"), "{sql}");
+        assert!(!sql.contains("'bot'"), "the value is bound: {sql}");
+        let sql = sketches_sql(&q, &None, 11).sql().as_str().to_owned();
+        assert!(!sql.contains("device"), "sketches hold no bots: {sql}");
+
+        assert!(!ok(&[("include_bots", "false")]).include_bots);
+        let q = ok(&[("include_bots", "true")]);
+        assert!(q.include_bots && q.has_visitors());
+        let sql = clicks_sql(&q, &None, 11).sql().as_str().to_owned();
+        assert!(!sql.contains("x.device <>"), "{sql}");
+
+        let q = ok(&[("include_bots", "true"), ("device", "bot,mobile")]);
+        assert_eq!(q.devices, ["bot", "mobile"]);
+        assert!(err(&[("device", "bot")]).contains("include_bots=true"));
+        assert!(
+            err(&[("device", "mobile,Bot"), ("include_bots", "false")]).contains("include_bots")
+        );
+        assert!(err(&[("include_bots", "yes")]).contains("true or false"));
     }
 
     #[test]

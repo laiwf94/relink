@@ -57,7 +57,7 @@ against two traits, `Kv` and `Origin`, so it runs and is tested natively;
 | `click_hourly` | `click_daily` at the resolution of a UTC hour, with the link's workspace. Kept for `RELINK_CLICK_HOURLY_RETENTION_DAYS`. |
 | `visitor_sketch_hourly`, `visitor_sketch_daily` | A HyperLogLog++ sketch of each link's visitors per UTC hour and per UTC day. |
 | `click_batches` | The random key of every click batch written in the last week, so a retried batch is applied once. Server role only. |
-| `click_events` | Raw clicks, one row each: time, workspace, link, domain, country, device class, referrer host, visitor hash and a bot flag. Partitioned by UTC calendar month (`click_events_pYYYYMM`); retention drops whole months. |
+| `click_events` | Raw clicks, one row each: time, workspace, link, domain, country, device class, referrer host, visitor hash (none for bots) and a bot flag. Partitioned by UTC calendar month (`click_events_pYYYYMM`); retention drops whole months. |
 | `kv_outbox` | Codes whose KV copy must be rewritten or deleted. |
 | `users` | People who signed in: issuer and subject at the provider, their member name, email address and display name. |
 | `oidc_logins` | Sign-ins between the redirect to the provider and its return: SHA-256 of `state`, nonce, PKCE verifier, return path, expiry. |
@@ -1742,8 +1742,65 @@ the 2-second query timeout. The transaction turns JIT off: the planner's
 estimates for scans under row-level security cross JIT's threshold, and
 compiling took about 300 ms, longer than the 60 ms query it was compiling.
 
-Bot clicks are still counted like any other in this release; classifying
-them and leaving them out by default comes next.
+### Bots and link previews
+
+Pasting a link into a chat app or a social post makes the app fetch it to
+draw a card, and crawlers, uptime monitors and scripts follow links too.
+Counted as people, they inflate clicks the moment a link is shared.
+`relink-core/src/classify.rs` recognises them from the User-Agent, at the
+origin and at the edge alike, with a versioned list:
+
+| Kind | Examples |
+|---|---|
+| `crawler` | Googlebot, Bingbot, Applebot, AhrefsBot, GPTBot, ClaudeBot, CCBot |
+| `preview` | facebookexternalhit (also iMessage), Twitterbot, Slackbot, Discordbot, WhatsApp, TelegramBot, LinkedInBot, Mastodon, Bluesky |
+| `monitor` | UptimeRobot, Pingdom, StatusCake, Datadog Synthetics, Lighthouse |
+| `tool` | curl, Wget, python-requests, Go's client, axios, Postman, headless Chrome |
+
+`AGENTS` holds about 90 named tokens; when none matches, the generic words
+`bot`, `crawl`, `spider`, `preview` and `headless` catch the rest, except
+inside words of real browsers such as the CUBOT phone brand. Real in-app
+browsers (Facebook's FBAN, Instagram, LinkedInApp, Telegram-Android) are not
+bots: they are people reading the page. The list is checked when the crate
+compiles (sorted by first byte, lowercase, no token shadowed by an earlier
+one), and `BOT_LIST_VERSION` (now 1) must change with it: a test pins a
+digest of the list to the version.
+
+Matching reads the first 512 bytes, lowercased. Named tokens match where a
+word starts (at the start or after a byte that is not a letter or digit),
+which is where every real client puts its name; the first one found wins,
+so a preview fetcher built on an HTTP library is still a preview. The scan
+finds word starts eight bytes at a time with SWAR range tests, rejects
+almost every word with an 8 KiB bitmap of the tokens' first two bytes, and
+compares only the few tokens that share the word's first two bytes, both
+tables built at compile time. The generic words are then five `contains`
+calls. On the benchmark machine `device_class` of a browser's User-Agent
+went from 153 ns (ten hard-coded tokens) to 222 ns, and the cached-redirect
+handler benchmark showed no significant change; the Worker bundle grew by
+2.1 KB gzipped, to 249,111 bytes, close to the 250 KB target.
+
+A User-Agent is whatever the client sends, so this catches clients that
+announce themselves, which the well-behaved ones do; one that claims to be a
+browser counts as a browser.
+
+What happens to a bot's click:
+
+- It is counted, in every rollup, under the device class `bot`, so nothing
+  is lost and the stats endpoint still shows it in its device breakdown.
+- Its raw event has `bot = true` and no visitor hash.
+- It is never a visitor: it feeds no visitor hash and no sketch. Sketches
+  have no device dimension, so this is the only way to keep bots out of
+  unique visitors.
+- `GET /v1/analytics` leaves it out (`device <> 'bot'` on the click scan)
+  unless the query has `include_bots=true`; filtering by `device=bot`
+  without it is refused, since it could only return nothing. Every answer
+  says `include_bots` and the `bot_list_version` that classified it.
+  `visitors` are people either way.
+- Targeting rules can route `device: ["bot"]`, for example to send
+  previews a static page.
+
+Quotas and click limits count bot clicks like any other: the redirect was
+served either way.
 
 ## Health checks and SSRF
 
