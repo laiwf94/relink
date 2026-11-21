@@ -72,6 +72,13 @@
 //! | `RELINK_CLICK_EVENTS_RETENTION_MONTHS` | `13` | Calendar months of raw click events kept, the current one included (1 to 120); older monthly partitions are dropped |
 //! | `RELINK_CLICK_HOURLY_RETENTION_DAYS` | `92` | Days of hourly click rollups and hourly visitor sketches kept (1 to 3660); daily rollups are kept as long as their link |
 //! | `RELINK_ANALYTICS_MAX_ROWS` | `1000000` | Rollup rows and visitor sketches one `GET /v1/analytics` query may read (1000 to 100000000); a broader query is refused with 422 |
+//! | `RELINK_LIVE_MAX_PER_WORKSPACE` | `50` | Live click streams (`GET /v1/links/{code}/live`) one workspace may have open on one instance (1 to 100000); more get 429 |
+//! | `RELINK_LIVE_MAX_STREAMS` | `10000` | Live click streams open on one instance (1 to 1000000) |
+//! | `RELINK_LIVE_BUFFER` | `256` | Clicks a workspace's live channel holds for streams that fall behind (1 to 65536); a stream further behind is told how many it missed |
+//! | `RELINK_LIVE_RELAY_QUEUE` | `4096` | Clicks waiting to be relayed to live streams on other instances; past it they are dropped and counted |
+//! | `RELINK_LIVE_ANNOUNCE_MS` | `10000` | How often an instance tells the others which links it streams (100 to 600000) |
+//! | `RELINK_LIVE_KEEPALIVE_MS` | `15000` | Comment sent on an idle live stream (100 to 600000) |
+//! | `RELINK_LIVE_MAX_AGE_S` | `3600` | A live stream ends after this long and the client reconnects, signing in again (1 to 86400) |
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |

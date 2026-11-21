@@ -14,6 +14,7 @@ use crate::cache;
 use crate::clicks::FlushConfig;
 use crate::code::{MAX_CODE_LEN, MIN_CODE_LEN};
 use crate::destination::Policy;
+use crate::live::LiveConfig;
 use crate::oidc::OidcConfig;
 use crate::partitions;
 use crate::ratelimit::Rate;
@@ -109,6 +110,8 @@ pub struct Config {
     pub click_hourly_retention_days: u32,
     /// Rollup rows and sketches one analytics query may read.
     pub analytics_max_rows: u64,
+    /// Live click streams (src/live.rs).
+    pub live: LiveConfig,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -176,6 +179,7 @@ impl fmt::Debug for Config {
                 &self.click_hourly_retention_days,
             )
             .field("analytics_max_rows", &self.analytics_max_rows)
+            .field("live", &self.live)
             .field("api_rate", &self.api_rate)
             .field("auth_lookup_rate", &self.auth_lookup_rate)
             .field("auth_lookup_rate_per_ip", &self.auth_lookup_rate_per_ip)
@@ -573,6 +577,15 @@ impl Config {
                 analytics::MIN_MAX_ROWS,
                 analytics::MAX_MAX_ROWS,
             )?,
+            live: LiveConfig {
+                max_per_workspace: v.parse("RELINK_LIVE_MAX_PER_WORKSPACE", 50, 1, 100_000)?,
+                max_streams: v.parse("RELINK_LIVE_MAX_STREAMS", 10_000, 1, 1_000_000)?,
+                buffer: v.parse("RELINK_LIVE_BUFFER", 256, 1, 65_536)?,
+                relay_queue: v.parse("RELINK_LIVE_RELAY_QUEUE", 4_096, 1, 1_000_000)?,
+                announce: v.millis("RELINK_LIVE_ANNOUNCE_MS", 10_000, 100, 600_000)?,
+                keep_alive: v.millis("RELINK_LIVE_KEEPALIVE_MS", 15_000, 100, 600_000)?,
+                max_age: Duration::from_secs(v.parse("RELINK_LIVE_MAX_AGE_S", 3_600, 1, 86_400)?),
+            },
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
                 burst: v.parse("RELINK_API_BURST", 20.0, 1.0, 1_000_000.0)?,
@@ -666,6 +679,7 @@ mod tests {
         assert_eq!(c.click_events_retention_months, 13);
         assert_eq!(c.click_hourly_retention_days, 92);
         assert_eq!(c.analytics_max_rows, 1_000_000);
+        assert_eq!(c.live, LiveConfig::default());
         assert_eq!(c.flush.max_events, 200_000);
         let c = from(&[
             ("RELINK_DATABASE_URL", "postgres://x/y"),
@@ -983,6 +997,46 @@ mod tests {
         for bad in ["999", "100000001", "-5", "lots"] {
             let e = from(&[base, ("RELINK_ANALYTICS_MAX_ROWS", bad)]).unwrap_err();
             assert!(e.starts_with("RELINK_ANALYTICS_MAX_ROWS:"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn live_stream_settings_are_bounded() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let c = from(&[
+            base,
+            ("RELINK_LIVE_MAX_PER_WORKSPACE", "3"),
+            ("RELINK_LIVE_MAX_STREAMS", "9"),
+            ("RELINK_LIVE_BUFFER", "16"),
+            ("RELINK_LIVE_RELAY_QUEUE", "32"),
+            ("RELINK_LIVE_ANNOUNCE_MS", "250"),
+            ("RELINK_LIVE_KEEPALIVE_MS", "500"),
+            ("RELINK_LIVE_MAX_AGE_S", "60"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.live,
+            LiveConfig {
+                max_per_workspace: 3,
+                max_streams: 9,
+                buffer: 16,
+                relay_queue: 32,
+                announce: Duration::from_millis(250),
+                keep_alive: Duration::from_millis(500),
+                max_age: Duration::from_secs(60),
+            }
+        );
+        for (name, bad) in [
+            ("RELINK_LIVE_MAX_PER_WORKSPACE", "0"),
+            ("RELINK_LIVE_MAX_STREAMS", "1000001"),
+            ("RELINK_LIVE_BUFFER", "65537"),
+            ("RELINK_LIVE_RELAY_QUEUE", "0"),
+            ("RELINK_LIVE_ANNOUNCE_MS", "99"),
+            ("RELINK_LIVE_KEEPALIVE_MS", "soon"),
+            ("RELINK_LIVE_MAX_AGE_S", "86401"),
+        ] {
+            let e = from(&[base, (name, bad)]).unwrap_err();
+            assert!(e.starts_with(&format!("{name}:")), "{name}={bad:?}: {e}");
         }
     }
 }

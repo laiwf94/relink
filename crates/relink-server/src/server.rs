@@ -30,6 +30,7 @@ use crate::health::HealthWorker;
 use crate::invite;
 use crate::kvsync::{CloudflareHostnames, CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
+use crate::live::{LIVE_CHANNEL, LiveHub, LiveSink};
 use crate::metrics::{DbOp, Gauges, Metrics};
 use crate::oidc::{self, Oidc};
 use crate::partitions;
@@ -78,6 +79,8 @@ pub struct App {
     pub tls: Option<Tls>,
     /// Hashes and checks protected links' passwords.
     pub hasher: Hasher,
+    /// Live click streams (src/live.rs).
+    pub live: Arc<LiveHub>,
 }
 
 /// Credentials tracked by the API rate limiter (one bucket per key or person).
@@ -141,6 +144,7 @@ impl App {
             sealer: cfg.key_encryption_key.map(|k| Arc::new(Sealer::new(&k))),
             tls: cfg.tls.clone().map(Tls::new),
             hasher: Hasher::default(),
+            live: Arc::new(LiveHub::new(cfg.live, metrics.clone())),
             shutting_down: AtomicBool::new(false),
             change_feed: AtomicBool::new(false),
             kv_wake: Arc::new(Notify::new()),
@@ -163,7 +167,15 @@ impl App {
             db_pool_size: self.db.pool_stats().0,
             db_pool_idle: self.db.pool_stats().1,
             tls_certificates: self.tls.as_ref().map_or(0, |t| t.store.len()),
+            live_streams: self.live.streams(),
         }
+    }
+
+    /// Takes one click: to the live streams watching its link, then to the
+    /// queue for the flusher. Never waits.
+    pub fn click(&self, event: ClickEvent) {
+        self.live.publish(&event);
+        self.clicks.record(event);
     }
 
     /// Applies a change notification (or a local change) for a link, by
@@ -186,6 +198,7 @@ pub fn public_router(app: Arc<App>) -> Router {
                 .delete(api::delete_link),
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
+        .route("/v1/links/{code}/live", get(api::link_live))
         .route("/v1/analytics", get(api::analytics))
         .route("/v1/links/{code}/versions", get(schedule::list_versions))
         .route("/v1/links/{code}/rollback", post(schedule::rollback))
@@ -409,6 +422,8 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
     let sink: Arc<dyn ClickSink> = Arc::new(db.clone());
     let flusher = tokio::spawn(Flusher::new(sink, metrics.clone(), cfg.flush).run(rx, drain_rx));
     let listener = tokio::spawn(listen_for_changes(app.clone(), bg_rx.clone()));
+    let live_sink: Arc<dyn LiveSink> = Arc::new(db.clone());
+    let relay = tokio::spawn(app.live.clone().run_relay(live_sink, bg_rx.clone()));
     let maintenance = tokio::spawn(maintain(app.clone(), bg_rx.clone()));
     let scheduler = tokio::spawn(schedule::run(app.clone(), cfg.schedule_poll, bg_rx.clone()));
     let health = if cfg.health.enabled {
@@ -484,6 +499,9 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         // instead of stretching shutdown past the orchestrator's grace period.
         let deadline = tokio::time::Instant::now() + timeout;
         supervisor_app.shutting_down.store(true, Ordering::Release);
+        // Live streams never finish on their own; end them so the drain
+        // below waits only for ordinary requests.
+        supervisor_app.live.close();
         tracing::info!("shutting down: draining requests");
         for mut srv in [public_srv, admin_srv].into_iter().chain(tls_srv) {
             if tokio::time::timeout_at(deadline, &mut srv).await.is_err() {
@@ -497,7 +515,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         // The flusher stops retrying a little early so it can still count
         // what it could not write before the supervisor gives up on it.
         let _ = drain_tx.send(Some(deadline - timeout / 10));
-        let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, maintenance, scheduler];
+        let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, relay, maintenance, scheduler];
         tasks.extend(health);
         tasks.extend(kv);
         tasks.extend(certificates);
@@ -556,6 +574,7 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
             let mut l = PgListener::connect_with(app.db.pool()).await?;
             l.eager_reconnect(false);
             l.listen(CHANGES_CHANNEL).await?;
+            l.listen(LIVE_CHANNEL).await?;
             Ok::<_, sqlx::Error>(l)
         };
         let connected = tokio::select! {
@@ -588,7 +607,9 @@ async fn listen_for_changes(app: Arc<App>, mut stop: watch::Receiver<bool>) {
             tokio::select! {
                 msg = listener.try_recv() => match msg {
                     Ok(Some(n)) => {
-                        if n.payload() == DOMAINS_CHANGED {
+                        if n.channel() == LIVE_CHANNEL {
+                            app.live.receive(n.payload());
+                        } else if n.payload() == DOMAINS_CHANGED {
                             domains::spawn_reload(app.clone());
                             // A newly verified domain needs a certificate;
                             // a deleted one's is no longer served.

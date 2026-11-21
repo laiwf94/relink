@@ -288,6 +288,8 @@ pub struct Gauges {
     pub db_pool_idle: usize,
     /// Custom-domain certificates loaded for the TLS listener.
     pub tls_certificates: usize,
+    /// Open live click streams (src/live.rs).
+    pub live_streams: usize,
 }
 
 /// Every metric the service exports.
@@ -360,6 +362,16 @@ pub struct Metrics {
     pub analytics_queries: Counter,
     pub analytics_refused: Counter,
     pub analytics_rows: Counter,
+    /// Live clicks written to streams, missed by streams that fell behind,
+    /// relayed to and received from other instances, and not relayed
+    /// because the relay queue was full or the notification failed; and
+    /// streams refused at a limit (src/live.rs).
+    pub live_sent: Counter,
+    pub live_lagged: Counter,
+    pub live_relayed: Counter,
+    pub live_received: Counter,
+    pub live_relay_dropped: Counter,
+    pub live_refused: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -412,6 +424,12 @@ impl Default for Metrics {
             analytics_queries: Counter::default(),
             analytics_refused: Counter::default(),
             analytics_rows: Counter::default(),
+            live_sent: Counter::default(),
+            live_lagged: Counter::default(),
+            live_relayed: Counter::default(),
+            live_received: Counter::default(),
+            live_relay_dropped: Counter::default(),
+            live_refused: Counter::default(),
             backlog: AtomicU64::new(0),
         }
     }
@@ -528,7 +546,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 38] = [
+        let counters: [(&str, &str, u64); 44] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -645,6 +663,36 @@ impl Metrics {
                 self.analytics_rows.get(),
             ),
             (
+                "relink_live_clicks_sent_total",
+                "Clicks written to live streams.",
+                self.live_sent.get(),
+            ),
+            (
+                "relink_live_clicks_lagged_total",
+                "Clicks live streams missed because they fell more than RELINK_LIVE_BUFFER behind.",
+                self.live_lagged.get(),
+            ),
+            (
+                "relink_live_clicks_relayed_total",
+                "Clicks relayed to live streams on other instances.",
+                self.live_relayed.get(),
+            ),
+            (
+                "relink_live_clicks_received_total",
+                "Clicks received from other instances for live streams here.",
+                self.live_received.get(),
+            ),
+            (
+                "relink_live_relay_dropped_total",
+                "Clicks not relayed to other instances because the relay queue was full or the notification failed.",
+                self.live_relay_dropped.get(),
+            ),
+            (
+                "relink_live_streams_refused_total",
+                "Live streams refused at the per-workspace or per-instance limit.",
+                self.live_refused.get(),
+            ),
+            (
                 "relink_lookups_coalesced_total",
                 "Cache misses that waited for another request's database lookup.",
                 self.coalesced.get(),
@@ -726,7 +774,7 @@ impl Metrics {
                 "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
             );
         }
-        let gauges: [(&str, &str, u64); 8] = [
+        let gauges: [(&str, &str, u64); 9] = [
             (
                 "relink_click_queue_depth",
                 "Clicks waiting in the in-memory queue.",
@@ -767,6 +815,11 @@ impl Metrics {
                 "Custom-domain certificates loaded for the TLS listener.",
                 g.tls_certificates as u64,
             ),
+            (
+                "relink_live_streams",
+                "Open live click streams.",
+                g.live_streams as u64,
+            ),
         ];
         for (name, help, value) in gauges {
             let _ = writeln!(
@@ -805,6 +858,7 @@ mod tests {
             db_pool_size: 2,
             db_pool_idle: 1,
             tls_certificates: 2,
+            live_streams: 4,
         }
     }
 

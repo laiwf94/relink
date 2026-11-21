@@ -313,6 +313,7 @@ async fn authentication_and_owner_scoping() {
         ),
         (Method::DELETE, format!("/v1/links/{code}"), None),
         (Method::GET, format!("/v1/links/{code}/stats"), None),
+        (Method::GET, format!("/v1/links/{code}/live"), None),
     ] {
         let (status, body) = h.api(method.clone(), &path, &h.bob, body).await;
         assert_eq!(status, 404, "{method} {path}: {body}");

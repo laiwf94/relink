@@ -34,6 +34,7 @@ use crate::classify::{self, Device, UNKNOWN_COUNTRY};
 use crate::clicks::ClickEvent;
 use crate::code::validate_alias;
 use crate::destination::normalize;
+use crate::live::{self, Refused};
 use crate::model::{Destination, GeoMode, GeoRule};
 use crate::server::App;
 use crate::session;
@@ -163,6 +164,13 @@ impl ApiError {
         ApiError {
             message: message.into(),
             ..ApiError::unavailable()
+        }
+    }
+    /// A live stream refused at a limit (src/live.rs).
+    pub fn too_many_streams(message: impl Into<String>) -> ApiError {
+        ApiError {
+            retry_after: Some(10),
+            ..ApiError::new(StatusCode::TOO_MANY_REQUESTS, "resource_exhausted", message)
         }
     }
     pub fn internal() -> ApiError {
@@ -1145,6 +1153,62 @@ pub async fn link_stats(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveQuery {
+    pub domain: Option<String>,
+    pub include_bots: Option<String>,
+}
+
+/// `GET /v1/links/{code}/live`: a server-sent events stream of the link's
+/// clicks as they happen, bots left out unless `include_bots=true`
+/// (src/live.rs).
+pub async fn link_live(
+    State(app): State<Arc<App>>,
+    ws: Allowed<StatsRead>,
+    Path(code): Path<String>,
+    StrictQuery(q): StrictQuery<LiveQuery>,
+) -> Result<Response, ApiError> {
+    let include_bots = match q.include_bots.as_deref().map(str::trim) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ApiError::invalid("include_bots must be true or false")),
+    };
+    let domain = domain_param(q.domain);
+    let link = app.db.tenant(ws.id).link(&code, domain.as_deref()).await?;
+    let stream = app.live.subscribe(ws.id, link.link.id).map_err(|r| {
+        app.metrics.live_refused.inc();
+        match r {
+            Refused::Workspace => ApiError::too_many_streams(format!(
+                "this workspace has {} live streams open on this server; close one first",
+                app.live.config().max_per_workspace
+            )),
+            Refused::Instance => {
+                ApiError::too_many_streams("this server has as many live streams as it allows")
+            }
+            Refused::Closed => ApiError::unavailable_msg("the server is shutting down"),
+        }
+    })?;
+    let body = stream.into_body(live::View { code, include_bots });
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            // Proxies that buffer responses (nginx) would hold events back.
+            (
+                header::HeaderName::from_static("x-accel-buffering"),
+                HeaderValue::from_static("no"),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 /// `GET /v1/analytics`: clicks and unique visitors over any period, grouped
 /// and filtered by link, country, device and referrer (src/analytics.rs).
 pub async fn analytics(
@@ -1309,7 +1373,7 @@ pub async fn edge_clicks(
         .collect::<Result<Vec<_>, _>>()?;
     let accepted = events.len();
     for ev in events {
-        app.clicks.record(ev);
+        app.click(ev);
     }
     app.metrics.edge_clicks.add(accepted as u64);
     Ok(json(
@@ -1373,6 +1437,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/links/{code}"),
     ("delete", "/v1/links/{code}"),
     ("get", "/v1/links/{code}/stats"),
+    ("get", "/v1/links/{code}/live"),
     ("get", "/v1/links/{code}/versions"),
     ("post", "/v1/links/{code}/rollback"),
     ("get", "/v1/links/{code}/schedules"),

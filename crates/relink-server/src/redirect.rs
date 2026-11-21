@@ -503,7 +503,7 @@ fn record_click(
 ) {
     let ua = headers.get(header::USER_AGENT).map(HeaderValue::as_bytes);
     let referrer = referrer_host(headers.get(header::REFERER).map(HeaderValue::as_bytes));
-    app.clicks.record(ClickEvent {
+    app.click(ClickEvent {
         link_id: link.id,
         at_ms: now_ms(),
         country: country.unwrap_or(UNKNOWN_COUNTRY),

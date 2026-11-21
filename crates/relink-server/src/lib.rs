@@ -36,6 +36,7 @@ pub mod health;
 pub mod invite;
 pub mod kvsync;
 pub mod limiter;
+pub mod live;
 pub mod metrics;
 pub mod oidc;
 pub mod partitions;

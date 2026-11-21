@@ -543,6 +543,27 @@
         }
       }
     },
+    "/v1/links/{code}/live": {
+      "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
+      "get": {
+        "summary": "Stream a link's clicks as they happen",
+        "operationId": "linkLive",
+        "security": [{ "apiKey": ["stats:read"] }, { "session": [] }],
+        "description": "A server-sent events stream. It starts with an open event; then each click on the link is a click event whose data is {code, at, country, device, referrer, bot}, sent within a second of the redirect on any instance. A stream that falls more than RELINK_LIVE_BUFFER clicks behind gets a lag event with data {missed} (counted across the workspace, so an upper bound for this link) and carries on. Idle streams get a comment every RELINK_LIVE_KEEPALIVE_MS, and a stream ends after RELINK_LIVE_MAX_AGE_S or at shutdown; EventSource reconnects by itself. At RELINK_LIVE_MAX_PER_WORKSPACE streams for the workspace, or RELINK_LIVE_MAX_STREAMS on the server, 429 resource_exhausted.",
+        "parameters": [
+          { "name": "include_bots", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Also stream clicks from crawlers and link-preview fetchers." }
+        ],
+        "responses": {
+          "200": { "description": "The event stream.", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/links/{code}/versions": {
       "parameters": [{ "$ref": "#/components/parameters/Code" }, { "$ref": "#/components/parameters/Workspace" }, { "$ref": "#/components/parameters/Domain" }],
       "get": {

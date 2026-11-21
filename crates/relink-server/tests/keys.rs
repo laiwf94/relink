@@ -95,10 +95,30 @@ async fn call(
         ("post" | "patch", _) => Some(json!({"enabled": true, "url": "https://example.com/"})),
         _ => None,
     };
+    let live = path.ends_with("/live");
     let path = path
         .replace("{code}", code)
         .replace("{hostname}", HOST)
         .replace("{id}", &schedule.to_string());
+    if live {
+        // A live stream never ends by itself: take the status, and read
+        // the body only when it is an error.
+        let resp = h
+            .http
+            .get(format!("{}{path}", h.base))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        if status == 200 {
+            return (status, Value::Null);
+        }
+        return (
+            status,
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap(),
+        );
+    }
     h.api(m, &path, key, body).await
 }
 
@@ -139,7 +159,7 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 19);
+    assert_eq!(routes.len(), 20);
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
     routes.sort_by_key(|(m, p, _)| (*m == "delete", p == "/v1/links/{code}"));

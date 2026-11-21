@@ -1802,6 +1802,64 @@ What happens to a bot's click:
 Quotas and click limits count bot clicks like any other: the redirect was
 served either way.
 
+### Live clicks
+
+`GET /v1/links/{code}/live` is a server-sent events stream of one link's
+clicks as they happen, for a console showing a launch or a campaign going
+out. It needs `stats:read`, like every other analytics read, and shows what
+the rollups keep: time, country, device class, referrer host and whether it
+was a bot. Bots are left out unless the stream asks for
+`include_bots=true`. The stream opens with an `open` event, then sends one
+`click` event per click.
+
+`src/live.rs` keeps one broadcast channel per workspace with a stream open
+and a map from each watched link to its workspace. A click is offered to
+it as it is taken, before the click queue, at the origin and from the edge
+batch alike. With no link watched anywhere that is one atomic load; with
+some, a read lock and a map lookup. A click on a watched link is sent once
+to its workspace's channel, and each stream keeps the clicks on its own
+link. The redirect never waits for a stream.
+
+**Backpressure.** A channel is a ring of `RELINK_LIVE_BUFFER` (256) clicks.
+A stream reads it only as fast as its connection takes bytes, so a slow
+client falls behind alone. Once it is a ring behind, the oldest clicks are
+overwritten; the stream gets a `lag` event with how many it missed and
+carries on from the oldest click still held. That count covers the
+workspace's channel, so it is an upper bound for the stream's link. Clicks
+waiting when a stream is woken go out in one write, up to 64.
+
+**Limits.** At most `RELINK_LIVE_MAX_PER_WORKSPACE` (50) streams per
+workspace and `RELINK_LIVE_MAX_STREAMS` (10,000) per instance; more are
+refused with 429 `resource_exhausted`. An idle stream gets a comment every
+`RELINK_LIVE_KEEPALIVE_MS` (15 s) so proxies keep it open, and
+`X-Accel-Buffering: no` asks nginx not to buffer it. A stream ends after
+`RELINK_LIVE_MAX_AGE_S` (an hour). `EventSource` reconnects by itself, and
+signs in again, so a revoked key or session stops streaming within the
+hour. Shutdown ends every stream first, so the drain waits only for
+ordinary requests.
+
+**Across instances.** A visitor's click lands on whichever instance the
+load balancer chose, and the stream may be open on another. An instance
+with streams announces its watched link IDs on the `relink_live`
+notification channel, at once when a link is first watched and then every
+`RELINK_LIVE_ANNOUNCE_MS` (10 s). Every instance remembers links watched
+elsewhere for three intervals. A click on such a link goes on a bounded
+relay queue (`RELINK_LIVE_RELAY_QUEUE`, 4,096; dropped and counted when
+full, never waited for). The relay task sends everything queued at once
+with `pg_notify`, split under Postgres's 8,000-byte payload limit, about
+150 clicks per notification. Receivers parse each line as strictly as an
+edge click and hand the clicks to their streams; an instance ignores its
+own notifications. Nothing is written to a table, and with no stream open
+anywhere, nothing is sent. A stream opened on another instance gets
+relayed clicks once the first announcement arrives, normally a few
+milliseconds after it opens.
+
+**Latency.** A click on the same instance is in the stream as soon as the
+redirect has been answered; a relayed one adds a notification round trip.
+`tests/live.rs` checks both are under a second. Clicks served by the edge
+reach the origin in its batches (50 clicks or 5 s), so they appear with
+that delay.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -1864,9 +1922,9 @@ is range-checked. Internal errors carry a request ID and nothing else.
 ## Shutdown
 
 On SIGTERM the server stops accepting connections and gives every phase one
-shared budget (`RELINK_SHUTDOWN_TIMEOUT_S`, 10 s): draining requests, stopping
-lease reservations, flushing the click queue, stopping background tasks,
-returning unspent leases and closing the pool. A phase that runs long takes
+shared budget (`RELINK_SHUTDOWN_TIMEOUT_S`, 10 s): ending live click streams,
+draining requests, stopping lease reservations, flushing the click queue,
+stopping background tasks, returning unspent leases and closing the pool. A phase that runs long takes
 time from the next rather than stretching the total past an orchestrator's
 grace period; a test with Postgres gone at shutdown finishes inside the budget
 and counts the clicks it could not write.
@@ -1924,6 +1982,7 @@ and counts the clicks it could not write.
 | Flush transaction | 5,000 hourly count rows (and the daily rows they add up to), 5,000 visitor rows and 5,000 raw events |
 | Raw event backlog | 200,000 events while the database is down (`RELINK_CLICK_EVENT_BACKLOG`, 0 to 5×10⁷); past it only raw events are dropped |
 | Analytics queries | 1,000,000 rollup rows and sketches read (`RELINK_ANALYTICS_MAX_ROWS`, 1,000 to 10⁸); 366 days and 1,000 points; 3 group-by dimensions; 50 values per filter; top 1 to 100 groups |
+| Live streams | 50 per workspace and 10,000 per instance; 256 clicks buffered per workspace; a 4,096-click relay queue; announcements every 10 s, kept 30 s; one hour per stream |
 | Hourly rollups | 92 days (`RELINK_CLICK_HOURLY_RETENTION_DAYS`, 1 to 3,660); 50,000 rows per table deleted per minute; replay keys kept 7 days |
 | User-Agent scanned | 512 bytes (256 in the fingerprint) |
 | Lookup concurrency | 32 |
