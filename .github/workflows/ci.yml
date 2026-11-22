@@ -33,6 +33,18 @@ jobs:
         with:
           components: rustfmt, clippy, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      # The suite and then the coverage run write several GB of WAL into a
+      # data directory of tens of thousands of files; a checkpoint that
+      # starts on its own mid-run stalls queries for seconds and once held
+      # a click flush past its 2 s timeout (#83, #86). This Postgres is
+      # thrown away with the job, so it checkpoints only once it is done.
+      - name: No Postgres checkpoints during the run
+        run: |
+          psql "$RELINK_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET max_wal_size = '8GB'" \
+            -c "ALTER SYSTEM SET checkpoint_timeout = '1d'" \
+            -c "SELECT pg_reload_conf()"
+          psql "$RELINK_TEST_DATABASE_URL" -Atc "SHOW max_wal_size" -c "SHOW checkpoint_timeout"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
