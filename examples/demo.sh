@@ -69,9 +69,12 @@ as_visitor() { # path [curl args...] -> "status location" on $DOMAIN
   local path="$1"; shift
   curl -sS -o /dev/null -w '%{http_code} %header{location}' -H "Host: $DOMAIN" "$@" "$URL/$path"
 }
+# curl's own User-Agent is classified as a bot, so the demo's visitors use a
+# browser's; a caller's own -A comes later and wins.
+BROWSER='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36'
 follow() { # code [curl args...] -> "status location"
   local code="$1"; shift
-  curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "$@" "$URL/$code"
+  curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -A "$BROWSER" "$@" "$URL/$code"
 }
 wait_for() { # url
   for _ in $(seq 1 100); do curl -fsS -o /dev/null "$1" 2>/dev/null && return 0; sleep 0.2; done
@@ -115,7 +118,7 @@ for _ in $(seq 1 40); do
   case "$(follow pricing-test)" in *pricing-a) A=$((A+1));; *pricing-b) B=$((B+1));; esac
 done
 echo "   pricing-test x40 -> a=$A b=$B (new visitors, weights 3:1)"
-COOKIE=$(curl -sS -o /dev/null -D - "$URL/pricing-test" | sed -n 's/^set-cookie: \([^;]*\).*/\1/Ip')
+COOKIE=$(curl -sS -o /dev/null -D - -A "$BROWSER" "$URL/pricing-test" | sed -n 's/^set-cookie: \([^;]*\).*/\1/Ip')
 FIRST=$(follow pricing-test -H "Cookie: $COOKIE")
 SAME=1; for _ in $(seq 1 10); do [ "$(follow pricing-test -H "Cookie: $COOKIE")" = "$FIRST" ] || SAME=0; done
 echo "   with its cookie  -> $FIRST (same 10/10: $([ $SAME = 1 ] && echo yes || echo no))"
