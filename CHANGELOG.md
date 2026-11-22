@@ -91,6 +91,10 @@ Fixed:
   still fail the build (#81).
 - The demo's visits sent curl's own User-Agent, which is now a bot, so its
   stats showed no visitors (#84).
+- A hostname ending in two dots and a character IDNA ignores, such as
+  `kk26kkk26k.0X0..` with U+034F after it, was stored in a form that adding
+  it again refused. Final dots are now counted on the parsed host, and the
+  stored form must parse back to itself (#85).
 
 ### Week 3 (2026-11-16 to 2026-11-22): targeting rules, deep links, versions, schedules and protected links (#24)
 

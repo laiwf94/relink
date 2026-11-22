@@ -86,6 +86,7 @@ pub fn parse_hostname(raw: &str, default_host: &str) -> Result<String, String> {
     // more: `2x.0x..` would get past the URL parser's check that a name
     // does not end in a number and be stored as `2x.0x`, which that check
     // refuses.
+    let final_dot = raw.ends_with('.');
     let raw = raw.strip_suffix('.').unwrap_or(raw);
     if raw.is_empty() {
         return Err("hostname is required".into());
@@ -120,13 +121,26 @@ pub fn parse_hostname(raw: &str, default_host: &str) -> Result<String, String> {
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .ok_or("hostname is not a valid host name")?;
-    let host = host.trim_end_matches('.').to_owned();
+    // The raw check above misses dots that only appear once IDNA has
+    // dropped the characters it ignores, as in `2x.0x..\u{34f}` (#85).
+    if host.ends_with("..") || (final_dot && host.ends_with('.')) {
+        return Err("hostname must not end in more than one dot".into());
+    }
+    let host = host.strip_suffix('.').unwrap_or(&host).to_owned();
     if !is_valid_hostname(&host) {
         return Err(
             "hostname must be labels of letters, digits and hyphens (not at either end of a \
              label), at most 63 characters each and 253 in all, with at least two labels"
                 .into(),
         );
+    }
+    // What is stored must read back as itself, whatever mapping produced
+    // it.
+    let again = url::Url::parse(&format!("https://{host}/"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned));
+    if again.as_deref() != Some(&*host) {
+        return Err("hostname is not a valid host name".into());
     }
     if host == default_host {
         return Err(format!(
@@ -1132,7 +1146,16 @@ mod tests {
         let err = |raw: &str| parse_hostname(raw, DEFAULT).unwrap_err();
         assert!(err("").contains("required"));
         assert!(err(" . ").contains("required"));
-        for raw in ["go.example.com..", "2X.0X..", "a.b..."] {
+        // Characters IDNA ignores (a combining grapheme joiner, a soft
+        // hyphen) cannot hide a second final dot (#85).
+        for raw in [
+            "go.example.com..",
+            "2X.0X..",
+            "a.b...",
+            "kk26kkk26k.0X0..\u{34f}",
+            "go.example.com.\u{ad}\u{34f}.",
+            "go.example.com.\u{34f}.",
+        ] {
             assert!(
                 err(raw).contains("more than one dot"),
                 "{raw}: {}",
@@ -1141,6 +1164,13 @@ mod tests {
         }
         // Accepted only in a form that is accepted again unchanged.
         assert!(err("2x.0x").contains("hostname"));
+        assert!(err("kk26kkk26k.0x0.\u{34f}").contains("hostname"));
+        assert_eq!(ok("go.example.com.\u{34f}"), "go.example.com");
+        assert_eq!(ok("go.exa\u{ad}mple.com"), "go.example.com");
+        for raw in ["bücher.example.com.\u{34f}", "go.example.com.\u{ad}"] {
+            let h = ok(raw);
+            assert_eq!(parse_hostname(&h, DEFAULT).as_deref(), Ok(&*h), "{raw}");
+        }
         for raw in [
             "https://go.example.com",
             "go.example.com/x",
