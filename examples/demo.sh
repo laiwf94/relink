@@ -7,8 +7,11 @@
 # redirect, path prefix, case-free codes and 404 and 410 pages, then a link
 # on that domain with targeting rules, app links for iPhones and Android, a
 # version history with a scheduled swap and a rollback, a password and
-# consent page and a preview, then stops Postgres to show redirects still
-# being served from memory while writes fail cleanly, and finally restarts
+# consent page and a preview, then clicks from people, a crawler and a link
+# preview watched live over server-sent events and counted by the analytics
+# query API (bots left out unless asked for) and in the raw events'
+# monthly partition, then stops Postgres to show redirects still being
+# served from memory while writes fail cleanly, and finally restarts
 # Postgres to show recovery.
 #
 # Needs: docker, cargo, curl, python3. Uses ports 18080, 19090 and 55432 by
@@ -40,6 +43,8 @@ export RELINK_DB_TIMEOUT_MS=1000
 export RELINK_TRUSTED_PROXIES="127.0.0.1,::1"
 export RELINK_COUNTRY_HEADER=cf-ipcountry
 export RELINK_REGION_HEADER=cf-region-code
+# Each visitor in step 8 says who they are in X-Forwarded-For.
+export RELINK_CLIENT_IP_HEADER=x-forwarded-for
 # Custom domains are proved against the demo's own DNS server.
 export RELINK_DNS_SERVERS="127.0.0.1:$DNS_PORT"
 
@@ -226,7 +231,62 @@ echo "   right password and consent   -> $(as_visitor press-kit -c "$JAR" -d 'pa
 echo "   press-kit with the grant     -> $(as_visitor press-kit -b "$JAR")"
 rm -f "$JAR"
 
-echo "== 8. Stop Postgres"
+echo "== 8. Analytics: a live stream, people and bots, the query API and raw events"
+api POST /v1/links '{"url":"https://example.com/webinar","alias":"webinar"}' >/dev/null
+LIVE="$(mktemp -t relink-demo-live.XXXXXX)"
+curl -sSN -H "Authorization: Bearer $KEY" "$URL/v1/links/webinar/live?include_bots=true" >"$LIVE" &
+LIVE_PID=$!
+for _ in $(seq 1 40); do grep -q '^event: open' "$LIVE" && break; sleep 0.1; done
+MAC='Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15'
+# Six people (one of them twice), a crawler and a chat app's link preview.
+while read -r ip country agent referer; do
+  case "$agent" in iphone) agent="$IPHONE";; mac) agent="$MAC";; android) agent="$PIXEL";;
+    googlebot) agent='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';;
+    slackbot) agent='Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)';; esac
+  follow webinar -H "X-Forwarded-For: $ip" -H "cf-ipcountry: $country" -A "$agent" \
+    ${referer:+-H "Referer: $referer"} >/dev/null
+done <<'VISITS'
+203.0.113.1 DE iphone https://news.example.org/story
+203.0.113.2 DE mac
+203.0.113.3 NZ android https://news.example.org/story
+203.0.113.4 US iphone
+203.0.113.5 US mac https://social.example.net/post
+203.0.113.6 US android
+203.0.113.1 DE iphone
+66.249.66.1 US googlebot
+54.209.60.63 US slackbot
+VISITS
+sleep 1
+kill "$LIVE_PID" 2>/dev/null; wait "$LIVE_PID" 2>/dev/null || true
+echo "   live stream (opened before the visits, within a second of each):"
+python3 - "$LIVE" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    if line.startswith("data: ") and '"bot"' in line:
+        c = json.loads(line[6:])
+        print("     %s %-8s %-18s%s" % (c["country"], c["device"], c["referrer"] or "(direct)",
+                                    "  bot" if c["bot"] else ""))
+PY
+rm -f "$LIVE"
+for _ in $(seq 1 40); do
+  [ "$(api GET '/v1/analytics?link=webinar&granularity=all&include_bots=true' | field "['total']['clicks']")" = 9 ] && break
+  sleep 0.25
+done
+echo "   people only (the default): $(api GET '/v1/analytics?link=webinar&granularity=all&group_by=link' |
+  field "['total']")"
+echo "   with include_bots=true:    $(api GET '/v1/analytics?link=webinar&granularity=all&group_by=link&include_bots=true' |
+  field "['total']") (bots are never visitors)"
+echo "   by country: $(api GET '/v1/analytics?link=webinar&granularity=all&group_by=country' | python3 -c 'import sys, json
+print(", ".join("%s %d" % (g["key"]["country"], g["clicks"]) for g in json.load(sys.stdin)["groups"]))')"
+echo "   by referrer, top 2: $(api GET '/v1/analytics?link=webinar&granularity=all&group_by=referrer&limit=2' | python3 -c 'import sys, json
+print(", ".join("%s %d" % (g["key"]["referrer"], g["clicks"]) for g in json.load(sys.stdin)["groups"]))')"
+echo "   today against yesterday: $(api GET "/v1/analytics?link=webinar&from=$(date -u +%F)&to=$(date -u +%F)&compare=previous" |
+  field "['total']")"
+echo "   raw events (partition, events, bots, with a visitor hash):"
+docker exec "$PG_NAME" psql -U postgres -tAF ' ' -c "SELECT tableoid::regclass, count(*),
+  count(*) FILTER (WHERE bot), count(visitor) FROM click_events GROUP BY 1" | sed 's/^/     /'
+
+echo "== 9. Stop Postgres"
 docker stop "$PG_NAME" >/dev/null
 echo "   $RANDOM_CODE          -> $(follow "$RANDOM_CODE")   (served from memory)"
 echo "   summer-sale      -> $(follow summer-sale)"
@@ -235,7 +295,7 @@ echo "   create link      -> HTTP $(status POST /v1/links '{"url":"https://examp
 echo "   not cached       -> $(follow never-seen)"
 echo "   readyz           -> $(curl -sS "$URL/readyz")"
 
-echo "== 9. Start Postgres again"
+echo "== 10. Start Postgres again"
 docker start "$PG_NAME" >/dev/null
 for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 0.5; done
 for _ in $(seq 1 40); do [ "$(status POST /v1/links '{"url":"https://example.com/new"}')" = 201 ] && break; sleep 0.5; done

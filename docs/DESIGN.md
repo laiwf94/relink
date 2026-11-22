@@ -1860,6 +1860,50 @@ redirect has been answered; a relayed one adds a notification round trip.
 reach the origin in its batches (50 clicks or 5 s), so they appear with
 that delay.
 
+### A click, start to finish
+
+Week 4's parts meet on every click, in this order, at either instance and
+for clicks the edge sends in its batches alike:
+
+1. **Classify.** The redirect reads the click's country, device class and
+   referrer host; `classify::bot_kind` marks crawlers, link-preview
+   fetchers, monitors and tools as device class `bot`. A person also gets
+   a fingerprint from their address and User-Agent, which never leaves
+   memory.
+2. **Live.** The click is offered to `LiveHub` before anything else: to
+   the streams on this instance watching its link, and to the relay when
+   another instance has announced it watches the link.
+3. **Queue.** The click goes on the bounded click queue with `try_send`.
+   Nothing in steps 2 to 6 makes the redirect wait.
+4. **Flush.** One transaction, keyed against replay, adds the click to
+   the daily and hourly rollups and the quota meter. For a person it adds
+   a keyed hash to the hourly and daily visitor sketches. The raw event,
+   without the fingerprint or any address, goes to its UTC month's
+   partition of `click_events`.
+5. **Query.** `GET /v1/analytics` reads the daily or the hourly rollups
+   and merges the sketches of the links and periods asked for. It leaves
+   bots out unless asked to include them.
+6. **Retention.** Hourly rows expire after their retention and whole
+   months of raw events are dropped, while the daily rollups stay as long
+   as their link.
+
+`tests/click_analytics.rs` walks this on two instances:
+
+- two days of edge batches for two links that share 300 people
+- live streams on one instance, getting each click within a second from
+  either instance and from the edge, and bots only when asked for
+- people, a crawler and two link previews over HTTP
+- the query API answering alike at both instances: by day and by hour,
+  grouped by link, country, device and referrer, filtered, top N and
+  compared with the day before; unique visitors are within 1% of the exact
+  count of people per link, per day and over both
+- raw events in their month's partition, with no column for an address and
+  no address or User-Agent in any value
+- an old month dropped by the partition manager, with the rollups intact
+- another workspace seeing none of it
+
+Step 8 of `examples/demo.sh` shows the same from the command line.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several

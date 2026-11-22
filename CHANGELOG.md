@@ -5,6 +5,93 @@ issue has the details of every task.
 
 ## Unreleased
 
+### Week 4 (2026-11-23 to 2026-11-29): raw events, HyperLogLog++, the query API, bots and live clicks (#25)
+
+Added:
+
+- **Raw click events.** Every click is one row of `click_events`: time,
+  workspace, link, domain, country, device class, referrer host, the
+  day-salted visitor hash and a bot flag. No column holds an address. The
+  table is partitioned by UTC calendar month (`click_events_pYYYYMM`,
+  migration 0020). The partition manager in `src/partitions.rs` keeps the
+  current month and the two after it created and drops months past
+  `RELINK_CLICK_EVENTS_RETENTION_MONTHS` (default 13) whole. It runs once a
+  minute on one instance at a time and gives way after a second to a long
+  query.
+- **HyperLogLog++ sketches** in `relink_core::hll`: a sparse form that is
+  exact but for 25-bit collisions, a dense form of 16,384 six-bit
+  registers, Ertl's improved estimator, and a canonical stored form. Merged
+  sketches are byte for byte the sketch of the union. Dense sketches from
+  3,500 to 1,000,000 items are off by 0.65% RMS (the target is 1%).
+- **Rollups fed from one replay-safe flush.** Each batch writes the daily
+  and new hourly counts, the quota meter, visitor hashes, hourly and daily
+  visitor sketches and raw events in one transaction, keyed so that a
+  retried batch whose commit landed writes nothing again (migration 0021).
+  Raw events have their own memory bound (`RELINK_CLICK_EVENT_BACKLOG`),
+  and hourly rows are kept for `RELINK_CLICK_HOURLY_RETENTION_DAYS`
+  (default 92).
+- **`GET /v1/analytics`.** Series by hour, day, ISO week, month or `all`,
+  the top N groups by up to three of link, country, device and referrer,
+  filters on each, and `compare=previous` or `year`, over at most 366 days.
+  Unique visitors are the merged sketches, given when grouping and
+  filtering by link only. `RELINK_ANALYTICS_MAX_ROWS` (default 1,000,000)
+  caps the rows one query reads, past which it gets 422
+  `query_too_expensive`. Answers come from one read-only snapshot. 30 days
+  by day grouped by country reads 60,000 rows in 60 ms.
+- **Bots and link previews.** `relink_core::classify::bot_kind` tells
+  crawlers, link-preview fetchers, monitors and tools from people by a
+  versioned list of 91 tokens (`BOT_LIST_VERSION` 1). In-app browsers count
+  as people. A bot's click is counted under device class `bot` but never
+  feeds a visitor hash or a sketch. The analytics API leaves bots out
+  unless asked for with `include_bots=true`, and reports the list version.
+- **Live clicks.** `GET /v1/links/{code}/live` is a server-sent events
+  stream of a link's clicks: time, country, device, referrer and the bot
+  flag, never the address. Clicks reach it from redirects at any instance
+  (relayed over `pg_notify`) and from edge batches. Each workspace's
+  channel is a ring of 256 clicks, so a slow stream falls behind alone and
+  is told how many it missed. Streams are capped at 50 per workspace and
+  10,000 per instance, and each ends after an hour.
+- **End to end.** `tests/click_analytics.rs` walks the whole week on two
+  instances:
+  - two days of edge batches for two links that share 300 people
+  - live streams on one instance that get each click within a second,
+    from either instance and from the edge
+  - people, a crawler and two link previews over HTTP
+  - the query API answering alike at both instances, with unique visitors
+    within 1% of the exact count per link, per day and over both
+  - raw events in their month's partition with no address in any value
+  - an old month dropped while the rollups keep their counts
+  - another workspace seeing none of it
+
+  `examples/demo.sh` has a new step 8 showing the same from the command
+  line.
+
+Changed:
+
+- Edge clicks carry only a day, so the origin places each at the time it
+  arrived, kept within the reported day. `ClickEvent` has `at_ms` instead
+  of `day`.
+- Targeting rules on `device: ["bot"]` use the new classification, at the
+  origin and the edge. `device_class` on a browser User-Agent went from
+  153 ns to 222 ns, and the Worker bundle from 247,017 to 249,111 bytes
+  gzipped.
+- 100,000 worst-case clicks now drain in 7.9 s instead of 3.5 s, mostly
+  for the raw events.
+- `futures-util` is a direct dependency. It was already in the tree.
+
+Fixed:
+
+- The outage test's set-up could fail while its first database connection
+  was still opening; it now retries (#82).
+- The session clean-up test raced the instance's own housekeeping (#80).
+- Dropping each test database forced a checkpoint that stalled other tests
+  under CI (#83).
+- `rustix` was updated to 1.1.6 for RUSTSEC-2026-0486, and the chrono
+  "unmaintained" advisory is listed in `deny.toml` so other advisories
+  still fail the build (#81).
+- The demo's visits sent curl's own User-Agent, which is now a bot, so its
+  stats showed no visitors (#84).
+
 ### Week 3 (2026-11-16 to 2026-11-22): targeting rules, deep links, versions, schedules and protected links (#24)
 
 Added:
