@@ -79,6 +79,13 @@
 //! | `RELINK_LIVE_ANNOUNCE_MS` | `10000` | How often an instance tells the others which links it streams (100 to 600000) |
 //! | `RELINK_LIVE_KEEPALIVE_MS` | `15000` | Comment sent on an idle live stream (100 to 600000) |
 //! | `RELINK_LIVE_MAX_AGE_S` | `3600` | A live stream ends after this long and the client reconnects, signing in again (1 to 86400) |
+//! | `RELINK_WEBHOOKS_ENABLED` | `true` | Run the webhook delivery worker on this instance (events are queued either way) |
+//! | `RELINK_WEBHOOK_POLL_MS` | `1000` | How often due webhook deliveries are looked for, when the last batch was not full (10 to 60000) |
+//! | `RELINK_WEBHOOK_CONCURRENCY` | `16` | Webhook deliveries in flight on one instance (1 to 1000) |
+//! | `RELINK_WEBHOOK_TIMEOUT_MS` | `10000` | Bound on one delivery try, connecting included (100 to 60000) |
+//! | `RELINK_WEBHOOK_MAX_ATTEMPTS` | `12` | Tries before a delivery is failed (1 to 50); it can still be retried through the API |
+//! | `RELINK_WEBHOOK_RETRY_BASE_MS` / `RELINK_WEBHOOK_RETRY_MAX_MS` | `30000` / `21600000` | Wait after the first failed try, doubled after each further one up to the maximum, then jittered down by up to half |
+//! | `RELINK_WEBHOOK_RETENTION_DAYS` | `30` | Days delivered and failed deliveries stay in the delivery log (1 to 3660) |
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |

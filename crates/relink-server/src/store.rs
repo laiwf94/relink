@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -944,6 +945,9 @@ pub struct DbConfig {
     pub health_threshold: i16,
     /// Record link changes in the KV outbox (edge publishing is on).
     pub kv_outbox: bool,
+    /// `RELINK_PUBLIC_BASE_URL`, for the short URLs in webhook events
+    /// written by system work.
+    pub public_base_url: String,
 }
 
 /// The database handle.
@@ -955,6 +959,7 @@ pub struct Db {
     timeout: Duration,
     health_threshold: i16,
     outbox: bool,
+    base_url: Arc<str>,
 }
 
 impl Db {
@@ -993,11 +998,17 @@ impl Db {
             timeout: cfg.timeout,
             health_threshold: cfg.health_threshold,
             outbox: cfg.kv_outbox,
+            base_url: Arc::from(cfg.public_base_url.as_str()),
         }
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// `RELINK_PUBLIC_BASE_URL`, without a final slash.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Open and idle connections across both pools, for metrics.
@@ -1626,18 +1637,21 @@ impl Db {
     }
 
     /// Stores new failure counts unless the destinations changed since the
-    /// claim. Notifies other instances when health flipped for any
-    /// destination. Returns whether the row was updated.
+    /// claim. When health flipped for any destination, notifies other
+    /// instances and writes a `health.changed` webhook event in the same
+    /// transaction. Returns whether the row was updated.
     pub async fn record_health(
         &self,
         target: &HealthTarget,
         failures: &[i16],
     ) -> Result<bool, DbError> {
-        let flipped = (0..target.destinations.len()).any(|i| {
-            let before = target.failures.get(i).copied().unwrap_or(0) >= self.health_threshold;
-            let after = failures.get(i).copied().unwrap_or(0) >= self.health_threshold;
-            before != after
-        });
+        let flipped: Vec<usize> = (0..target.destinations.len())
+            .filter(|&i| {
+                let before = target.failures.get(i).copied().unwrap_or(0) >= self.health_threshold;
+                let after = failures.get(i).copied().unwrap_or(0) >= self.health_threshold;
+                before != after
+            })
+            .collect();
         self.timed(async {
             let mut tx = self.pool.begin().await?;
             let updated = sqlx::query(
@@ -1650,9 +1664,25 @@ impl Db {
             .await?
             .rows_affected()
                 == 1;
-            if updated && flipped {
+            if updated && !flipped.is_empty() {
                 self.changed(&mut tx, target.id, target.domain_id, &target.code)
                     .await?;
+                let row = sqlx::query(concat!(
+                    "SELECT ",
+                    api_columns!(),
+                    " FROM links WHERE id = $1"
+                ))
+                .bind(target.id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let link = self.row_to_link(&row)?;
+                crate::webhooks::emit(
+                    &mut tx,
+                    link.workspace_id,
+                    crate::webhooks::Event::HealthChanged,
+                    crate::webhooks::health_changed(&link, &flipped, self.base_url()),
+                )
+                .await?;
             }
             tx.commit().await?;
             Ok(updated)

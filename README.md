@@ -38,6 +38,13 @@ from people by a versioned list and left out unless asked for, and
 `GET /v1/links/{code}/live` streams a link's clicks within a second of each,
 from any instance.
 
+Workspace admins register webhook endpoints for `link.created`,
+`link.updated`, `link.expired` and `health.changed`. Each event is queued in
+the transaction that makes the change and delivered at least once, signed
+with HMAC-SHA256 under the endpoint's secret, retried with exponential
+backoff, and kept with every try in a delivery log the API reads
+(`/v1/webhooks`).
+
 ```console
 $ curl -s localhost:8080/v1/links -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
     -d '{"alias":"pricing","destinations":[{"url":"https://example.com/a","weight":3},

@@ -72,6 +72,28 @@ pub struct HealthConfig {
     pub batch: i64,
 }
 
+/// Webhook delivery settings (`RELINK_WEBHOOK_*`, src/webhooks.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WebhookConfig {
+    /// Run the delivery worker on this instance.
+    pub enabled: bool,
+    /// How often due deliveries are looked for when the last batch was not
+    /// full.
+    pub poll: Duration,
+    /// Deliveries in flight at once.
+    pub concurrency: usize,
+    /// Bound on one try, connecting included.
+    pub timeout: Duration,
+    /// Tries before a delivery is failed.
+    pub max_attempts: u32,
+    /// Wait after the first failed try; doubled after each further one.
+    pub retry_base: Duration,
+    /// Longest wait between tries.
+    pub retry_max: Duration,
+    /// Days finished deliveries are kept in the log.
+    pub retention_days: u32,
+}
+
 /// Longest retention of hourly click rollups, in days (ten years).
 pub const MAX_HOURLY_RETENTION_DAYS: u32 = 3_660;
 
@@ -112,6 +134,8 @@ pub struct Config {
     pub analytics_max_rows: u64,
     /// Live click streams (src/live.rs).
     pub live: LiveConfig,
+    /// Webhook deliveries (src/webhooks.rs).
+    pub webhooks: WebhookConfig,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -180,6 +204,7 @@ impl fmt::Debug for Config {
             )
             .field("analytics_max_rows", &self.analytics_max_rows)
             .field("live", &self.live)
+            .field("webhooks", &self.webhooks)
             .field("api_rate", &self.api_rate)
             .field("auth_lookup_rate", &self.auth_lookup_rate)
             .field("auth_lookup_rate_per_ip", &self.auth_lookup_rate_per_ip)
@@ -586,6 +611,21 @@ impl Config {
                 keep_alive: v.millis("RELINK_LIVE_KEEPALIVE_MS", 15_000, 100, 600_000)?,
                 max_age: Duration::from_secs(v.parse("RELINK_LIVE_MAX_AGE_S", 3_600, 1, 86_400)?),
             },
+            webhooks: WebhookConfig {
+                enabled: v.bool("RELINK_WEBHOOKS_ENABLED", true)?,
+                poll: v.millis("RELINK_WEBHOOK_POLL_MS", 1_000, 10, 60_000)?,
+                concurrency: v.parse("RELINK_WEBHOOK_CONCURRENCY", 16, 1, 1_000)?,
+                timeout: v.millis("RELINK_WEBHOOK_TIMEOUT_MS", 10_000, 100, 60_000)?,
+                max_attempts: v.parse("RELINK_WEBHOOK_MAX_ATTEMPTS", 12, 1, 50)?,
+                retry_base: v.millis("RELINK_WEBHOOK_RETRY_BASE_MS", 30_000, 10, 3_600_000)?,
+                retry_max: v.millis(
+                    "RELINK_WEBHOOK_RETRY_MAX_MS",
+                    21_600_000,
+                    10,
+                    7 * 86_400_000,
+                )?,
+                retention_days: v.parse("RELINK_WEBHOOK_RETENTION_DAYS", 30, 1, 3_660)?,
+            },
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
                 burst: v.parse("RELINK_API_BURST", 20.0, 1.0, 1_000_000.0)?,
@@ -622,6 +662,11 @@ impl Config {
             key_encryption_key,
             tls,
         };
+        if cfg.webhooks.retry_max < cfg.webhooks.retry_base {
+            return Err(
+                "RELINK_WEBHOOK_RETRY_MAX_MS must be at least RELINK_WEBHOOK_RETRY_BASE_MS".into(),
+            );
+        }
         if (cfg.country_header.is_some()
             || cfg.region_header.is_some()
             || cfg.client_ip_header.is_some())
@@ -1038,5 +1083,60 @@ mod tests {
             let e = from(&[base, (name, bad)]).unwrap_err();
             assert!(e.starts_with(&format!("{name}:")), "{name}={bad:?}: {e}");
         }
+    }
+
+    #[test]
+    fn webhook_settings_are_bounded() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let c = from(&[base]).unwrap();
+        assert_eq!(
+            c.webhooks,
+            WebhookConfig {
+                enabled: true,
+                poll: Duration::from_secs(1),
+                concurrency: 16,
+                timeout: Duration::from_secs(10),
+                max_attempts: 12,
+                retry_base: Duration::from_secs(30),
+                retry_max: Duration::from_secs(6 * 3600),
+                retention_days: 30,
+            }
+        );
+        let c = from(&[
+            base,
+            ("RELINK_WEBHOOKS_ENABLED", "false"),
+            ("RELINK_WEBHOOK_POLL_MS", "20"),
+            ("RELINK_WEBHOOK_CONCURRENCY", "4"),
+            ("RELINK_WEBHOOK_TIMEOUT_MS", "500"),
+            ("RELINK_WEBHOOK_MAX_ATTEMPTS", "3"),
+            ("RELINK_WEBHOOK_RETRY_BASE_MS", "10"),
+            ("RELINK_WEBHOOK_RETRY_MAX_MS", "40"),
+            ("RELINK_WEBHOOK_RETENTION_DAYS", "7"),
+        ])
+        .unwrap();
+        assert!(!c.webhooks.enabled);
+        assert_eq!(c.webhooks.poll, Duration::from_millis(20));
+        assert_eq!(c.webhooks.concurrency, 4);
+        assert_eq!(c.webhooks.max_attempts, 3);
+        assert_eq!(c.webhooks.retry_max, Duration::from_millis(40));
+        assert_eq!(c.webhooks.retention_days, 7);
+        for (name, bad) in [
+            ("RELINK_WEBHOOK_POLL_MS", "9"),
+            ("RELINK_WEBHOOK_CONCURRENCY", "0"),
+            ("RELINK_WEBHOOK_TIMEOUT_MS", "60001"),
+            ("RELINK_WEBHOOK_MAX_ATTEMPTS", "51"),
+            ("RELINK_WEBHOOK_RETRY_BASE_MS", "soon"),
+            ("RELINK_WEBHOOK_RETENTION_DAYS", "0"),
+        ] {
+            let e = from(&[base, (name, bad)]).unwrap_err();
+            assert!(e.starts_with(&format!("{name}:")), "{name}={bad:?}: {e}");
+        }
+        let e = from(&[
+            base,
+            ("RELINK_WEBHOOK_RETRY_BASE_MS", "1000"),
+            ("RELINK_WEBHOOK_RETRY_MAX_MS", "999"),
+        ])
+        .unwrap_err();
+        assert!(e.contains("RELINK_WEBHOOK_RETRY_MAX_MS"), "{e}");
     }
 }

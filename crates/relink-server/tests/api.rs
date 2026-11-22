@@ -673,6 +673,28 @@ async fn openapi_matches_the_router_and_responses() {
         .await;
     assert_eq!(status, 201, "{schedule}");
     let schedule_id = schedule["id"].to_string();
+    // An endpoint that nothing in this test sends to, and one failed
+    // delivery in its log for the routes that name one.
+    let (status, webhook) = h
+        .api(
+            Method::POST,
+            "/v1/webhooks",
+            &h.alice,
+            Some(json!({"url": "https://hooks.relink-docs.net/in", "events": ["health.changed"]})),
+        )
+        .await;
+    assert_eq!(status, 201, "{webhook}");
+    let webhook_id = webhook["id"].to_string();
+    let delivery_id: i64 = sqlx::query_scalar(
+        "INSERT INTO webhook_deliveries (webhook_id, workspace_id, event_id, event, payload, \
+                                         state, attempts) \
+         SELECT id, workspace_id, 'evt_' || repeat('0', 32), 'health.changed', '{}', 'failed', 1 \
+           FROM webhooks WHERE id = $1 RETURNING id",
+    )
+    .bind(webhook["id"].as_i64().unwrap())
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
     let schedule_body = format!(r#"{{"run_at":"{run_at}","url":"https://example.com/"}}"#);
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
@@ -685,18 +707,27 @@ async fn openapi_matches_the_router_and_responses() {
             path.replace("{code}", code)
                 .replace("{hostname}", "go.relink-docs.net")
                 .replace("/schedules/{id}", &format!("/schedules/{schedule_id}"))
+                .replace("/webhooks/{id}", &format!("/webhooks/{webhook_id}"))
+                .replace("{delivery}", &delivery_id.to_string())
         );
         let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
         let edge = path.starts_with("/v1/edge/");
         let key = if edge { EDGE_TOKEN } else { h.alice.as_str() };
         let mut req = h.http.request(m, url).bearer_auth(key);
-        if (method == "post" || method == "patch") && !path.ends_with("/verify") {
+        if (method == "post" || method == "patch")
+            && !path.ends_with("/verify")
+            && !path.ends_with("/retry")
+        {
             let body = if edge {
                 r#"{"clicks":[]}"#
             } else if path == "/v1/domains" {
                 r#"{"hostname":"other.relink-docs.net"}"#
             } else if path == "/v1/domains/{hostname}" {
                 r#"{"prefixes":["campaign"]}"#
+            } else if path == "/v1/webhooks" {
+                r#"{"url":"https://hooks.relink-docs.net/two","events":["link.expired"]}"#
+            } else if path == "/v1/webhooks/{id}" {
+                r#"{"description":"docs"}"#
             } else if path.ends_with("/rollback") {
                 r#"{"version":1}"#
             } else if path.ends_with("/schedules") {
@@ -777,6 +808,22 @@ async fn openapi_matches_the_router_and_responses() {
     let (_, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
     let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("LinkList"));
+    let (_, list) = h.api(Method::GET, "/v1/webhooks", &h.alice, None).await;
+    let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("WebhookList"));
+    let hook = &list["webhooks"][0];
+    let keys: BTreeSet<String> = hook.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("Webhook"));
+    let (_, log) = h
+        .api(
+            Method::GET,
+            &format!("/v1/webhooks/{}/deliveries", hook["id"]),
+            &h.alice,
+            None,
+        )
+        .await;
+    let keys: BTreeSet<String> = log.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("DeliveryList"));
     let (_, usage) = h.api(Method::GET, "/v1/usage", &h.alice, None).await;
     let keys: BTreeSet<String> = usage.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("Usage"));

@@ -249,35 +249,41 @@ impl HealthWorker {
     }
 }
 
-async fn probe(client: &reqwest::Client, resolver: SafeResolver, url: &str) -> ProbeResult {
-    let Ok(parsed) = Url::parse(url) else {
-        return ProbeResult::Unhealthy;
-    };
-    // IP literals skip DNS, so the block list is applied here instead.
-    let literal = match parsed.host() {
+/// Whether `url`'s host is an IP address `resolver` would refuse. IP
+/// literals skip DNS, so the block list is applied to them here instead.
+pub fn blocked_literal(url: &Url, resolver: SafeResolver) -> bool {
+    let literal = match url.host() {
         Some(Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
         Some(Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
         _ => None,
     };
-    if let Some(ip) = literal
-        && !resolver.allow_private
-        && !is_public_ip(ip)
-    {
+    literal.is_some_and(|ip| !resolver.allow_private && !is_public_ip(ip))
+}
+
+/// Whether a request failed because [`SafeResolver`] refused its host.
+pub fn is_blocked(e: &(dyn StdError + 'static)) -> bool {
+    let mut source: Option<&(dyn StdError + 'static)> = Some(e);
+    while let Some(err) = source {
+        if err.is::<BlockedHost>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+async fn probe(client: &reqwest::Client, resolver: SafeResolver, url: &str) -> ProbeResult {
+    let Ok(parsed) = Url::parse(url) else {
+        return ProbeResult::Unhealthy;
+    };
+    if blocked_literal(&parsed, resolver) {
         return ProbeResult::Blocked;
     }
     match client.get(parsed).send().await {
         Ok(resp) if status_is_healthy(resp.status().as_u16()) => ProbeResult::Healthy,
         Ok(_) => ProbeResult::Unhealthy,
-        Err(e) => {
-            let mut source: Option<&dyn StdError> = Some(&e);
-            while let Some(err) = source {
-                if err.is::<BlockedHost>() {
-                    return ProbeResult::Blocked;
-                }
-                source = err.source();
-            }
-            ProbeResult::Unhealthy
-        }
+        Err(e) if is_blocked(&e) => ProbeResult::Blocked,
+        Err(_) => ProbeResult::Unhealthy,
     }
 }
 

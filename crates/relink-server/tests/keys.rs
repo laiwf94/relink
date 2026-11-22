@@ -68,17 +68,18 @@ fn all_but(s: Scope) -> Scopes {
 /// The custom domain the domain routes act on.
 const HOST: &str = "go.relink-docs.net";
 
-/// Sends one request for a documented route with a body that would succeed.
-/// `schedule` is a pending schedule of the link, for the route that cancels
-/// one.
-async fn call(
-    h: &Harness,
-    method: &str,
-    path: &str,
-    code: &str,
+/// What the routes' path parameters name: a link, a pending schedule of it
+/// (for the route that cancels one), and a webhook endpoint with a failed
+/// delivery.
+struct Targets<'a> {
+    code: &'a str,
     schedule: i64,
-    key: &str,
-) -> (u16, Value) {
+    webhook: i64,
+    delivery: i64,
+}
+
+/// Sends one request for a documented route with a body that would succeed.
+async fn call(h: &Harness, method: &str, path: &str, t: &Targets<'_>, key: &str) -> (u16, Value) {
     let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
     let body = match (method, path) {
         (_, "/v1/domains/{hostname}/verify") => None,
@@ -88,6 +89,11 @@ async fn call(
         })),
         ("patch", "/v1/domains/{hostname}") => Some(json!({"prefixes": ["campaign"]})),
         ("post", "/v1/links/{code}/rollback") => Some(json!({"version": 1})),
+        ("post", "/v1/webhooks") => Some(json!({
+            "url": "https://hooks.relink-docs.net/in", "events": ["health.changed"]
+        })),
+        ("patch", "/v1/webhooks/{id}") => Some(json!({"description": "scoped"})),
+        (_, "/v1/webhooks/{id}/deliveries/{delivery}/retry") => None,
         ("post", "/v1/links/{code}/schedules") => Some(json!({
             "run_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
             "enabled": false,
@@ -97,9 +103,11 @@ async fn call(
     };
     let live = path.ends_with("/live");
     let path = path
-        .replace("{code}", code)
+        .replace("{code}", t.code)
         .replace("{hostname}", HOST)
-        .replace("{id}", &schedule.to_string());
+        .replace("/webhooks/{id}", &format!("/webhooks/{}", t.webhook))
+        .replace("{delivery}", &t.delivery.to_string())
+        .replace("{id}", &t.schedule.to_string());
     if live {
         // A live stream never ends by itself: take the status, and read
         // the body only when it is an error.
@@ -159,7 +167,7 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 20);
+    assert_eq!(routes.len(), 28);
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
     routes.sort_by_key(|(m, p, _)| (*m == "delete", p == "/v1/links/{code}"));
@@ -188,11 +196,39 @@ async fn every_route_requires_its_documented_scope() {
         .await;
     assert_eq!(status, 201, "{schedule}");
     let schedule = schedule["id"].as_i64().unwrap();
+    let (status, hook) = h
+        .api(
+            Method::POST,
+            "/v1/webhooks",
+            &h.alice,
+            Some(json!({"url": "https://hooks.relink-docs.net/in", "events": ["health.changed"]})),
+        )
+        .await;
+    assert_eq!(status, 201, "{hook}");
+    let webhook = hook["id"].as_i64().unwrap();
+    // Failed, so the retry route has something to retry each time; nothing
+    // in this test sends to the endpoint.
+    let delivery: i64 = sqlx::query_scalar(
+        "INSERT INTO webhook_deliveries (webhook_id, workspace_id, event_id, event, payload, \
+                                         state, attempts) \
+         SELECT id, workspace_id, 'evt_' || repeat('0', 32), 'health.changed', '{}', 'failed', 1 \
+           FROM webhooks WHERE id = $1 RETURNING id",
+    )
+    .bind(webhook)
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
+    let targets = Targets {
+        code,
+        schedule,
+        webhook,
+        delivery,
+    };
     for (method, path, scope) in &routes {
         let (without, _) = make_key(&h, "alice", None, all_but(*scope), None)
             .await
             .unwrap();
-        let (status, body) = call(&h, method, path, code, schedule, &without).await;
+        let (status, body) = call(&h, method, path, &targets, &without).await;
         assert_eq!(status, 403, "{method} {path} without {scope}: {body}");
         assert_eq!(body["error"]["code"], "permission_denied");
         let message = body["error"]["message"].as_str().unwrap();
@@ -201,9 +237,9 @@ async fn every_route_requires_its_documented_scope() {
         let (only, _) = make_key(&h, "alice", None, (*scope).into(), None)
             .await
             .unwrap();
-        let (status, body) = call(&h, method, path, code, schedule, &only).await;
+        let (status, body) = call(&h, method, path, &targets, &only).await;
         assert!(
-            matches!(status, 200 | 201 | 204),
+            matches!(status, 200 | 201 | 202 | 204),
             "{method} {path} with only {scope}: {status} {body}"
         );
     }

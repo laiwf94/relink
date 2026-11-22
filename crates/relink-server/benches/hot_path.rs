@@ -96,6 +96,7 @@ fn app(rt: &tokio::runtime::Runtime) -> Arc<App> {
             timeout: Duration::from_secs(1),
             health_threshold: 2,
             kv_outbox: false,
+            public_base_url: cfg.public_base_url.clone(),
         },
     );
     let mut ruled = link("ruled", 1);

@@ -14,7 +14,7 @@
 //! table, with [`Anchor`].
 //!
 //! The log covers changes made by people and operators: links, API keys,
-//! workspaces, sign-ins and sign-outs, and invitations. Bookkeeping the server does by itself
+//! workspaces, sign-ins and sign-outs, invitations and webhooks. Bookkeeping the server does by itself
 //! (click counts, click leases, health results, the KV outbox) is not
 //! logged; it is not anyone's decision and would drown the log.
 
@@ -135,6 +135,9 @@ pub enum Action {
     ScheduleCreate,
     ScheduleCancel,
     ScheduleApply,
+    WebhookCreate,
+    WebhookUpdate,
+    WebhookDelete,
 }
 
 impl Action {
@@ -162,6 +165,9 @@ impl Action {
             Action::ScheduleCreate => "schedule.create",
             Action::ScheduleCancel => "schedule.cancel",
             Action::ScheduleApply => "schedule.apply",
+            Action::WebhookCreate => "webhook.create",
+            Action::WebhookUpdate => "webhook.update",
+            Action::WebhookDelete => "webhook.delete",
         }
     }
 }

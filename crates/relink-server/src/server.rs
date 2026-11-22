@@ -43,6 +43,7 @@ use crate::session;
 use crate::store::{CHANGES_CHANNEL, DOMAINS_CHANGED, Db, DbConfig, parse_change};
 use crate::tls::{self, Sealer, Tls, TlsListener};
 use crate::util::{now_ms, secure_random, stopped, utc_day};
+use crate::webhooks::{self, WebhookWorker};
 
 /// State shared by every request and background task.
 pub struct App {
@@ -225,6 +226,28 @@ pub fn public_router(app: Arc<App>) -> Router {
             "/v1/domains/{hostname}/verify",
             post(domains::verify_domain),
         )
+        .route(
+            "/v1/webhooks",
+            get(webhooks::list_webhooks).post(webhooks::create_webhook),
+        )
+        .route(
+            "/v1/webhooks/{id}",
+            get(webhooks::get_webhook)
+                .patch(webhooks::update_webhook)
+                .delete(webhooks::delete_webhook),
+        )
+        .route(
+            "/v1/webhooks/{id}/deliveries",
+            get(webhooks::list_deliveries),
+        )
+        .route(
+            "/v1/webhooks/{id}/deliveries/{delivery}",
+            get(webhooks::get_delivery),
+        )
+        .route(
+            "/v1/webhooks/{id}/deliveries/{delivery}/retry",
+            post(webhooks::retry_delivery),
+        )
         .route("/v1/auth/login", get(oidc::login))
         .route("/v1/auth/callback", get(oidc::callback))
         .route("/v1/auth/session", get(session::get_session))
@@ -302,6 +325,7 @@ pub fn open_db(cfg: &Config) -> Result<Db, String> {
             timeout: cfg.db_timeout,
             health_threshold: cfg.health.failure_threshold,
             kv_outbox: cfg.kv.is_some(),
+            public_base_url: cfg.public_base_url.clone(),
         },
     ))
 }
@@ -439,6 +463,19 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         None
     };
 
+    let deliveries = if cfg.webhooks.enabled {
+        let worker = WebhookWorker::new(
+            db.clone(),
+            cfg.webhooks,
+            cfg.destination_policy.allow_private,
+            metrics.clone(),
+        )
+        .map_err(|e| format!("cannot build the webhook client: {e}"))?;
+        Some(tokio::spawn(worker.run(bg_rx.clone())))
+    } else {
+        None
+    };
+
     let kv = match &cfg.kv {
         Some(kv_cfg) => {
             let api = CloudflareKv::new(kv_cfg)
@@ -517,6 +554,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         let _ = drain_tx.send(Some(deadline - timeout / 10));
         let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, relay, maintenance, scheduler];
         tasks.extend(health);
+        tasks.extend(deliveries);
         tasks.extend(kv);
         tasks.extend(certificates);
         for mut task in tasks {

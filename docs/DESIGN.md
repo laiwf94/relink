@@ -1904,6 +1904,100 @@ for clicks the edge sends in its batches alike:
 
 Step 8 of `examples/demo.sh` shows the same from the command line.
 
+## Webhooks
+
+A workspace admin registers an endpoint (`POST /v1/webhooks`) for any of
+four events: `link.created` and `link.updated` when someone creates or
+changes a link (through the API, a rollback or a schedule), `link.expired`
+when a link's `expires_at` passes, and `health.changed` when a
+destination's health check result flips. `src/webhooks.rs` holds all of
+it; migration 0022 the tables.
+
+**Written with the change.** An event becomes one row per subscribed,
+enabled endpoint in `webhook_deliveries`, inserted by `webhooks::emit` in
+the same transaction as the change: `Tenant::insert_link` and
+`Tenant::apply_patch` for link changes, `Db::record_health` for health.
+A change that commits is always delivered eventually; one that rolls back
+never is. With no endpoint subscribed, `emit` is one insert that selects
+nothing from a workspace's few `webhooks` rows. A patch that changes
+nothing a client sees (only bookkeeping such as `version` or
+`updated_at`) sends nothing. `link.updated` carries the link now, the
+names of the fields that changed and their previous values.
+
+**Expiries.** Nothing happens in the database when an expiry passes, so the
+delivery worker looks for links whose `expires_at` is past and differs from
+`links.expiry_announced`, through a partial index that holds only links
+with an expiry not yet announced. Each is marked announced and its event
+written in one transaction, with `SKIP LOCKED` so instances split the work.
+Keeping the expiry that was announced, rather than a flag, means moving
+`expires_at` later announces the new expiry in its turn. Links that had
+already expired when the migration ran are marked announced, not sent.
+
+**Delivery, at least once.** `WebhookWorker` claims up to
+`RELINK_WEBHOOK_CONCURRENCY` (16) due rows with `FOR UPDATE SKIP LOCKED`,
+and in the same statement moves their due time past twice the request
+timeout. The tries then run concurrently, with no lock held. A 2xx answer
+marks the delivery delivered; anything else (another status, a refused
+connection, a timeout, a blocked address) adds one to its tries and makes
+it due again after `backoff`: `RELINK_WEBHOOK_RETRY_BASE_MS` (30 s) doubled
+for each failed try after the first, capped at `RELINK_WEBHOOK_RETRY_MAX_MS`
+(6 h), then scaled by a random factor between 0.5 and 1 so endpoints that
+failed together do not all retry together. With the defaults the twelve
+tries of `RELINK_WEBHOOK_MAX_ATTEMPTS` span 7 to 15 hours; after the
+last, the delivery is failed. An instance that dies mid-try never records
+it, so the row comes back when its claim runs out and is sent again. That,
+and an endpoint that answers after the timeout, are why delivery is at least
+once rather than exactly once. Two instances never hold the same row at
+once, so in normal running each event reaches each endpoint once
+(`tests/webhooks.rs` checks 40 events through two instances). Deliveries
+are not ordered: a retried event can arrive after a later one.
+
+**What is sent.** A `POST` of the stored payload, byte for byte the same on
+every try:
+
+```json
+{"id": "evt_6c1f...", "type": "link.updated", "created_at": "2026-11-22T10:15:02.113Z",
+ "workspace_id": 3, "data": {"link": {...}, "changed": ["destinations"], "previous": {...}}}
+```
+
+`data.link` is the link as `GET /v1/links/{code}` shows it. Headers:
+`Relink-Event`, `Relink-Event-Id` (the same for every try and every
+endpoint, for dropping duplicates), `Relink-Delivery` (the row in the
+delivery log) and `Relink-Signature: t=<unix seconds>,v1=<hex>`, where the
+hex is HMAC-SHA256 under the endpoint's secret of the timestamp, a dot and
+the body. The timestamp is the time of the try, so a receiver can refuse
+anything signed more than a few minutes ago; `webhooks::verify` is the
+check, and its unit test pins a known answer. The secret (`whsec_` and 64
+hex characters, the whole string being the key) is shown when the endpoint
+is registered and when `rotate_secret` replaces it, and never again. It is
+stored as is, because the server must sign with it; sealing it under the
+key encryption key belongs with the encryption at rest of week 38.
+
+**The delivery log.** Every try is a row in `webhook_attempts`: when, the
+status (or none), how long it took, the error, and the first 512 bytes of
+the answer. `GET /v1/webhooks/{id}/deliveries` lists an endpoint's
+deliveries newest first, filtered by state; `GET .../deliveries/{delivery}`
+adds the payload and every try; `POST .../retry` makes a failed or pending
+delivery due now, giving a failed one one more try. Disabling an endpoint
+fails its pending deliveries, so a paused endpoint does not keep the worker
+scanning them; they can be retried once it is enabled again. Finished
+deliveries are deleted `RELINK_WEBHOOK_RETENTION_DAYS` (30) after they were
+created, 10,000 at a time each minute; pending ones never are.
+
+**Boundaries.** Endpoints, deliveries and tries are under row-level
+security like links: a workspace sees only its own, and a delivery's
+composite foreign key ties it to its endpoint's workspace. Managing and
+reading webhooks needs the admin or owner role (`links:write` or
+`links:read`), since an endpoint receives every link of the workspace;
+each change is in the audit log as `webhook.create`, `webhook.update` or
+`webhook.delete`, without the secret. A workspace holds at most 50
+endpoints. The URL must be https on a public host by the destination
+rules, and the requests follow the health checker's SSRF defences below:
+the resolver drops non-public addresses, IP literals are checked against
+the same list, redirects are not followed, no proxy is used, and only the
+start of an answer is read. `RELINK_WEBHOOKS_ENABLED=false` keeps an
+instance from sending; events are still queued for the others.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several

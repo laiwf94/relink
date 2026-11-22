@@ -14,7 +14,8 @@
 //! decides which forwarding headers to believe; [`schedule`] keeps each
 //! link's version history and applies scheduled changes; [`protect`] puts
 //! a password or consent page in front of a link; [`health`] probes
-//! destinations; [`kvsync`] publishes links for the edge; [`store`] is
+//! destinations; [`webhooks`] tells a workspace's endpoints about link
+//! changes, expiries and health; [`kvsync`] publishes links for the edge; [`store`] is
 //! Postgres and [`server`] wires it together; [`cli`] parses the key
 //! commands. The rules shared with the edge come from `relink_core` and are
 //! re-exported below.
@@ -54,5 +55,6 @@ pub mod tenant;
 pub mod tls;
 pub mod trust;
 pub mod util;
+pub mod webhooks;
 
 pub use relink_core::{abtest, classify, destination, hll, model, netguard, rules, rules_v2};

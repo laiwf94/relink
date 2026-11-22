@@ -18,7 +18,8 @@
 //! filter of their own: a link in another workspace is invisible, so it is
 //! "not found" exactly like a code that does not exist. Each change also
 //! appends to the workspace's audit chain in the same transaction, as the
-//! [`Actor`] the `Tenant` was made for.
+//! [`Actor`] the `Tenant` was made for, and queues the webhook events it
+//! causes (src/webhooks.rs).
 
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -42,6 +43,7 @@ use crate::store::{
     Bucket, DayStats, Db, DbError, LinkPatch, NewLink, STATS_COUNTRY, STATS_DEVICE, STATS_REFERRER,
     STATS_TOP_N, Stats, StoredLink, api_columns, columns, geo_columns, protection_columns,
 };
+use crate::webhooks::{self, Event};
 
 /// `WHERE` clause finding a link by code (`$1`) on a domain named by its
 /// hostname (`$2`, NULL for the default domain) in the tenant's workspace.
@@ -387,6 +389,13 @@ impl<'a> Tenant<'a> {
                         ..self.change(Action::LinkCreate, link.id)
                     };
                     audit::record(&mut tx, &self.actor, change).await?;
+                    webhooks::emit(
+                        &mut tx,
+                        self.workspace_id,
+                        Event::LinkCreated,
+                        webhooks::link_created(&link, self.db.base_url()),
+                    )
+                    .await?;
                     tx.commit().await?;
                     Ok(Ok(link))
                 })
@@ -466,6 +475,7 @@ impl<'a> Tenant<'a> {
     ) -> Result<StoredLink, sqlx::Error> {
         let mut link = self.db.row_to_link(row)?;
         let before = audit::link_state(&link);
+        let original = link.clone();
         let destinations_changed = match &patch.destinations {
             Some(d) if *d != link.destinations => {
                 link.destinations = d.clone();
@@ -545,6 +555,15 @@ impl<'a> Tenant<'a> {
             ..self.change(edit.action, updated.id)
         };
         audit::record(tx, &self.actor, change).await?;
+        // The row read under the lock has no hostname; the link's domain
+        // cannot change, so the updated row's is the original's too.
+        let original = StoredLink {
+            domain: updated.domain.clone(),
+            ..original
+        };
+        if let Some(data) = webhooks::link_updated(&original, &updated, self.db.base_url()) {
+            webhooks::emit(tx, self.workspace_id, Event::LinkUpdated, data).await?;
+        }
         Ok(updated)
     }
 

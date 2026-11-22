@@ -192,10 +192,11 @@ pub enum DbOp {
     Maintenance,
     Kv,
     Schedule,
+    Webhook,
 }
 
 impl DbOp {
-    const ALL: [DbOp; 9] = [
+    const ALL: [DbOp; 10] = [
         DbOp::Lookup,
         DbOp::Lease,
         DbOp::Flush,
@@ -205,6 +206,7 @@ impl DbOp {
         DbOp::Maintenance,
         DbOp::Kv,
         DbOp::Schedule,
+        DbOp::Webhook,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -217,6 +219,7 @@ impl DbOp {
             DbOp::Maintenance => "maintenance",
             DbOp::Kv => "kv",
             DbOp::Schedule => "schedule",
+            DbOp::Webhook => "webhook",
         }
     }
 }
@@ -372,6 +375,13 @@ pub struct Metrics {
     pub live_received: Counter,
     pub live_relay_dropped: Counter,
     pub live_refused: Counter,
+    /// Webhook deliveries delivered, tries that failed and will be retried,
+    /// deliveries that failed for good, and link expiries announced
+    /// (src/webhooks.rs).
+    pub webhook_delivered: Counter,
+    pub webhook_retried: Counter,
+    pub webhook_failed: Counter,
+    pub webhook_expiries: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -428,6 +438,10 @@ impl Default for Metrics {
             live_lagged: Counter::default(),
             live_relayed: Counter::default(),
             live_received: Counter::default(),
+            webhook_delivered: Counter::default(),
+            webhook_retried: Counter::default(),
+            webhook_failed: Counter::default(),
+            webhook_expiries: Counter::default(),
             live_relay_dropped: Counter::default(),
             live_refused: Counter::default(),
             backlog: AtomicU64::new(0),
@@ -546,7 +560,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 44] = [
+        let counters: [(&str, &str, u64); 48] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -626,6 +640,26 @@ impl Metrics {
                 "relink_schedules_failed_total",
                 "Scheduled link changes that could not be applied and were marked failed.",
                 self.schedules_failed.get(),
+            ),
+            (
+                "relink_webhook_deliveries_total",
+                "Webhook deliveries the endpoint accepted with a 2xx answer.",
+                self.webhook_delivered.get(),
+            ),
+            (
+                "relink_webhook_retries_total",
+                "Webhook tries that failed and were scheduled again.",
+                self.webhook_retried.get(),
+            ),
+            (
+                "relink_webhook_failures_total",
+                "Webhook deliveries that failed on their last try.",
+                self.webhook_failed.get(),
+            ),
+            (
+                "relink_webhook_expiries_total",
+                "Link expiries announced as link.expired events.",
+                self.webhook_expiries.get(),
             ),
             (
                 "relink_click_partitions_created_total",

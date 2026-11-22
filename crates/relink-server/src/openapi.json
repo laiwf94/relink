@@ -344,6 +344,153 @@
         }
       }
     },
+    "/v1/webhooks": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Register a webhook endpoint",
+        "operationId": "createWebhook",
+        "description": "Registers an endpoint for the named events (link.created, link.updated, link.expired, health.changed). Needs the admin or owner role. The url must be https on a public host. The answer carries the signing secret, which is not shown again. Each delivery is a POST of the event as JSON with Relink-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 under the secret of \"<t>.<body>\">, Relink-Event, Relink-Event-Id (the same on every retry, for dropping duplicates) and Relink-Delivery. Any 2xx answer is success; anything else is retried with exponential backoff. A workspace holds at most 50 endpoints (failed_precondition, 409).",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateWebhook" } } } },
+        "responses": {
+          "201": { "description": "Registered, with its secret.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Webhook" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List webhook endpoints",
+        "operationId": "listWebhooks",
+        "description": "Every endpoint of the workspace, oldest first, without secrets. Needs the admin or owner role.",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": { "description": "The endpoints.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookList" } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/webhooks/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/WebhookId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "Get a webhook endpoint",
+        "operationId": "getWebhook",
+        "description": "Needs the admin or owner role. The secret is not shown.",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": { "description": "The endpoint.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Webhook" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Change a webhook endpoint",
+        "operationId": "updateWebhook",
+        "description": "Needs the admin or owner role. Absent fields keep their value. Disabling an endpoint fails its pending deliveries, which can be retried once it is enabled again. rotate_secret replaces the secret at once and the answer shows the new one, once.",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchWebhook" } } } },
+        "responses": {
+          "200": { "description": "The endpoint as changed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Webhook" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a webhook endpoint",
+        "operationId": "deleteWebhook",
+        "description": "Needs the admin or owner role. Its delivery log goes with it.",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "204": { "description": "Deleted." },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/webhooks/{id}/deliveries": {
+      "parameters": [{ "$ref": "#/components/parameters/WebhookId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "An endpoint's delivery log",
+        "operationId": "listDeliveries",
+        "description": "Deliveries newest first, kept for RELINK_WEBHOOK_RETENTION_DAYS after they finish. Needs the admin or owner role.",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "parameters": [
+          { "name": "state", "in": "query", "required": false, "schema": { "enum": ["pending", "delivered", "failed"] } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+          { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "A page of deliveries.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeliveryList" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/webhooks/{id}/deliveries/{delivery}": {
+      "parameters": [{ "$ref": "#/components/parameters/WebhookId" }, { "$ref": "#/components/parameters/DeliveryId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "One delivery with its payload and every try",
+        "operationId": "getDelivery",
+        "description": "Needs the admin or owner role.",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": { "description": "The delivery.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeliveryDetail" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/webhooks/{id}/deliveries/{delivery}/retry": {
+      "parameters": [{ "$ref": "#/components/parameters/WebhookId" }, { "$ref": "#/components/parameters/DeliveryId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Try a delivery again now",
+        "operationId": "retryDelivery",
+        "description": "Makes a failed or pending delivery due now; a failed one gets one more try. Needs the admin or owner role and no body. A delivered one, or one of a disabled endpoint, is failed_precondition (409).",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "202": { "description": "Due now.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Delivery" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/auth/login": {
       "get": {
         "summary": "Start signing in with the OpenID Connect provider",
@@ -679,6 +826,8 @@
       "Code": { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{3,64}$" } },
       "Domain": { "name": "domain", "in": "query", "required": false, "schema": { "type": "string", "maxLength": 253 }, "description": "The custom domain the code is on; absent for the default domain. A hostname the workspace does not have finds no link." },
       "Hostname": { "name": "hostname", "in": "path", "required": true, "schema": { "type": "string", "maxLength": 253 }, "description": "The domain's hostname, case-insensitive." },
+      "WebhookId": { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "description": "The webhook endpoint's ID." },
+      "DeliveryId": { "name": "delivery", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "description": "The delivery's ID, as the delivery log and the Relink-Delivery header show it." },
       "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied. A session acts in the named workspace if the person is a member, else in their personal workspace." },
       "InviteToken": { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^rli_[0-9a-f]{64}$" }, "description": "The token from the invitation link. It is a credential: relink never logs it." },
       "Csrf": { "name": "X-CSRF-Token", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "description": "The session's CSRF token; required on every state-changing request authenticated by the session cookie." }
@@ -1150,6 +1299,104 @@
         "type": "object",
         "required": ["domains"],
         "properties": { "domains": { "type": "array", "items": { "$ref": "#/components/schemas/Domain" } } }
+      },
+      "WebhookEvent": { "enum": ["link.created", "link.updated", "link.expired", "health.changed"] },
+      "CreateWebhook": {
+        "type": "object",
+        "required": ["url", "events"],
+        "additionalProperties": false,
+        "properties": {
+          "url": { "type": "string", "maxLength": 2048, "description": "https, a public host, no credentials." },
+          "events": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/WebhookEvent" } },
+          "description": { "type": "string", "maxLength": 200 },
+          "enabled": { "type": "boolean", "default": true }
+        }
+      },
+      "PatchWebhook": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": { "type": "string", "maxLength": 2048 },
+          "events": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/WebhookEvent" } },
+          "description": { "type": "string", "maxLength": 200 },
+          "enabled": { "type": "boolean" },
+          "rotate_secret": { "type": "boolean", "default": false }
+        }
+      },
+      "Webhook": {
+        "type": "object",
+        "required": ["id", "url", "events", "description", "enabled", "created_by", "created_at", "updated_at"],
+        "properties": {
+          "id": { "type": "integer" },
+          "url": { "type": "string" },
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/WebhookEvent" } },
+          "description": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "created_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "secret": { "type": "string", "pattern": "^whsec_[0-9a-f]{64}$", "description": "The signing secret, only when the endpoint was just registered or its secret rotated. The whole string is the HMAC key." }
+        }
+      },
+      "WebhookList": {
+        "type": "object",
+        "required": ["webhooks"],
+        "properties": { "webhooks": { "type": "array", "items": { "$ref": "#/components/schemas/Webhook" } } }
+      },
+      "Delivery": {
+        "type": "object",
+        "required": ["id", "event_id", "event", "state", "attempts", "created_at", "next_attempt_at", "delivered_at", "last_status", "last_error"],
+        "properties": {
+          "id": { "type": "integer" },
+          "event_id": { "type": "string", "pattern": "^evt_[0-9a-f]{32}$" },
+          "event": { "$ref": "#/components/schemas/WebhookEvent" },
+          "state": { "enum": ["pending", "delivered", "failed"] },
+          "attempts": { "type": "integer", "description": "Tries so far." },
+          "created_at": { "type": "string", "format": "date-time" },
+          "next_attempt_at": { "type": ["string", "null"], "format": "date-time", "description": "When a pending delivery is next tried." },
+          "delivered_at": { "type": ["string", "null"], "format": "date-time" },
+          "last_status": { "type": ["integer", "null"], "description": "The last answer's status; null when there was none." },
+          "last_error": { "type": ["string", "null"] }
+        }
+      },
+      "DeliveryList": {
+        "type": "object",
+        "required": ["deliveries", "next_cursor"],
+        "properties": {
+          "deliveries": { "type": "array", "items": { "$ref": "#/components/schemas/Delivery" } },
+          "next_cursor": { "type": ["string", "null"] }
+        }
+      },
+      "DeliveryDetail": {
+        "allOf": [
+          { "$ref": "#/components/schemas/Delivery" },
+          {
+            "type": "object",
+            "required": ["payload", "attempt_log"],
+            "properties": {
+              "payload": {
+                "type": "object",
+                "description": "The event exactly as posted: id, type, created_at, workspace_id and data. data has the link (as GET /v1/links/{code} shows it); link.updated adds changed (field names) and previous (their old values); health.changed adds destinations, the ones whose health flipped.",
+                "required": ["id", "type", "created_at", "workspace_id", "data"]
+              },
+              "attempt_log": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["attempt", "at", "status", "duration_ms", "error", "response"],
+                  "properties": {
+                    "attempt": { "type": "integer" },
+                    "at": { "type": "string", "format": "date-time" },
+                    "status": { "type": ["integer", "null"] },
+                    "duration_ms": { "type": "integer" },
+                    "error": { "type": ["string", "null"] },
+                    "response": { "type": ["string", "null"], "description": "The first 512 bytes of the answer." }
+                  }
+                }
+              }
+            }
+          }
+        ]
       },
       "Stats": {
         "type": "object",
