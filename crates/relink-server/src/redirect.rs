@@ -35,6 +35,7 @@ use crate::rules::{Decision, Settings, Visit, evaluate};
 use crate::server::App;
 use crate::store::link_key;
 use crate::util::{fast_random, now_ms};
+use relink_core::conversion;
 use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file};
 use relink_core::gate::preview;
 use relink_core::site::{
@@ -411,10 +412,9 @@ pub async fn handle(
     } else {
         Outcome::Redirect
     };
-    (
-        location(redirect.status, redirect.location, cache, cookie),
-        outcome,
-    )
+    // A link that tracks conversions sends each click on with its own id.
+    let to = conversion::location(link, &redirect, &app.signer, visit.now_ms, visit.random);
+    (location(redirect.status, &to, cache, cookie), outcome)
 }
 
 /// An app association file (`relink_core::deeplink::app_file`).

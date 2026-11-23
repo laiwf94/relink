@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Request};
 use criterion::{Criterion, criterion_group, criterion_main};
+use relink_core::conversion::{self, ClickId, Target};
 use relink_server::abtest::{Signer, choose};
 use relink_server::cache::{Cache, Config as CacheConfig};
 use relink_server::classify::{device_class, referrer_host};
@@ -56,6 +57,7 @@ fn link(code: &str, destinations: usize) -> Link {
         rules: Default::default(),
         app: Default::default(),
         protection: Default::default(),
+        conversion_window_days: None,
     }
 }
 
@@ -101,7 +103,14 @@ fn app(rt: &tokio::runtime::Runtime) -> Arc<App> {
     );
     let mut ruled = link("ruled", 1);
     ruled.rules = serde_json::from_str(&worst_rules_for_handler()).unwrap();
-    let source = Arc::new(Links(vec![link("bench", 1), link("split", 3), ruled]));
+    let mut tracked = link("tracked", 1);
+    tracked.conversion_window_days = Some(30);
+    let source = Arc::new(Links(vec![
+        link("bench", 1),
+        link("split", 3),
+        ruled,
+        tracked,
+    ]));
     let (app, mut rx) = App::new(
         cfg,
         db,
@@ -148,6 +157,18 @@ fn redirect_path(c: &mut Criterion) {
     g.bench_function("handler_cache_hit_64_rule_conditions", |b| {
         b.to_async(&rt)
             .iter(|| handle(&app, "ruled", query, &ruled_headers, peer))
+    });
+    // A link that tracks conversions: each click gets a signed click id.
+    let (resp, _) = rt.block_on(handle(&app, "tracked", None, &headers, peer));
+    assert!(
+        resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("&rl_cid=")
+    );
+    g.bench_function("handler_cache_hit_click_id", |b| {
+        b.to_async(&rt)
+            .iter(|| handle(&app, "tracked", None, &headers, peer))
     });
     g.bench_function("handler_negative_hit", |b| {
         rt.block_on(handle(&app, "missing", None, &headers, peer));
@@ -208,6 +229,34 @@ fn components(c: &mut Criterion) {
     let cookie = signer.sign(42, 3, 1);
     c.bench_function("ab_cookie_verify", |b| {
         b.iter(|| signer.verify(42, 3, &cookie, 3))
+    });
+    let click = ClickId::new(
+        42,
+        1_764_000_000_000,
+        Target::Destination(1),
+        "https://example.com/landing",
+        7,
+    );
+    c.bench_function("click_id_mint_and_tag", |b| {
+        let mut r = 0u64;
+        b.iter(|| {
+            r = r.wrapping_add(1);
+            let id = ClickId::new(
+                42,
+                1_764_000_000_000,
+                Target::Destination(1),
+                "https://example.com/landing?utm_source=x",
+                r,
+            );
+            conversion::tag(
+                "https://example.com/landing?utm_source=x",
+                &id.encode(&signer),
+            )
+        })
+    });
+    let encoded = click.encode(&signer);
+    c.bench_function("click_id_verify", |b| {
+        b.iter(|| ClickId::decode(&signer, &encoded))
     });
     c.bench_function("ab_choose_10_variants", |b| {
         let w = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000];

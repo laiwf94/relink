@@ -70,9 +70,10 @@ const HOST: &str = "go.relink-docs.net";
 
 /// What the routes' path parameters name: a link, a pending schedule of it
 /// (for the route that cancels one), and a webhook endpoint with a failed
-/// delivery.
+/// delivery; and a click id of the link, for posting a conversion.
 struct Targets<'a> {
     code: &'a str,
+    click_id: &'a str,
     schedule: i64,
     webhook: i64,
     delivery: i64,
@@ -93,6 +94,9 @@ async fn call(h: &Harness, method: &str, path: &str, t: &Targets<'_>, key: &str)
             "url": "https://hooks.relink-docs.net/in", "events": ["health.changed"]
         })),
         ("patch", "/v1/webhooks/{id}") => Some(json!({"description": "scoped"})),
+        // The same each time: the first is recorded, the rest are 200
+        // duplicates.
+        ("post", "/v1/conversions") => Some(json!({"click_id": t.click_id, "event": "scoped"})),
         (_, "/v1/webhooks/{id}/deliveries/{delivery}/retry") => None,
         ("post", "/v1/links/{code}/schedules") => Some(json!({
             "run_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
@@ -166,14 +170,21 @@ async fn every_route_requires_its_documented_scope() {
         }
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
-    assert_eq!(documented.len(), 3, "every scope guards some route");
-    assert_eq!(routes.len(), 28);
+    assert_eq!(documented.len(), 4, "every scope guards some route");
+    assert_eq!(routes.len(), 30);
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
     routes.sort_by_key(|(m, p, _)| (*m == "delete", p == "/v1/links/{code}"));
 
-    let link = h.create(json!({"url": "https://example.com/"})).await;
+    let link = h
+        .create(json!({"url": "https://example.com/", "conversion_window_days": 30}))
+        .await;
     let code = link["code"].as_str().unwrap();
+    let to = h.visit(code, &[]).await.headers()["location"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let click_id = relink_core::conversion::find(&to).unwrap();
     let (status, body) = h
         .api(
             Method::POST,
@@ -220,6 +231,7 @@ async fn every_route_requires_its_documented_scope() {
     .unwrap();
     let targets = Targets {
         code,
+        click_id,
         schedule,
         webhook,
         delivery,
@@ -591,7 +603,8 @@ fn key_errors_read_well() {
                 role: Role::Viewer,
                 scopes: Scopes::ALL,
             },
-            "viewer role grants only links:read,stats:read, not links:read,links:write,stats:read",
+            "viewer role grants only links:read,stats:read, not \
+             links:read,links:write,stats:read,conversions:write",
         ),
         (
             KeyError::Db(relink_server::store::DbError::Conflict),

@@ -46,6 +46,7 @@ fn new_link(alias: Option<&str>, max_clicks: Option<i64>) -> NewLink {
         rules: Default::default(),
         app: Default::default(),
         protection: Default::default(),
+        conversion_window_days: None,
         domain: None,
     }
 }

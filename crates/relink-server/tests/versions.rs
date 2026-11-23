@@ -93,6 +93,7 @@ fn settings_of(link: &Value) -> Value {
         "health_check": link["health_check"],
         "rules": link["rules"],
         "app": link["app"],
+        "conversion_window_days": link["conversion_window_days"],
     })
 }
 

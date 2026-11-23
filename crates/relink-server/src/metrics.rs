@@ -382,6 +382,11 @@ pub struct Metrics {
     pub webhook_retried: Counter,
     pub webhook_failed: Counter,
     pub webhook_expiries: Counter,
+    /// Conversions posted (src/conversions.rs): stored, already stored,
+    /// and refused.
+    pub conversions_recorded: Counter,
+    pub conversions_duplicate: Counter,
+    pub conversions_rejected: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -442,6 +447,9 @@ impl Default for Metrics {
             webhook_retried: Counter::default(),
             webhook_failed: Counter::default(),
             webhook_expiries: Counter::default(),
+            conversions_recorded: Counter::default(),
+            conversions_duplicate: Counter::default(),
+            conversions_rejected: Counter::default(),
             live_relay_dropped: Counter::default(),
             live_refused: Counter::default(),
             backlog: AtomicU64::new(0),
@@ -560,7 +568,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 48] = [
+        let counters: [(&str, &str, u64); 51] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -660,6 +668,21 @@ impl Metrics {
                 "relink_webhook_expiries_total",
                 "Link expiries announced as link.expired events.",
                 self.webhook_expiries.get(),
+            ),
+            (
+                "relink_conversions_total",
+                "Conversions posted and attributed to their click.",
+                self.conversions_recorded.get(),
+            ),
+            (
+                "relink_conversions_duplicate_total",
+                "Conversions posted again and answered with the stored one.",
+                self.conversions_duplicate.get(),
+            ),
+            (
+                "relink_conversions_rejected_total",
+                "Conversions refused: malformed, a click id that is not valid, another workspace's link, no tracking or outside the window.",
+                self.conversions_rejected.get(),
             ),
             (
                 "relink_click_partitions_created_total",

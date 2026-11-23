@@ -34,6 +34,7 @@ use std::rc::Rc;
 
 use relink_core::classify::{UNKNOWN_COUNTRY, device_class, referrer_host};
 use relink_core::code::is_plausible_code;
+use relink_core::conversion;
 use relink_core::deeplink::{APP_FILE_CACHE, JSON, app_file_at};
 use relink_core::gate::{GATE_CSP, preview};
 use relink_core::hex;
@@ -293,7 +294,7 @@ async fn serve<K: Kv, O: Origin>(
     let cookies: Vec<&[u8]> = req.cookies.iter().map(Vec::as_slice).collect();
     let visit = visit(req, &cookies);
     let decision = evaluate(link, &visit, settings);
-    stopped(kv, origin, req, link, pages, decision).await
+    stopped(kv, origin, settings, req, link, pages, decision).await
 }
 
 /// The facts the decisions read: targeting rules were compiled when the
@@ -329,7 +330,7 @@ async fn serve_preview<K: Kv, O: Origin>(
     let path = req.code.strip_suffix('+').unwrap_or(&req.code);
     match preview(link, path, &visit(req, &cookies), settings) {
         Ok(html) => edge(gate_response(200, html), None),
-        Err(decision) => stopped(kv, origin, req, link, pages, decision).await,
+        Err(decision) => stopped(kv, origin, settings, req, link, pages, decision).await,
     }
 }
 
@@ -352,6 +353,7 @@ pub fn gate_response(status: u16, html: String) -> EdgeResponse {
 async fn stopped<K: Kv, O: Origin>(
     kv: &K,
     origin: &O,
+    settings: &Settings<'_>,
     req: &EdgeRequest,
     link: &Link,
     pages: Pages<'_>,
@@ -376,7 +378,10 @@ async fn stopped<K: Kv, O: Origin>(
         Decision::Redirect(r) if r.needs_admission => return from_origin(origin, req).await,
         Decision::Redirect(r) => {
             let cache = r.cacheable.then_some(EDGE_MAX_AGE);
-            let response = redirect(r.status, r.location, cache, r.set_cookie);
+            // A link that tracks conversions gets a click id, as at the
+            // origin, under the same key.
+            let location = conversion::location(link, &r, settings.signer, req.now_ms, req.random);
+            let response = redirect(r.status, &location, cache, r.set_cookie);
             return edge(response, Some(click_for(link, req)));
         }
     };
@@ -760,6 +765,7 @@ mod tests {
             rules: Default::default(),
             app: Default::default(),
             protection: Default::default(),
+            conversion_window_days: None,
         }
     }
 
@@ -803,6 +809,29 @@ mod tests {
         );
         assert_eq!(click.referrer.as_deref(), Some("news.example.org"));
         assert_eq!(click.fingerprint.len(), 32);
+    }
+
+    #[test]
+    fn tracked_links_send_a_click_id_and_are_not_cached() {
+        let mut l = link("promo");
+        l.conversion_window_days = Some(30);
+        let kv = MemoryKv::with(&l);
+        let origin = FakeOrigin::default();
+        let out = run(handle(&kv, &origin, &SETTINGS, DEFAULT, &req("promo")));
+        assert_eq!(out.served, Served::Edge);
+        assert_eq!(out.response.header("cache-control"), Some("no-store"));
+        let to = out.response.header("location").unwrap();
+        let (base, id) = to.split_once("?rl_cid=").unwrap();
+        assert_eq!(base, "https://example.com/landing");
+        let click = conversion::ClickId::decode(&SIGNER, id).unwrap();
+        assert_eq!(click.link_id, 11);
+        assert_eq!(click.at_ms(), req("promo").now_ms / 1000 * 1000);
+        assert_eq!(click.target, conversion::Target::Destination(0));
+        assert_eq!(
+            click.url_hash,
+            conversion::url_hash("https://example.com/landing")
+        );
+        assert!(out.click.is_some());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 pub mod abtest;
 pub mod classify;
 pub mod code;
+pub mod conversion;
 pub mod deeplink;
 pub mod destination;
 pub mod gate;

@@ -183,6 +183,8 @@ pub struct LinksRead;
 pub struct LinksWrite;
 /// Requires `stats:read`.
 pub struct StatsRead;
+/// Requires `conversions:write`.
+pub struct ConversionsWrite;
 
 impl RequiredScope for LinksRead {
     const SCOPE: Scope = Scope::LinksRead;
@@ -192,6 +194,9 @@ impl RequiredScope for LinksWrite {
 }
 impl RequiredScope for StatsRead {
     const SCOPE: Scope = Scope::StatsRead;
+}
+impl RequiredScope for ConversionsWrite {
+    const SCOPE: Scope = Scope::ConversionsWrite;
 }
 
 /// A [`Workspace`] whose caller may use the scope `S` there.
@@ -353,9 +358,10 @@ impl<'a> Tenant<'a> {
                     let row = sqlx::query(concat!(
                         "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
                          max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-                         domain_id, rules, app, password_hash, password_attempts, consent) \
+                         domain_id, rules, app, password_hash, password_attempts, consent, \
+                         conversion_window_days) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                         $15, $16, $17) \
+                         $15, $16, $17, $18) \
                          RETURNING ",
                         api_columns!()
                     ))
@@ -376,6 +382,7 @@ impl<'a> Tenant<'a> {
                     .bind(hash)
                     .bind(attempts)
                     .bind(consent)
+                    .bind(new.conversion_window_days.map(|d| d as i16))
                     .fetch_one(&mut *tx)
                     .await?;
                     let mut link = self.db.row_to_link(&row)?;
@@ -513,6 +520,9 @@ impl<'a> Tenant<'a> {
         if let Some(p) = &patch.protection {
             link.protection = p.apply(&link.protection);
         }
+        if let Some(w) = patch.conversion_window_days {
+            link.conversion_window_days = w;
+        }
         let (geo_mode, geo_countries) = geo_columns(link.geo.as_ref());
         let (hash, attempts, consent) = protection_columns(&link.protection);
         let row = sqlx::query(concat!(
@@ -522,7 +532,8 @@ impl<'a> Tenant<'a> {
              redirect_status = $4, expires_at = $5, max_clicks = $6, geo_mode = $7, \
              geo_countries = $8, fallback_url = $9, enabled = $10, health_check = $11, \
              rules = $12, app = $13, password_hash = $14, password_attempts = $15, \
-             consent = $16, updated_at = now() WHERE id = $1 RETURNING ",
+             consent = $16, conversion_window_days = $17, updated_at = now() \
+             WHERE id = $1 RETURNING ",
             api_columns!()
         ))
         .bind(link.id)
@@ -541,6 +552,7 @@ impl<'a> Tenant<'a> {
         .bind(hash)
         .bind(attempts)
         .bind(consent)
+        .bind(link.conversion_window_days.map(|d| d as i16))
         .fetch_one(&mut **tx)
         .await?;
         let mut updated = self.db.row_to_link(&row)?;

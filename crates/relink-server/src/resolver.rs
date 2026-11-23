@@ -312,6 +312,7 @@ mod tests {
             rules: Default::default(),
             app: Default::default(),
             protection: Default::default(),
+            conversion_window_days: None,
         }
     }
 

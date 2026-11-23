@@ -196,6 +196,7 @@ fn link(id: i64, code: String, state: State) -> Link {
         rules: Default::default(),
         app: Default::default(),
         protection: Default::default(),
+        conversion_window_days: None,
     }
 }
 

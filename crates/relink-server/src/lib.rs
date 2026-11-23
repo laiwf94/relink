@@ -30,6 +30,7 @@ pub mod cli;
 pub mod clicks;
 pub mod code;
 pub mod config;
+pub mod conversions;
 pub mod der;
 pub mod dns;
 pub mod domains;

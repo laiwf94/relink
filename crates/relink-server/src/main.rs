@@ -7,7 +7,8 @@
 //!                             create an API key for OWNER; prints it once.
 //!                             Without --workspace, in OWNER's personal
 //!                             workspace; LIST is a comma-separated subset of
-//!                             links:read, links:write, stats:read (default:
+//!                             links:read, links:write, stats:read,
+//!                             conversions:write (default:
 //!                             all) and must be granted by OWNER's role there;
 //!                             DURATION is like 90d, 12h, 30m or 45s
 //! relink rotate-key ID [--overlap DURATION]

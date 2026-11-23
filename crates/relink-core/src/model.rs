@@ -156,6 +156,11 @@ pub struct Link {
         serde(deserialize_with = "Protection::present")
     )]
     pub protection: Protection,
+    /// Days after a click that a conversion is attributed to it, when the
+    /// link tracks conversions ([`crate::conversion`]): every redirect
+    /// then carries a click id. Omitted when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion_window_days: Option<u16>,
 }
 
 /// Reads an optional RFC 3339 time, as chrono writes it, with chrono's

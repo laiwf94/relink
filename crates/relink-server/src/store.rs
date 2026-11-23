@@ -37,7 +37,7 @@ macro_rules! columns {
         "id, code, owner, workspace_id, domain_id, destinations, destinations_version, redirect_status, \
          expires_at, max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
          health_failures, health_checked_at, created_at, updated_at, rules, app, version, \
-         password_hash, password_attempts, consent"
+         password_hash, password_attempts, consent, conversion_window_days"
     };
 }
 pub(crate) use columns;
@@ -230,6 +230,8 @@ pub struct NewLink {
     pub app: Option<AppLink>,
     /// A password (already hashed) and consent page, validated by the API.
     pub protection: Protection,
+    /// Conversion tracking's attribution window in days, `None` for off.
+    pub conversion_window_days: Option<u16>,
     /// The verified custom domain (hostname) to create the link on, or
     /// `None` for the default domain.
     pub domain: Option<String>,
@@ -253,6 +255,8 @@ pub struct LinkPatch {
     pub app: Option<Option<AppLink>>,
     /// Changes to the password and consent page.
     pub protection: Option<ProtectionPatch>,
+    /// A new attribution window, or `Some(None)` to stop tracking.
+    pub conversion_window_days: Option<Option<u16>>,
 }
 
 /// A change to a link's [`Protection`]; each field as in [`LinkPatch`].
@@ -1108,6 +1112,9 @@ impl Db {
             rules,
             app: app.as_ref().map(AppLink::compile).unwrap_or_default(),
             protection,
+            conversion_window_days: row
+                .try_get::<Option<i16>, _>("conversion_window_days")?
+                .and_then(|d| u16::try_from(d).ok()),
         };
         Ok(StoredLink {
             link,

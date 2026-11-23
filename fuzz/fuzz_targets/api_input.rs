@@ -1,5 +1,5 @@
-//! API inputs: request bodies, edge click batches, KV link records, cursors
-//! and change notifications.
+//! API inputs: request bodies, edge click batches, KV link records, cursors,
+//! change notifications and posted click ids.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -27,8 +27,17 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(c) = relink_core::gate::check_consent(s) {
             assert_eq!(relink_core::gate::check_consent(&c).as_deref(), Ok(&*c));
         }
+        // A posted click id: only the signer's own ids pass, and they
+        // encode back to exactly what was posted.
+        if let Some(id) = relink_core::conversion::ClickId::decode(&signer, s) {
+            assert_eq!(id.encode(&signer), s);
+        }
+        // A click id added to any location is the one read back from it.
+        let tagged = relink_core::conversion::tag(s, "ID");
+        assert_eq!(relink_core::conversion::find(&tagged), Some("ID"));
     }
     let _ = serde_json::from_slice::<CreateLink>(data);
+    let _ = serde_json::from_slice::<relink_server::conversions::PostConversion>(data);
     let _ = serde_json::from_slice::<PatchLink>(data);
     // KV records as the edge reads them.
     if let Ok(link) = serde_json::from_slice::<relink_core::model::Link>(data) {

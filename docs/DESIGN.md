@@ -163,11 +163,15 @@ behind API transactions, and the reverse.
 ### Roles and API key scopes
 
 A member's role in a workspace is `viewer`, `editor`, `admin` or `owner`. A
-key carries scopes, a non-empty subset of `links:read`, `links:write` and
-`stats:read` (migration 0005; keys made before it keep all three). What a
+key carries scopes, a non-empty subset of `links:read`, `links:write`,
+`stats:read` and `conversions:write` (migration 0005, and 0023 for the last;
+keys made before 0005 keep the first three, and keys keep the scopes they
+were made with). What a
 request may do is the intersection of the two: the key must carry the scope
 and its owner's role must grant it. Viewers are granted `links:read` and
-`stats:read`; editors, admins and owners all three. Admins and owners differ
+`stats:read`; editors, admins and owners all four. `conversions:write`
+posts conversions and nothing else, so the key a destination's server
+holds cannot read or change links. Admins and owners differ
 in whom they manage (admins manage editors and viewers, owners everyone),
 which the member and key administration built on this uses.
 
@@ -1998,6 +2002,81 @@ the same list, redirects are not followed, no proxy is used, and only the
 start of an answer is read. `RELINK_WEBHOOKS_ENABLED=false` keeps an
 instance from sending; events are still queued for the others.
 
+## Conversions
+
+A link with `conversion_window_days` (1 to 365) tracks conversions: every
+redirect appends `rl_cid=<click id>` to the URL it sends the visitor to,
+replacing any `rl_cid` already there and keeping the fragment last. The
+destination keeps the id (in its session or with the sign-up), and its
+server posts it back with what happened. `relink-core/src/conversion.rs`
+mints and reads ids, `src/conversions.rs` takes the postbacks, migration
+0023 the table.
+
+**Nothing is written per click.** The id is 36 bytes, 48 characters of
+base64url, and carries what attribution needs, signed:
+
+| Bytes | Field |
+|---|---|
+| 0 | format version, 1 |
+| 1..9 | link id |
+| 9..13 | click time, Unix seconds |
+| 13..15 | what chose the URL (destination, rule, app target or fallback) and its index |
+| 15..19 | `SHA-256("relink-cid-url\0" \| url)[0..4]` |
+| 19..26 | nonce |
+| 26..36 | `HMAC-SHA256(key, "relink-cid\0" \| bytes 0..26)[0..10]` |
+
+The key is `RELINK_COOKIE_KEY`, under its own label so a tag never passes
+as an A/B cookie or a grant, and the Worker holds the same key, so the edge
+mints ids with the same code and its clicks convert like the origin's. A
+redirect with a click id is never cacheable (each click needs its own),
+which is the one cost tracking adds to the redirect besides one SHA-256
+and one HMAC. On the development machine minting and appending an id takes
+0.32 µs and checking one 0.22 µs, and a cached redirect with an id 1.59 µs
+against 1.03 µs without (`cargo bench --bench hot_path -- click_id`). The id is signed, not encrypted: it shows its
+holder the link id, the time and the variant, nothing about the visitor,
+and unlike the visitor hashes it is not stored per click anywhere. Changing
+`RELINK_COOKIE_KEY` invalidates ids already handed out, as it does A/B
+assignments. 80 bits of tag make a forgery a guess the API refuses.
+
+**Postbacks.** `POST /v1/conversions` takes `click_id`, `event` (1 to 64 of
+`[A-Za-z0-9_.:-]`), an optional `value` in minor units with an optional
+ISO 4217 `currency`, an optional `external_id` and an optional `occurred_at`
+(default now, at most 5 minutes ahead). It needs `conversions:write`. The
+server checks the tag (400 otherwise), finds the link in the caller's
+workspace under row-level security (404 for another workspace's link, or a
+deleted one), and requires that the link still tracks conversions and that
+`occurred_at` is from 5 minutes before the click to `conversion_window_days`
+after it, using the link's window at the time of the post (409 otherwise).
+Turning tracking off stops both the ids and the postbacks.
+
+**Attribution.** The id names the target kind and index, so a conversion is
+attributed to the destination index (the A/B variant), the targeting rule,
+the app target or the fallback. The URL is named by comparing the id's hash
+with what the link has at that index now and, if the destinations changed
+since the click, with its kept versions (newest first). A conversion whose
+URL has left all of them keeps its kind and index with `destination` null.
+
+**Counted once.** Each conversion is one row, unique per workspace and
+event on `dedup`: `x:` and `external_id` when one is given, otherwise `c:`
+and the click id. So a signup counts once per click however often it is
+posted, and an order counts once even if two clicks claim it. A repeated
+post answers 200 with the stored row and `duplicate: true` (201 for a new
+one); `ON CONFLICT DO NOTHING` makes two concurrent posts of the same
+conversion store one. Rows are deleted with their link.
+
+**Stats.** `GET /v1/links/{code}/conversions` (`stats:read`) adds up the
+conversions that happened in a range of UTC days, optionally of one event,
+in total and per (target, index, URL): count, distinct converted clicks,
+counts per event and value totals per currency (null for plain numbers),
+read in one repeatable-read snapshot from the `(link_id, occurred_at)`
+index. The link's current destinations come first, in order and with zeros,
+so every variant shows; then URLs it no longer has and other targets, most
+conversions first. There are no conversion rates yet: the click rollups are
+not kept per destination.
+
+`relink_conversions_total`, `relink_conversions_duplicate_total` and
+`relink_conversions_rejected_total` count posts by outcome.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -2104,6 +2183,7 @@ and counts the clicks it could not write.
 | Targeting rules | 32 rules and 64 leaf conditions per link, nested 8 deep, 300 values per leaf; queries read up to 64 parameters within 2,048 bytes |
 | App targets | deep link 1,024 printable ASCII characters; package name 255; stored object 8 KiB |
 | Version history | the newest 100 versions per link |
+| Conversions | attribution window 1 to 365 days; event 64 characters; `external_id` 128; value 0 to 10¹⁵ minor units; 5 minutes of clock skew either way |
 | Schedules | 20 pending per link; `run_at` within 10 years; due schedules looked for every second (`RELINK_SCHEDULE_POLL_MS`), 100 per query |
 | Domain apps | 8 iOS and 8 Android apps per domain, 8 fingerprints per Android app; bundle ID 155 characters |
 | Alias | 3 to 64 of `[A-Za-z0-9_-]`, alphanumeric at both ends |

@@ -153,6 +153,7 @@ async fn reconciliation_repairs_drift() {
                 rules: Default::default(),
                 app: Default::default(),
                 protection: Default::default(),
+                conversion_window_days: None,
                 domain: None,
             },
             7,

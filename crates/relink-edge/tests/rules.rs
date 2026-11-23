@@ -178,6 +178,7 @@ fn with_app(id: i64, rules: Vec<Rule>, limited: bool, app: Option<&str>) -> Link
             .map(|a| serde_json::from_str::<AppLink>(a).unwrap().compile())
             .unwrap_or_default(),
         protection: Default::default(),
+        conversion_window_days: None,
     }
 }
 

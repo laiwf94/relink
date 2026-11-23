@@ -17,6 +17,7 @@
 //! the origin instead.
 
 use crate::abtest::{Signer, choose, cookie_name, find_cookie};
+use crate::conversion::Target;
 use crate::model::Link;
 use crate::rules_v2::Request;
 
@@ -95,6 +96,9 @@ pub struct Redirect<'a> {
     pub rule: Option<usize>,
     /// `location` is the link's app target for the visitor's phone.
     pub app: bool,
+    /// What chose `location`, as a click id records it
+    /// ([`crate::conversion`]).
+    pub target: Target,
 }
 
 pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) -> Decision<'a> {
@@ -130,6 +134,7 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
             needs_admission: link.max_clicks.is_some(),
             rule: Some(i),
             app: false,
+            target: Target::Rule(index(i)),
         });
     }
     if let Some(location) = link.app.target(visit.user_agent) {
@@ -142,6 +147,7 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
             needs_admission: link.max_clicks.is_some(),
             rule: None,
             app: true,
+            target: Target::App,
         });
     }
 
@@ -150,9 +156,11 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
     // beats an error page.
     let usable = |i: usize| !any_healthy || link.is_healthy(i);
     let mut set_cookie = None;
-    let (location, fallback) = match (&link.fallback_url, any_healthy) {
-        (Some(url), false) => (url.as_str(), true),
-        _ if link.destinations.len() == 1 => (link.destinations[0].url.as_str(), false),
+    let (location, target) = match (&link.fallback_url, any_healthy) {
+        (Some(url), false) => (url.as_str(), Target::Fallback),
+        _ if link.destinations.len() == 1 => {
+            (link.destinations[0].url.as_str(), Target::Destination(0))
+        }
         _ => {
             let name = cookie_name(&link.code);
             let sticky = find_cookie(visit.cookies.iter().copied(), &name)
@@ -175,7 +183,10 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
                     i
                 }
             };
-            (link.destinations[chosen].url.as_str(), false)
+            (
+                link.destinations[chosen].url.as_str(),
+                Target::Destination(index(chosen)),
+            )
         }
     };
 
@@ -186,17 +197,27 @@ pub fn evaluate<'a>(link: &'a Link, visit: &Visit<'_>, settings: &Settings<'_>) 
         && link.destinations.len() == 1
         && link.max_clicks.is_none()
         && link.expires_at.is_none()
-        && !link.health_check;
+        && !link.health_check
+        // Every click gets its own id.
+        && link.conversion_window_days.is_none();
     Decision::Redirect(Redirect {
         status,
         location,
         set_cookie,
         cacheable,
-        fallback,
+        fallback: target == Target::Fallback,
         needs_admission: link.max_clicks.is_some(),
         rule: None,
         app: false,
+        target,
     })
+}
+
+/// A destination or rule index as a click id holds it. Both lists are
+/// bounded far below 256 (10 destinations, [`crate::rules_v2::MAX_RULES`]
+/// rules); past that the id would name the last index it can hold.
+fn index(i: usize) -> u8 {
+    u8::try_from(i).unwrap_or(u8::MAX)
 }
 
 fn assignment_cookie(link: &Link, name: &str, variant: usize, settings: &Settings<'_>) -> String {
@@ -244,6 +265,7 @@ mod tests {
             rules: RuleSet::default(),
             app: Default::default(),
             protection: Default::default(),
+            conversion_window_days: None,
         }
     }
 
@@ -340,6 +362,59 @@ mod tests {
         let r = redirect(evaluate(&l, &visit(&[]), &SETTINGS));
         assert_eq!(r.location, "https://fallback.example.com/");
         assert!(r.fallback && r.set_cookie.is_none());
+    }
+
+    #[test]
+    fn redirects_say_what_chose_the_url() {
+        let mut l = link(&["https://a.example.com/", "https://b.example.com/"]);
+        let pick = |l: &Link, v: &Visit<'_>| redirect(evaluate(l, v, &SETTINGS)).target;
+        let low = Visit {
+            random: 0,
+            ..visit(&[])
+        };
+        let high = Visit {
+            random: u64::MAX,
+            ..visit(&[])
+        };
+        assert_eq!(pick(&l, &low), Target::Destination(0));
+        assert_eq!(pick(&l, &high), Target::Destination(1));
+        l.health_check = true;
+        l.unhealthy = vec![true, true];
+        l.fallback_url = Some("https://fallback.example.com/".into());
+        assert_eq!(pick(&l, &low), Target::Fallback);
+        let l = with_rules(
+            link(&["https://a.example.com/"]),
+            r#"[{"if": {"country": ["FR"]}, "url": "https://fr.example.com/"},
+                {"if": {"country": ["DE"]}, "url": "https://de.example.com/"}]"#,
+        );
+        let de = Visit {
+            country: Some(*b"DE"),
+            ..visit(&[])
+        };
+        assert_eq!(pick(&l, &de), Target::Rule(1));
+        assert_eq!(pick(&l, &visit(&[])), Target::Destination(0));
+        assert_eq!(index(300), u8::MAX);
+    }
+
+    #[test]
+    fn tracked_links_are_never_cacheable() {
+        let mut l = link(&["https://a.example.com/"]);
+        assert!(redirect(evaluate(&l, &visit(&[]), &SETTINGS)).cacheable);
+        l.conversion_window_days = Some(30);
+        let r = redirect(evaluate(&l, &visit(&[]), &SETTINGS));
+        assert!(!r.cacheable);
+        // The location itself stays plain; the caller adds the click id.
+        assert_eq!(r.location, "https://a.example.com/");
+        let to = crate::conversion::location(&l, &r, &SIGNER, 1_000_000, 5);
+        let id = crate::conversion::find(&to).unwrap();
+        let click = crate::conversion::ClickId::decode(&SIGNER, id).unwrap();
+        assert_eq!((click.link_id, click.at_secs), (9, 1_000));
+        l.conversion_window_days = None;
+        let r = redirect(evaluate(&l, &visit(&[]), &SETTINGS));
+        assert_eq!(
+            crate::conversion::location(&l, &r, &SIGNER, 1, 5),
+            "https://a.example.com/"
+        );
     }
 
     #[test]

@@ -104,6 +104,8 @@ pub struct LinkSpec {
     pub rules: RuleSet,
     #[serde(default)]
     pub app: Option<AppLink>,
+    #[serde(default)]
+    pub conversion_window_days: Option<u16>,
 }
 
 impl LinkSpec {
@@ -124,6 +126,7 @@ impl LinkSpec {
             rules: Some(self.rules),
             app: Some(self.app),
             protection: None,
+            conversion_window_days: Some(self.conversion_window_days),
         }
     }
 }

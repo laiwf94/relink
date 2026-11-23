@@ -45,6 +45,23 @@ with HMAC-SHA256 under the endpoint's secret, retried with exponential
 backoff, and kept with every try in a delivery log the API reads
 (`/v1/webhooks`).
 
+A link with `conversion_window_days` set sends every click on with a signed
+click id, `rl_cid`, minted alike at the origin and the edge with nothing
+written per click. The destination's server posts it back with the event to
+`POST /v1/conversions`, using a key that holds only `conversions:write`; the
+conversion is attributed to the click, the URL it went to and its A/B
+variant, counted once per event, and `GET /v1/links/{code}/conversions`
+adds them up per destination with value totals per currency.
+
+```console
+$ curl -si localhost:8080/pricing | grep -i '^location'
+location: https://example.com/a?rl_cid=AQAAAAAAAAAHaUQx...
+$ curl -s localhost:8080/v1/conversions -H "Authorization: Bearer $POSTBACK_KEY" \
+    -H 'Content-Type: application/json' \
+    -d '{"click_id":"AQAAAAAAAAAHaUQx...","event":"purchase","value":4999,"currency":"EUR","external_id":"order-1"}'
+{"event":"purchase","link":"pricing","target":"destination","variant":0,"destination":"https://example.com/a",...,"duplicate":false}
+```
+
 ```console
 $ curl -s localhost:8080/v1/links -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
     -d '{"alias":"pricing","destinations":[{"url":"https://example.com/a","weight":3},
@@ -132,9 +149,9 @@ error codes and request IDs. `/v1/links` endpoints take
 `Authorization: Bearer <key>` and JSON bodies; the full schema is at
 `/openapi.json`, an OpenAPI 3.1 document that a test checks against the router.
 
-Keys carry scopes (`links:read`, `links:write`, `stats:read`) and act within
-their owner's role in the workspace: viewers read links and statistics,
-editors, admins and owners also write. Keys can expire, and rotation keeps the
+Keys carry scopes (`links:read`, `links:write`, `stats:read`,
+`conversions:write`) and act within their owner's role in the workspace:
+viewers read links and statistics, editors, admins and owners also write. Keys can expire, and rotation keeps the
 old key working for an overlap window so deployments switch without downtime:
 
 People sign in with any OpenID Connect provider instead of holding keys:

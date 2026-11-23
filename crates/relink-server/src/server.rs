@@ -24,6 +24,7 @@ use crate::auth::{Authenticator, Credential, LookupLimits};
 use crate::cache::Cache;
 use crate::clicks::{ClickEvent, ClickQueue, ClickSink, Flusher};
 use crate::config::Config;
+use crate::conversions;
 use crate::dns::{DnsClient, parse_resolv_conf};
 use crate::domains::{self, DomainMap};
 use crate::health::HealthWorker;
@@ -200,6 +201,11 @@ pub fn public_router(app: Arc<App>) -> Router {
         )
         .route("/v1/links/{code}/stats", get(api::link_stats))
         .route("/v1/links/{code}/live", get(api::link_live))
+        .route(
+            "/v1/links/{code}/conversions",
+            get(conversions::link_conversions),
+        )
+        .route("/v1/conversions", post(conversions::post_conversion))
         .route("/v1/analytics", get(api::analytics))
         .route("/v1/links/{code}/versions", get(schedule::list_versions))
         .route("/v1/links/{code}/rollback", post(schedule::rollback))

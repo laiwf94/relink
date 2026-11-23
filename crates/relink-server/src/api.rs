@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::Instrument;
 
+use relink_core::conversion;
 use relink_core::deeplink::{self, AppLink};
 use relink_core::gate::{self, Protection};
 use relink_core::rules_v2::{self, Rule, RuleSet};
@@ -494,6 +495,9 @@ pub struct CreateLink {
     pub app: Option<AppInput>,
     /// A password or consent page in front of the redirect ([`gate`]).
     pub protection: Option<ProtectionInput>,
+    /// Tracks conversions: every click carries a click id, and conversions
+    /// are attributed to it for this many days ([`conversion`]).
+    pub conversion_window_days: Option<u16>,
     /// A verified custom domain of the workspace to create the link on;
     /// absent or null for the default domain.
     pub domain: Option<String>,
@@ -532,6 +536,9 @@ pub struct PatchLink {
     /// removes both.
     #[serde(default, deserialize_with = "nullable")]
     pub protection: Option<Option<ProtectionInput>>,
+    /// A new attribution window; `null` stops tracking conversions.
+    #[serde(default, deserialize_with = "nullable")]
+    pub conversion_window_days: Option<Option<u16>>,
 }
 
 /// A link's password and consent page as the API takes them. On a `PATCH`
@@ -605,6 +612,9 @@ pub struct LinkView {
     /// The password (never shown, only whether there is one) and consent
     /// page; `null` for none.
     pub protection: Option<Protection>,
+    /// Days a conversion is attributed to a click; `null` when the link
+    /// does not track conversions.
+    pub conversion_window_days: Option<u16>,
     /// The link's current version (`GET /v1/links/{code}/versions`).
     pub version: i32,
     pub created_at: DateTime<Utc>,
@@ -650,6 +660,7 @@ impl LinkView {
             rules: link.rules.rules().to_vec(),
             app: link.app.clone(),
             protection: link.is_protected().then(|| link.protection.clone()),
+            conversion_window_days: link.conversion_window_days,
             version: link.version,
             created_at: link.created_at,
             updated_at: link.updated_at,
@@ -894,6 +905,18 @@ fn validate_fallback(app: &App, url: String) -> Result<String, ApiError> {
         .map_err(|e| ApiError::invalid(format!("fallback_url: {e}")))
 }
 
+/// An attribution window: 1 to [`conversion::MAX_WINDOW_DAYS`] days.
+fn validate_window(days: u16) -> Result<u16, ApiError> {
+    if (1..=conversion::MAX_WINDOW_DAYS).contains(&days) {
+        Ok(days)
+    } else {
+        Err(ApiError::invalid(format!(
+            "conversion_window_days must be 1 to {}",
+            conversion::MAX_WINDOW_DAYS
+        )))
+    }
+}
+
 pub async fn create_link(
     State(app): State<Arc<App>>,
     ws: Allowed<LinksWrite>,
@@ -923,6 +946,10 @@ pub async fn create_link(
         .fallback_url
         .map(|u| validate_fallback(&app, u))
         .transpose()?;
+    let conversion_window_days = req
+        .conversion_window_days
+        .map(validate_window)
+        .transpose()?;
     let protection = match req.protection {
         Some(p) => validate_protection(&app, p, true)
             .await?
@@ -943,6 +970,7 @@ pub async fn create_link(
         rules,
         app: app_link,
         protection,
+        conversion_window_days,
         domain: domain_param(req.domain),
     };
     let link = ws
@@ -1063,6 +1091,10 @@ pub async fn update_link(
             })
             .transpose()?,
         protection: None,
+        conversion_window_days: req
+            .conversion_window_days
+            .map(|w| w.map(validate_window).transpose())
+            .transpose()?,
     };
     // Last, so a bad request costs no hash.
     patch.protection = match req.protection {
@@ -1080,6 +1112,7 @@ pub async fn update_link(
         && patch.health_check.is_none()
         && patch.rules.is_none()
         && patch.app.is_none()
+        && patch.conversion_window_days.is_none()
         && patch
             .protection
             .as_ref()
@@ -1438,6 +1471,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("delete", "/v1/links/{code}"),
     ("get", "/v1/links/{code}/stats"),
     ("get", "/v1/links/{code}/live"),
+    ("get", "/v1/links/{code}/conversions"),
+    ("post", "/v1/conversions"),
     ("get", "/v1/links/{code}/versions"),
     ("post", "/v1/links/{code}/rollback"),
     ("get", "/v1/links/{code}/schedules"),

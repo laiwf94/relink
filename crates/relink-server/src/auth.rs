@@ -41,16 +41,25 @@ pub enum Scope {
     LinksWrite,
     /// Read link statistics.
     StatsRead,
+    /// Post conversions (`POST /v1/conversions`), and nothing else: the
+    /// scope for a key kept on a destination's server.
+    ConversionsWrite,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 3] = [Scope::LinksRead, Scope::LinksWrite, Scope::StatsRead];
+    pub const ALL: [Scope; 4] = [
+        Scope::LinksRead,
+        Scope::LinksWrite,
+        Scope::StatsRead,
+        Scope::ConversionsWrite,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Scope::LinksRead => "links:read",
             Scope::LinksWrite => "links:write",
             Scope::StatsRead => "stats:read",
+            Scope::ConversionsWrite => "conversions:write",
         }
     }
 
@@ -75,8 +84,12 @@ pub struct Scopes(u8);
 
 impl Scopes {
     pub const NONE: Scopes = Scopes(0);
-    pub const ALL: Scopes =
-        Scopes(Scope::LinksRead.bit() | Scope::LinksWrite.bit() | Scope::StatsRead.bit());
+    pub const ALL: Scopes = Scopes(
+        Scope::LinksRead.bit()
+            | Scope::LinksWrite.bit()
+            | Scope::StatsRead.bit()
+            | Scope::ConversionsWrite.bit(),
+    );
 
     pub fn contains(self, s: Scope) -> bool {
         self.0 & s.bit() != 0
@@ -656,13 +669,16 @@ mod tests {
             Ok(Scopes::from(Scope::LinksRead) | Scope::StatsRead)
         );
         assert_eq!(
-            Scopes::parse_list("links:read,links:write,stats:read"),
+            Scopes::parse_list("links:read,links:write,stats:read,conversions:write"),
             Ok(Scopes::ALL)
         );
         for bad in ["", ",", "links:read,", "links:*", "LINKS:READ", "admin"] {
             assert!(Scopes::parse_list(bad).is_err(), "{bad:?}");
         }
-        assert_eq!(Scopes::ALL.to_string(), "links:read,links:write,stats:read");
+        assert_eq!(
+            Scopes::ALL.to_string(),
+            "links:read,links:write,stats:read,conversions:write"
+        );
         assert_eq!(Scopes::NONE.to_string(), "");
         assert_eq!(
             format!("{:?}", Scopes::from(Scope::StatsRead)),
@@ -693,6 +709,7 @@ mod tests {
         assert!(!Role::Viewer.grants().contains(Scope::LinksWrite));
         assert!(Role::Viewer.grants().contains(Scope::LinksRead));
         assert!(Role::Viewer.grants().contains(Scope::StatsRead));
+        assert!(!Role::Viewer.grants().contains(Scope::ConversionsWrite));
         for r in [Role::Editor, Role::Admin, Role::Owner] {
             assert_eq!(r.grants(), Scopes::ALL);
         }

@@ -651,8 +651,17 @@ async fn openapi_matches_the_router_and_responses() {
 
     // Every documented route is served (wrong methods would be 405, unknown
     // paths 404 with a JSON body).
-    let link = h.create(json!({"url": "https://example.com/"})).await;
+    let link = h
+        .create(json!({"url": "https://example.com/", "conversion_window_days": 30}))
+        .await;
     let code = link["code"].as_str().unwrap();
+    // A click id for the conversion route, from a click on the link.
+    let to = h.visit(code, &[]).await.headers()["location"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let click_id = relink_core::conversion::find(&to).unwrap().to_owned();
+    let conversion_body = format!(r#"{{"click_id":"{click_id}","event":"docs"}}"#);
     let (status, domain) = h
         .api(
             Method::POST,
@@ -732,6 +741,8 @@ async fn openapi_matches_the_router_and_responses() {
                 r#"{"version":1}"#
             } else if path.ends_with("/schedules") {
                 schedule_body.as_str()
+            } else if path == "/v1/conversions" {
+                conversion_body.as_str()
             } else {
                 r#"{"enabled":true,"url":"https://example.com/"}"#
             };
@@ -824,6 +835,46 @@ async fn openapi_matches_the_router_and_responses() {
         .await;
     let keys: BTreeSet<String> = log.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("DeliveryList"));
+    // The link the routes used is deleted by now: another one.
+    let tracked = h
+        .create(json!({"url": "https://example.com/", "conversion_window_days": 1}))
+        .await;
+    let code = tracked["code"].as_str().unwrap();
+    let to = h.visit(code, &[]).await.headers()["location"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let click_id = relink_core::conversion::find(&to).unwrap();
+    let (_, conversion) = h
+        .api(
+            Method::POST,
+            "/v1/conversions",
+            &h.alice,
+            Some(json!({"click_id": click_id, "event": "docs"})),
+        )
+        .await;
+    let keys: BTreeSet<String> = conversion.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("Conversion"));
+    let (_, stats) = h
+        .api(
+            Method::GET,
+            &format!("/v1/links/{code}/conversions"),
+            &h.alice,
+            None,
+        )
+        .await;
+    let keys: BTreeSet<String> = stats.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("ConversionStats"));
+    let destination = &stats["destinations"][0];
+    let keys: BTreeSet<String> = destination.as_object().unwrap().keys().cloned().collect();
+    let item: BTreeSet<String> = doc["components"]["schemas"]["ConversionStats"]["properties"]
+        ["destinations"]["items"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(keys, item);
     let (_, usage) = h.api(Method::GET, "/v1/usage", &h.alice, None).await;
     let keys: BTreeSet<String> = usage.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("Usage"));

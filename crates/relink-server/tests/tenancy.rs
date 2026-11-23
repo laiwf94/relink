@@ -45,6 +45,7 @@ fn new_link(owner: &str, alias: &str) -> NewLink {
         rules: Default::default(),
         app: Default::default(),
         protection: Default::default(),
+        conversion_window_days: None,
         domain: None,
     }
 }
