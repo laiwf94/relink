@@ -147,7 +147,7 @@ fn host_kind() -> impl Strategy<Value = HostKind> {
             .prop_map(|(l, t)| HostKind::Domain(l, t)),
         1 => "[a-z]{1,12}".prop_map(HostKind::SingleLabel),
         1 => (label(), prop::sample::select(vec![
-                "localhost", "local", "internal", "home.arpa", "test", "invalid", "example", "onion"]))
+                "localhost", "local", "internal", "home.arpa", "test", "invalid", "example", "onion", "alt"]))
             .prop_map(|(l, s)| HostKind::Reserved(l, s)),
         2 => prop_oneof![
                 any::<[u8; 4]>(),

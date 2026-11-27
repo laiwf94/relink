@@ -2096,7 +2096,7 @@ A health check is a request from inside your network to a URL a stranger
 chose, so it gets three layers. At creation, destinations must be http(s)
 without credentials, and hosts that cannot be public are refused: IP literals
 unless allowed, single-label names, `localhost`, `.local`, `.internal`,
-`.home.arpa`, `.test`, `.invalid`, `.example`, `.onion`. At probe time the
+`.home.arpa`, `.test`, `.invalid`, `.example`, `.onion`, `.alt`. At probe time the
 client's DNS resolver drops every address that is not globally routable (the
 IANA special-purpose registries, RFC 6890; for IPv6 only `2000::/3` minus
 documentation and protocol ranges, with mapped, NAT64 and 6to4 forms judged by

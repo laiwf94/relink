@@ -58,7 +58,7 @@ impl fmt::Display for UrlError {
 impl std::error::Error for UrlError {}
 
 /// Domain suffixes that never resolve on the public internet (RFC 6761,
-/// RFC 6762, RFC 8375) plus the `internal` name reserved for private use.
+/// RFC 6762, RFC 8375, RFC 9476) plus the `internal` name reserved for private use.
 const NON_PUBLIC_SUFFIXES: &[&str] = &[
     "localhost",
     "local",
@@ -68,6 +68,7 @@ const NON_PUBLIC_SUFFIXES: &[&str] = &[
     "invalid",
     "example",
     "onion",
+    "alt",
 ];
 
 /// Validates `raw` and returns its normalised form (WHATWG serialisation:
@@ -121,7 +122,9 @@ fn check_domain(domain: &str, policy: Policy) -> Result<(), UrlError> {
     if policy.allow_private {
         return Ok(());
     }
-    let name = domain.strip_suffix('.').unwrap_or(domain);
+    // The parser keeps every final dot, so strip them all: `intranet..` is
+    // still a single label and `x.localhost..` still ends in `.localhost`.
+    let name = domain.trim_end_matches('.');
     // Single-label names ("intranet", "db") resolve through search domains
     // to internal hosts.
     if !name.contains('.') {
@@ -188,6 +191,11 @@ mod tests {
             ("https://db.internal./", UrlError::NonPublicHost),
             ("https://router.home.arpa/", UrlError::NonPublicHost),
             ("https://intranet/", UrlError::NonPublicHost),
+            ("https://x.localhost../", UrlError::NonPublicHost),
+            ("https://intranet../", UrlError::NonPublicHost),
+            ("https://printer.local.../", UrlError::NonPublicHost),
+            ("https://a.alt/", UrlError::NonPublicHost),
+            ("https://a.b.ALT./", UrlError::NonPublicHost),
             ("http://127.0.0.1/", UrlError::IpLiteral),
             ("http://2130706433/", UrlError::IpLiteral),
             ("http://[::1]/", UrlError::IpLiteral),
@@ -209,6 +217,8 @@ mod tests {
         assert!(normalize("https://mylocal.com/", STRICT).is_ok());
         assert!(normalize("https://gettest.io/", STRICT).is_ok());
         assert!(normalize("https://example.com.local/", STRICT).is_err());
+        assert!(normalize("https://example.com./", STRICT).is_ok());
+        assert!(normalize("https://salt.com/", STRICT).is_ok());
     }
 
     #[test]
