@@ -17,7 +17,7 @@ Out of scope for now: a web console, and storage other than Postgres.
 URL validation, expiry, the geo rule, health-aware destination choice, A/B
 assignment and the cookie that makes it sticky, and the JSON shape of a link.
 It also holds the HyperLogLog++ sketches for unique counts, so the origin
-and the edge build the same bytes.
+and the edge build the same bytes, and the QR encoder.
 It does no I/O, owns no clock and no random source (callers pass both in), and
 depends only on `url`, `chrono` without its clock, `serde`, `sha2` and `hmac`.
 That is what lets it build for `wasm32-unknown-unknown`, and CI checks that
@@ -2165,6 +2165,59 @@ throughout. Exporting the million as CSV takes 8 s and downloading the
 connection; set-based inserts of a step's links would be the next step
 if it needs to be faster.
 
+## QR codes
+
+`relink-core/src/qr.rs` encodes QR codes (ISO/IEC 18004:2015) and writes
+them as SVG or PNG. It is in the core so the origin and the Worker can draw
+the same symbol from the same bytes, and like the rest of the core it does
+no I/O and builds for wasm32.
+
+**What it encodes.** One segment in byte mode, versions 1 to 40, at any of
+the four error-correction levels: L (about 7% of codewords recoverable), M
+(15%), Q (25%) and H (30%). A link is a URL, and byte mode reads the same in
+every scanner, so there are no numeric, alphanumeric or kanji segments, no
+ECI and no structured append. The smallest version that holds the data at
+the asked level is used, and the level is never raised to fill spare room,
+so the same input always gives the same symbol. The data, a terminator, and
+the pad bytes `EC 11` fill the version's data codewords, which are split into
+its blocks, each given its Reed-Solomon codewords over GF(256) (polynomial
+`0x11D`), and interleaved. Codewords are placed in two-module columns from
+the bottom right, around the finder, timing and alignment patterns and the
+version information (version 7 and up). Each of the eight data masks is
+applied in turn with its format information (BCH(15,5)), scored by the
+standard's four penalty rules (runs of five or more, 2×2 blocks, 1:1:3:1:1
+finder-like patterns with four light modules on a side, the quiet zone
+counting as light, and the dark share's distance from half), and the lowest
+score wins, ties going to the lower mask.
+
+**Writers.** Both draw a quiet zone, four modules unless asked for 0 to 16,
+in the light colour; colours are `#rgb` or `#rrggbb`. The SVG has a
+background `<rect>` and one `<path>` with a rectangle per horizontal run of
+dark modules, and `shape-rendering="crispEdges"`; its width and height are
+the scale (1 to 32 pixels per module, 8 by default) times the modules.
+The PNG is a 1-bit palette image, light at index 0 and dark at index 1,
+with filter type 0 on every row. Its pixels go into deflate's stored
+(uncompressed) blocks of up to 65,535 bytes, in a zlib stream with its
+Adler-32: no deflate implementation and no dependency, and every decoder
+reads stored blocks. At one bit per pixel a short link's code at the
+defaults is 9 KB; the largest image (version 40, border 16, scale 32) is
+6,688 pixels a side and 5.6 MB, which is why the scale stops at 32.
+
+**Tests.** `crates/relink-core/tests/qr.rs` compares every symbol, module
+for module and with the same chosen mask, against Nayuki's `qrcodegen`, an
+independent encoder used only as a dev-dependency: both ends of every
+version at every level, every mask forced at seven versions, and 200 random
+inputs. Unit tests check the capacities and codeword counts against the
+standard's tables, the format and version codes against its annexes, and
+the Reed-Solomon codewords against its worked example in annex I. The PNG
+is read back by a separate reader (its own bit-by-bit CRC-32 and Adler-32)
+and the SVG's path is parsed back into modules, both compared pixel for
+pixel with the symbol.
+
+**Speed.** A short link (version 2-M) encodes in about 50 µs, almost all of
+it scoring the eight masks; its SVG takes about 15 µs and its PNG about
+30 µs. A version 40 symbol takes about 3 ms (`cargo bench --bench hot_path -- qr_`).
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -2274,6 +2327,7 @@ and counts the clicks it could not write.
 | Conversions | attribution window 1 to 365 days; event 64 characters; `external_id` 128; value 0 to 10¹⁵ minor units; 5 minutes of clock skew either way |
 | Jobs | 10 queued or running per workspace; uploads up to 256 MiB (`RELINK_JOB_MAX_UPLOAD_MB`, 1 to 4,096), records up to 64 KiB, chunks of 500 records or 1 MiB; 100 failed rows kept per job; patches of 1 to 1,000 codes or every link; 5 failed steps in a row fail a job; kept 7 days after they finish (`RELINK_JOB_RETENTION_DAYS`) |
 | Schedules | 20 pending per link; `run_at` within 10 years; due schedules looked for every second (`RELINK_SCHEDULE_POLL_MS`), 100 per query |
+| QR codes | byte mode, versions 1 to 40: 2,953 bytes at L, 2,331 at M, 1,663 at Q, 1,273 at H; quiet zone 0 to 16 modules (4 by default); 1 to 32 pixels per module (8 by default) |
 | Domain apps | 8 iOS and 8 Android apps per domain, 8 fingerprints per Android app; bundle ID 155 characters |
 | Alias | 3 to 64 of `[A-Za-z0-9_-]`, alphanumeric at both ends |
 | Generated code | 7 base62 characters by default (4 to 32); collisions retried 5 times |
@@ -2347,10 +2401,14 @@ audit` known advisories.
 | `tracing`, `tracing-subscriber` | Structured JSON logs with request-scoped spans. |
 | `worker` | The workers-rs binding to the Cloudflare Workers runtime; wasm32 only. |
 | `proptest`, `criterion`, `tower` (dev) | Property tests, benchmarks, and driving the router in-process in benchmarks. |
+| `qrcodegen` (dev) | A second, independent QR encoder that every symbol is compared with in `relink-core`'s tests. It has no dependencies and is not in any build. |
 
 Metrics, the cache, single flight, token buckets, CIDR parsing, hex,
 base64 and base64url are each a few dozen lines and written here instead of
-pulled in. So is the DER the ACME client needs (`src/der.rs`, under 500
+pulled in. So are the QR encoder and its PNG writer (`relink-core/src/qr.rs`,
+about 1,050 lines with comments, before its tests), which need Reed-Solomon
+over GF(256), CRC-32, Adler-32 and stored deflate blocks, and no image or
+compression crate. So is the DER the ACME client needs (`src/der.rs`, under 500
 lines with comments): writing one fixed shape of certificate request and reading the
 validity, names and key of a certificate. A general ASN.1 crate would be
 larger than that.

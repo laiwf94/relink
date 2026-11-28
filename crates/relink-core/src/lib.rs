@@ -14,6 +14,7 @@ pub mod hll;
 pub mod host;
 pub mod model;
 pub mod netguard;
+pub mod qr;
 pub mod rules;
 pub mod rules_v2;
 pub mod site;

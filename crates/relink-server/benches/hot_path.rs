@@ -14,6 +14,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Request};
 use criterion::{Criterion, criterion_group, criterion_main};
 use relink_core::conversion::{self, ClickId, Target};
+use relink_core::qr::{EcLevel, QrCode, Render};
 use relink_server::abtest::{Signer, choose};
 use relink_server::cache::{Cache, Config as CacheConfig};
 use relink_server::classify::{device_class, referrer_host};
@@ -427,5 +428,22 @@ fn eight_by_eight(leaves: [&str; 7]) -> String {
     format!("[{}]", list.join(","))
 }
 
-criterion_group!(benches, redirect_path, components);
+/// A short link's QR code: encoding (version 2-M, all eight masks scored)
+/// and both writers at their defaults; and the largest symbol.
+fn qr_codes(c: &mut Criterion) {
+    let url = b"https://rl.example/Xy7_q-2";
+    c.bench_function("qr_encode_short_link", |b| {
+        b.iter(|| QrCode::encode(std::hint::black_box(url), EcLevel::Medium))
+    });
+    let q = QrCode::encode(url, EcLevel::Medium).unwrap();
+    let render = Render::default();
+    c.bench_function("qr_svg_short_link", |b| b.iter(|| q.to_svg(&render)));
+    c.bench_function("qr_png_short_link", |b| b.iter(|| q.to_png(&render)));
+    let data = vec![b'x'; 2953];
+    c.bench_function("qr_encode_version_40", |b| {
+        b.iter(|| QrCode::encode(std::hint::black_box(&data), EcLevel::Low))
+    });
+}
+
+criterion_group!(benches, redirect_path, components, qr_codes);
 criterion_main!(benches);
