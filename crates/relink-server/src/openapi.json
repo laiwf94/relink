@@ -491,6 +491,159 @@
         }
       }
     },
+    "/v1/jobs": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "List the workspace's jobs, newest first",
+        "operationId": "listJobs",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "next_cursor from the previous page." }
+        ],
+        "responses": {
+          "200": { "description": "A page of jobs.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobList" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/jobs/import": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Import links from a CSV or NDJSON file",
+        "operationId": "createImport",
+        "description": "The body is the file, up to RELINK_JOB_MAX_UPLOAD_MB (256 MB by default; payload_too_large, 413), read as it arrives. A CSV file starts with a header naming its columns: url, and any of code, domain, redirect_type, expires_at (RFC 3339), max_clicks, enabled, health_check (true or false), fallback_url and conversion_window_days; short_url, version, created_at and updated_at, which an export writes, are skipped. Fields may be quoted (RFC 4180); an empty field is left out. Each NDJSON line is a CreateLink body. Blank lines are skipped and no record may be longer than 64 KiB. A malformed header, a record too long or an open quote refuses the whole upload (400) and stores nothing. Each record is then checked when the job reaches it, by the rules of POST /v1/links; one that fails is listed in the job's errors by number (1 is the first record after the header) and the rest still go in. A workspace has at most 10 jobs queued or running (failed_precondition, 409).",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "text/csv": { "schema": { "type": "string" } },
+            "application/x-ndjson": { "schema": { "type": "string" } }
+          }
+        },
+        "responses": {
+          "202": { "description": "Queued.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/jobs/export": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Export the workspace's links as CSV or NDJSON",
+        "operationId": "createExport",
+        "description": "Every link of the workspace that exists when the job is made, or every one on domain, oldest first. CSV has the columns code, domain, short_url, url, redirect_type, expires_at, max_clicks, enabled, health_check, fallback_url, conversion_window_days, version, created_at and updated_at, with a link's first destination as url, and imports again as it is; each NDJSON line is the link as GET /v1/links/{code} shows it. GET /v1/jobs/{id}/output has the file once the job has succeeded, for RELINK_JOB_RETENTION_DAYS.",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateExport" } } } },
+        "responses": {
+          "202": { "description": "Queued.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/jobs/patch": {
+      "parameters": [{ "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Change many links at once",
+        "operationId": "createPatch",
+        "description": "Applies patch, a PATCH /v1/links/{code} body, to every link the filter picks, each with its own version, audit entry and link.updated event. The patch is checked when the job is made (400) and again at each step, so a time that has passed since fails the job. Codes the workspace does not have are listed in the job's errors at once, numbered by their place in filter.codes. Links created after the job are not changed.",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreatePatch" } } } },
+        "responses": {
+          "202": { "description": "Queued.", "headers": { "Location": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/jobs/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/JobId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "A job's progress",
+        "operationId": "getJob",
+        "description": "Its state, rows done out of the total, and the first 100 rows that failed with the reason each would have got from the API.",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": { "description": "The job.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/jobs/{id}/cancel": {
+      "parameters": [{ "$ref": "#/components/parameters/JobId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "post": {
+        "summary": "Cancel a job",
+        "operationId": "cancelJob",
+        "description": "Stops a queued or running job before its next step; what it has done stays done. A finished job is failed_precondition (409). No body.",
+        "security": [{ "apiKey": ["links:write"] }, { "session": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/Csrf" }],
+        "responses": {
+          "200": { "description": "Cancelled.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/jobs/{id}/output": {
+      "parameters": [{ "$ref": "#/components/parameters/JobId" }, { "$ref": "#/components/parameters/Workspace" }],
+      "get": {
+        "summary": "Download an export",
+        "operationId": "getJobOutput",
+        "description": "The file of an export that has succeeded, streamed. Any other job is failed_precondition (409).",
+        "security": [{ "apiKey": ["links:read"] }, { "session": [] }],
+        "responses": {
+          "200": {
+            "description": "The file.",
+            "headers": { "Content-Disposition": { "schema": { "type": "string" } } },
+            "content": { "text/csv": { "schema": { "type": "string" } }, "application/x-ndjson": { "schema": { "type": "string" } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/auth/login": {
       "get": {
         "summary": "Start signing in with the OpenID Connect provider",
@@ -873,6 +1026,7 @@
       "Domain": { "name": "domain", "in": "query", "required": false, "schema": { "type": "string", "maxLength": 253 }, "description": "The custom domain the code is on; absent for the default domain. A hostname the workspace does not have finds no link." },
       "Hostname": { "name": "hostname", "in": "path", "required": true, "schema": { "type": "string", "maxLength": 253 }, "description": "The domain's hostname, case-insensitive." },
       "WebhookId": { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "description": "The webhook endpoint's ID." },
+      "JobId": { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "description": "The job's ID." },
       "DeliveryId": { "name": "delivery", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "description": "The delivery's ID, as the delivery log and the Relink-Delivery header show it." },
       "Workspace": { "name": "Relink-Workspace", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9]{1,19}$" }, "description": "The workspace the request is meant for. An API key acts only in its own workspace, which is the default; naming another is refused with permission_denied. A session acts in the named workspace if the person is a member, else in their personal workspace." },
       "InviteToken": { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^rli_[0-9a-f]{64}$" }, "description": "The token from the invitation link. It is a credential: relink never logs it." },
@@ -1677,6 +1831,72 @@
         "required": ["schedules", "next_cursor"],
         "properties": {
           "schedules": { "type": "array", "items": { "$ref": "#/components/schemas/Schedule" } },
+          "next_cursor": { "type": ["string", "null"] }
+        }
+      },
+      "CreateExport": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["format"],
+        "properties": {
+          "format": { "enum": ["csv", "ndjson"] },
+          "domain": { "type": ["string", "null"], "description": "Only the links on this custom domain of the workspace." }
+        }
+      },
+      "CreatePatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["filter", "patch"],
+        "properties": {
+          "filter": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "codes (1 to 1000), on domain or else the default domain; or all: true, every link, or every link on domain.",
+            "properties": {
+              "codes": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 1000 },
+              "all": { "type": "boolean" },
+              "domain": { "type": ["string", "null"] }
+            }
+          },
+          "patch": { "$ref": "#/components/schemas/PatchLink" }
+        }
+      },
+      "JobError": {
+        "type": "object",
+        "required": ["row", "code", "message"],
+        "properties": {
+          "row": { "type": "integer", "minimum": 1, "description": "The record's number: 1 is the first after a CSV header; for a patch, the code's place in filter.codes." },
+          "code": { "type": "string", "description": "The error code the same API request would get." },
+          "message": { "type": "string" }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "required": ["id", "kind", "format", "state", "total", "processed", "succeeded", "failed", "progress", "error", "created_by", "created_at", "started_at", "finished_at", "output_url"],
+        "properties": {
+          "id": { "type": "integer" },
+          "kind": { "enum": ["import", "export", "patch"] },
+          "format": { "enum": ["csv", "ndjson", null] },
+          "state": { "enum": ["queued", "running", "succeeded", "failed", "cancelled"] },
+          "total": { "type": "integer", "description": "Rows (links) the job covers." },
+          "processed": { "type": "integer", "description": "Rows done: succeeded plus failed." },
+          "succeeded": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+          "error": { "type": ["string", "null"], "description": "Why a failed job failed." },
+          "created_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "started_at": { "type": ["string", "null"], "format": "date-time" },
+          "finished_at": { "type": ["string", "null"], "format": "date-time" },
+          "output_url": { "type": ["string", "null"], "description": "Where a succeeded export's file is." },
+          "errors": { "type": "array", "items": { "$ref": "#/components/schemas/JobError" }, "description": "On GET /v1/jobs/{id} only: the first 100 rows that failed." }
+        }
+      },
+      "JobList": {
+        "type": "object",
+        "required": ["jobs", "next_cursor"],
+        "properties": {
+          "jobs": { "type": "array", "items": { "$ref": "#/components/schemas/Job" } },
           "next_cursor": { "type": ["string", "null"] }
         }
       }

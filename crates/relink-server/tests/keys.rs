@@ -77,6 +77,9 @@ struct Targets<'a> {
     schedule: i64,
     webhook: i64,
     delivery: i64,
+    /// A finished export, and a queued job no worker takes, to cancel.
+    job: i64,
+    queued_job: i64,
 }
 
 /// Sends one request for a documented route with a body that would succeed.
@@ -102,6 +105,11 @@ async fn call(h: &Harness, method: &str, path: &str, t: &Targets<'_>, key: &str)
             "run_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
             "enabled": false,
         })),
+        ("post", "/v1/jobs/export") => Some(json!({"format": "csv"})),
+        ("post", "/v1/jobs/patch") => Some(json!({
+            "filter": {"all": true}, "patch": {"enabled": true}
+        })),
+        (_, "/v1/jobs/{id}/cancel") => None,
         ("post" | "patch", _) => Some(json!({"enabled": true, "url": "https://example.com/"})),
         _ => None,
     };
@@ -111,7 +119,29 @@ async fn call(h: &Harness, method: &str, path: &str, t: &Targets<'_>, key: &str)
         .replace("{hostname}", HOST)
         .replace("/webhooks/{id}", &format!("/webhooks/{}", t.webhook))
         .replace("{delivery}", &t.delivery.to_string())
+        .replace(
+            "/jobs/{id}/cancel",
+            &format!("/jobs/{}/cancel", t.queued_job),
+        )
+        .replace("/jobs/{id}", &format!("/jobs/{}", t.job))
         .replace("{id}", &t.schedule.to_string());
+    if path == "/v1/jobs/import" {
+        // The file is the body.
+        let resp = h
+            .http
+            .post(format!("{}{path}", h.base))
+            .bearer_auth(key)
+            .header("content-type", "text/csv")
+            .body("url\nhttps://example.com/imported\n")
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        return (
+            status,
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap(),
+        );
+    }
     if live {
         // A live stream never ends by itself: take the status, and read
         // the body only when it is an error.
@@ -171,7 +201,7 @@ async fn every_route_requires_its_documented_scope() {
     }
     let documented: BTreeSet<Scope> = routes.iter().map(|r| r.2).collect();
     assert_eq!(documented.len(), 4, "every scope guards some route");
-    assert_eq!(routes.len(), 30);
+    assert_eq!(routes.len(), 37);
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
     routes.sort_by_key(|(m, p, _)| (*m == "delete", p == "/v1/links/{code}"));
@@ -229,12 +259,43 @@ async fn every_route_requires_its_documented_scope() {
     .fetch_one(h.store.pool())
     .await
     .unwrap();
+    let (status, export) = h
+        .api(
+            Method::POST,
+            "/v1/jobs/export",
+            &h.alice,
+            Some(json!({"format": "csv"})),
+        )
+        .await;
+    assert_eq!(status, 202, "{export}");
+    let job = export["id"].as_i64().unwrap();
+    assert!(
+        common::eventually(std::time::Duration::from_secs(20), || async {
+            let (_, j) = h
+                .api(Method::GET, &format!("/v1/jobs/{job}"), &h.alice, None)
+                .await;
+            j["state"] == "succeeded"
+        })
+        .await,
+        "the export did not finish"
+    );
+    let queued_job: i64 = sqlx::query_scalar(
+        "INSERT INTO jobs (workspace_id, kind, format, created_by, via, lease_until) \
+         SELECT workspace_id, 'export', 'csv', 'alice', 'cli', now() + interval '1 day' \
+           FROM jobs WHERE id = $1 RETURNING id",
+    )
+    .bind(job)
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
     let targets = Targets {
         code,
         click_id,
         schedule,
         webhook,
         delivery,
+        job,
+        queued_job,
     };
     for (method, path, scope) in &routes {
         let (without, _) = make_key(&h, "alice", None, all_but(*scope), None)

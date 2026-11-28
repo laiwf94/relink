@@ -193,10 +193,11 @@ pub enum DbOp {
     Kv,
     Schedule,
     Webhook,
+    Job,
 }
 
 impl DbOp {
-    const ALL: [DbOp; 10] = [
+    const ALL: [DbOp; 11] = [
         DbOp::Lookup,
         DbOp::Lease,
         DbOp::Flush,
@@ -207,6 +208,7 @@ impl DbOp {
         DbOp::Kv,
         DbOp::Schedule,
         DbOp::Webhook,
+        DbOp::Job,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -220,6 +222,7 @@ impl DbOp {
             DbOp::Kv => "kv",
             DbOp::Schedule => "schedule",
             DbOp::Webhook => "webhook",
+            DbOp::Job => "job",
         }
     }
 }
@@ -387,6 +390,11 @@ pub struct Metrics {
     pub conversions_recorded: Counter,
     pub conversions_duplicate: Counter,
     pub conversions_rejected: Counter,
+    /// Background jobs (src/jobs.rs): jobs that succeeded and failed, and
+    /// rows (links) they processed.
+    pub jobs_succeeded: Counter,
+    pub jobs_failed: Counter,
+    pub job_rows: Counter,
     /// Gauge: aggregated click rows held by the flusher.
     pub backlog: AtomicU64,
 }
@@ -450,6 +458,9 @@ impl Default for Metrics {
             conversions_recorded: Counter::default(),
             conversions_duplicate: Counter::default(),
             conversions_rejected: Counter::default(),
+            jobs_succeeded: Counter::default(),
+            jobs_failed: Counter::default(),
+            job_rows: Counter::default(),
             live_relay_dropped: Counter::default(),
             live_refused: Counter::default(),
             backlog: AtomicU64::new(0),
@@ -568,7 +579,7 @@ impl Metrics {
             .iter()
             .map(|k| (k.as_str(), self.quota_exceeded_count(*k))),
         );
-        let counters: [(&str, &str, u64); 51] = [
+        let counters: [(&str, &str, u64); 54] = [
             (
                 "relink_kv_writes_total",
                 "Link and domain records written to Workers KV.",
@@ -668,6 +679,21 @@ impl Metrics {
                 "relink_webhook_expiries_total",
                 "Link expiries announced as link.expired events.",
                 self.webhook_expiries.get(),
+            ),
+            (
+                "relink_jobs_succeeded_total",
+                "Imports, exports and bulk patches that finished.",
+                self.jobs_succeeded.get(),
+            ),
+            (
+                "relink_jobs_failed_total",
+                "Imports, exports and bulk patches that failed.",
+                self.jobs_failed.get(),
+            ),
+            (
+                "relink_job_rows_total",
+                "Rows (links) background jobs processed, successfully or not.",
+                self.job_rows.get(),
             ),
             (
                 "relink_conversions_total",

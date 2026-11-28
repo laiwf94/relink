@@ -87,6 +87,12 @@
 //! | `RELINK_WEBHOOK_MAX_ATTEMPTS` | `12` | Tries before a delivery is failed (1 to 50); it can still be retried through the API |
 //! | `RELINK_WEBHOOK_RETRY_BASE_MS` / `RELINK_WEBHOOK_RETRY_MAX_MS` | `30000` / `21600000` | Wait after the first failed try, doubled after each further one up to the maximum, then jittered down by up to half |
 //! | `RELINK_WEBHOOK_RETENTION_DAYS` | `30` | Days delivered and failed deliveries stay in the delivery log (1 to 3660) |
+//! | `RELINK_JOBS_ENABLED` | `true` | Run the job worker (imports, exports, bulk patches) on this instance (jobs are queued either way) |
+//! | `RELINK_JOB_POLL_MS` | `1000` | How often runnable jobs are looked for when there were none (10 to 60000) |
+//! | `RELINK_JOB_LEASE_MS` | `60000` | How long a worker holds a job between two steps before another may take it over (100 to 3600000); a step may take half of it |
+//! | `RELINK_JOB_SLICE_MS` | `2000` | How long a worker stays on one job before letting the next run (10 to 60000) |
+//! | `RELINK_JOB_MAX_UPLOAD_MB` | `256` | Largest import upload (1 to 4096) |
+//! | `RELINK_JOB_RETENTION_DAYS` | `7` | Days finished jobs, and an export's file, are kept (1 to 3660) |
 //! | `RELINK_API_RATE` / `RELINK_API_BURST` | `10` / `20` | Per-key token bucket for the API |
 //! | `RELINK_AUTH_LOOKUP_RATE` | `200` | Database lookups per second for API keys not in the auth cache; excess callers get 429 |
 //! | `RELINK_AUTH_LOOKUP_RATE_PER_IP` | `5` | The same per client address (burst twice that) |

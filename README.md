@@ -53,6 +53,25 @@ conversion is attributed to the click, the URL it went to and its A/B
 variant, counted once per event, and `GET /v1/links/{code}/conversions`
 adds them up per destination with value totals per currency.
 
+Links come in and go out in bulk as background jobs. `POST /v1/jobs/import`
+takes a CSV or NDJSON file of up to 256 MB, stored in chunks as it arrives;
+each row is checked and created like a `POST /v1/links`, and rows that fail
+are listed by number with the reason while the rest go in. Exports write
+every link as CSV or NDJSON for download, and one change can be applied to
+a list of codes or to every link. `GET /v1/jobs/{id}` shows the progress.
+Workers share the jobs through Postgres with `SKIP LOCKED` and leases, take
+turns between jobs, and commit each step with its progress, so a crashed
+worker's job carries on elsewhere with every row done exactly once.
+
+```console
+$ curl -s localhost:8080/v1/jobs/import -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: text/csv' --data-binary @links.csv
+{"id":7,"kind":"import","format":"csv","state":"queued","total":1000000,"processed":0,...}
+$ curl -s localhost:8080/v1/jobs/7 -H "Authorization: Bearer $KEY"
+{"id":7,"state":"running","total":1000000,"processed":412500,"succeeded":412497,"failed":3,"progress":0.4125,
+ "errors":[{"row":1873,"code":"already_exists","message":"this alias is already taken"},...],...}
+```
+
 ```console
 $ curl -si localhost:8080/pricing | grep -i '^location'
 location: https://example.com/a?rl_cid=AQAAAAAAAAAHaUQx...

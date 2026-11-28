@@ -315,108 +315,131 @@ impl<'a> Tenant<'a> {
                 .alias
                 .clone()
                 .unwrap_or_else(|| crate::code::random_code(code_len));
-            let (geo_mode, geo_countries) = geo_columns(new.geo.as_ref());
-            let (hash, attempts, consent) = protection_columns(&new.protection);
             let res = self
                 .db
                 .timed(async {
                     let mut tx = self.begin().await?;
-                    if let Err(q) = quota::admit_new_link(&mut tx, Utc::now().date_naive()).await? {
-                        return Ok(Err(DbError::Quota(q)));
+                    let link = self.insert_in(&mut tx, new, &code).await?;
+                    if link.is_ok() {
+                        tx.commit().await?;
                     }
-                    let (domain_id, code): (Option<i64>, Cow<'_, str>) = match &new.domain {
-                        None => (None, Cow::Borrowed(&code)),
-                        Some(host) => {
-                            // FOR KEY SHARE: the domain cannot be deleted,
-                            // nor its case rule changed, before this link
-                            // commits.
-                            let row: Option<(i64, bool)> = sqlx::query_as(
-                                "SELECT id, COALESCE((settings->>'case_insensitive')::boolean, \
-                                 false) FROM domains WHERE hostname = $1 \
-                                 AND verified_at IS NOT NULL FOR KEY SHARE",
-                            )
-                            .bind(host)
-                            .fetch_optional(&mut *tx)
-                            .await?;
-                            match row {
-                                // A case-insensitive domain stores its
-                                // codes in lowercase, the form visitors'
-                                // paths are folded to.
-                                Some((id, true)) => {
-                                    (Some(id), Cow::Owned(code.to_ascii_lowercase()))
-                                }
-                                Some((id, false)) => (Some(id), Cow::Borrowed(&code)),
-                                None => {
-                                    return Ok(Err(DbError::Invalid(format!(
-                                        "domain: {host} is not a verified domain of this workspace"
-                                    ))));
-                                }
-                            }
-                        }
-                    };
-                    // workspace_id defaults to the transaction's workspace.
-                    let row = sqlx::query(concat!(
-                        "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
-                         max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
-                         domain_id, rules, app, password_hash, password_attempts, consent, \
-                         conversion_window_days) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                         $15, $16, $17, $18) \
-                         RETURNING ",
-                        api_columns!()
-                    ))
-                    .bind(&*code)
-                    .bind(&new.owner)
-                    .bind(Json(&new.destinations))
-                    .bind(new.redirect_status as i16)
-                    .bind(new.expires_at)
-                    .bind(new.max_clicks)
-                    .bind(geo_mode)
-                    .bind(geo_countries)
-                    .bind(&new.fallback_url)
-                    .bind(new.enabled)
-                    .bind(new.health_check)
-                    .bind(domain_id)
-                    .bind(Json(&new.rules))
-                    .bind(new.app.as_ref().map(Json))
-                    .bind(hash)
-                    .bind(attempts)
-                    .bind(consent)
-                    .bind(new.conversion_window_days.map(|d| d as i16))
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    let mut link = self.db.row_to_link(&row)?;
-                    link.version =
-                        schedule::record_version(&mut tx, link.id, &self.actor, Source::Create)
-                            .await?;
-                    // Instances may hold a negative cache entry for this code.
-                    self.db.changed(&mut tx, link.id, domain_id, &code).await?;
-                    let change = Change {
-                        after: Some(audit::link_state(&link)),
-                        ..self.change(Action::LinkCreate, link.id)
-                    };
-                    audit::record(&mut tx, &self.actor, change).await?;
-                    webhooks::emit(
-                        &mut tx,
-                        self.workspace_id,
-                        Event::LinkCreated,
-                        webhooks::link_created(&link, self.db.base_url()),
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    Ok(Ok(link))
+                    Ok(link)
                 })
                 .await;
             match res {
                 Ok(Ok(link)) => return Ok(link),
+                Ok(Err(DbError::Conflict)) | Err(DbError::Conflict) if new.alias.is_none() => {
+                    continue;
+                }
                 Ok(Err(e)) => return Err(e),
-                Err(DbError::Conflict) if new.alias.is_none() => continue,
                 Err(e) => return Err(e),
             }
         }
         Err(DbError::Other(
             "could not allocate a unique code after 5 attempts".into(),
         ))
+    }
+
+    /// Inserts `new` with `code` inside `tx`, a transaction of this
+    /// workspace, with everything a create writes: the quota check, the
+    /// first version, the change notification, the audit entry and the
+    /// `link.created` event. A taken code, the plan's limit and an
+    /// unverified domain are `Ok(Err)`, found before anything is written,
+    /// so `tx` can go on to the next link. Shared by
+    /// [`Tenant::insert_link`] and bulk imports (src/jobs.rs).
+    pub(crate) async fn insert_in(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        new: &NewLink,
+        code: &str,
+    ) -> Result<Result<StoredLink, DbError>, sqlx::Error> {
+        let (geo_mode, geo_countries) = geo_columns(new.geo.as_ref());
+        let (hash, attempts, consent) = protection_columns(&new.protection);
+        if let Err(q) = quota::admit_new_link(&mut *tx, Utc::now().date_naive()).await? {
+            return Ok(Err(DbError::Quota(q)));
+        }
+        let (domain_id, code): (Option<i64>, Cow<'_, str>) = match &new.domain {
+            None => (None, Cow::Borrowed(code)),
+            Some(host) => {
+                // FOR KEY SHARE: the domain cannot be deleted,
+                // nor its case rule changed, before this link
+                // commits.
+                let row: Option<(i64, bool)> = sqlx::query_as(
+                    "SELECT id, COALESCE((settings->>'case_insensitive')::boolean, \
+                     false) FROM domains WHERE hostname = $1 \
+                     AND verified_at IS NOT NULL FOR KEY SHARE",
+                )
+                .bind(host)
+                .fetch_optional(&mut **tx)
+                .await?;
+                match row {
+                    // A case-insensitive domain stores its
+                    // codes in lowercase, the form visitors'
+                    // paths are folded to.
+                    Some((id, true)) => (Some(id), Cow::Owned(code.to_ascii_lowercase())),
+                    Some((id, false)) => (Some(id), Cow::Borrowed(code)),
+                    None => {
+                        return Ok(Err(DbError::Invalid(format!(
+                            "domain: {host} is not a verified domain of this workspace"
+                        ))));
+                    }
+                }
+            }
+        };
+        // workspace_id defaults to the transaction's workspace.
+        let row = sqlx::query(concat!(
+            "INSERT INTO links (code, owner, destinations, redirect_status, expires_at, \
+             max_clicks, geo_mode, geo_countries, fallback_url, enabled, health_check, \
+             domain_id, rules, app, password_hash, password_attempts, consent, \
+             conversion_window_days) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+             $15, $16, $17, $18) \
+             ON CONFLICT DO NOTHING RETURNING ",
+            api_columns!()
+        ))
+        .bind(&*code)
+        .bind(&new.owner)
+        .bind(Json(&new.destinations))
+        .bind(new.redirect_status as i16)
+        .bind(new.expires_at)
+        .bind(new.max_clicks)
+        .bind(geo_mode)
+        .bind(geo_countries)
+        .bind(&new.fallback_url)
+        .bind(new.enabled)
+        .bind(new.health_check)
+        .bind(domain_id)
+        .bind(Json(&new.rules))
+        .bind(new.app.as_ref().map(Json))
+        .bind(hash)
+        .bind(attempts)
+        .bind(consent)
+        .bind(new.conversion_window_days.map(|d| d as i16))
+        .fetch_optional(&mut **tx)
+        .await?;
+        // The code is taken on that domain. Nothing has been written yet,
+        // so the transaction can go on.
+        let Some(row) = row else {
+            return Ok(Err(DbError::Conflict));
+        };
+        let mut link = self.db.row_to_link(&row)?;
+        link.version =
+            schedule::record_version(&mut *tx, link.id, &self.actor, Source::Create).await?;
+        // Instances may hold a negative cache entry for this code.
+        self.db.changed(&mut *tx, link.id, domain_id, &code).await?;
+        let change = Change {
+            after: Some(audit::link_state(&link)),
+            ..self.change(Action::LinkCreate, link.id)
+        };
+        audit::record(&mut *tx, &self.actor, change).await?;
+        webhooks::emit(
+            tx,
+            self.workspace_id,
+            Event::LinkCreated,
+            webhooks::link_created(&link, self.db.base_url()),
+        )
+        .await?;
+        Ok(Ok(link))
     }
 
     /// This workspace's links, newest first, after the cursor (a link ID).

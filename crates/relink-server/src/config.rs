@@ -94,6 +94,24 @@ pub struct WebhookConfig {
     pub retention_days: u32,
 }
 
+/// Background job settings (`RELINK_JOB_*`, src/jobs.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobConfig {
+    /// Run the job worker on this instance.
+    pub enabled: bool,
+    /// How often runnable jobs are looked for when none was found.
+    pub poll: Duration,
+    /// How long a worker holds a job between two of its steps; another
+    /// worker takes the job over once it runs out.
+    pub lease: Duration,
+    /// How long a worker stays on one job before it lets the next one run.
+    pub slice: Duration,
+    /// Largest import upload, in bytes.
+    pub max_upload: u64,
+    /// Days finished jobs, and an export's file, are kept.
+    pub retention_days: u32,
+}
+
 /// Longest retention of hourly click rollups, in days (ten years).
 pub const MAX_HOURLY_RETENTION_DAYS: u32 = 3_660;
 
@@ -136,6 +154,8 @@ pub struct Config {
     pub live: LiveConfig,
     /// Webhook deliveries (src/webhooks.rs).
     pub webhooks: WebhookConfig,
+    /// Imports, exports and bulk patches (src/jobs.rs).
+    pub jobs: JobConfig,
     pub api_rate: Rate,
     /// Database lookups per second for API keys not in the auth cache.
     pub auth_lookup_rate: f64,
@@ -205,6 +225,7 @@ impl fmt::Debug for Config {
             .field("analytics_max_rows", &self.analytics_max_rows)
             .field("live", &self.live)
             .field("webhooks", &self.webhooks)
+            .field("jobs", &self.jobs)
             .field("api_rate", &self.api_rate)
             .field("auth_lookup_rate", &self.auth_lookup_rate)
             .field("auth_lookup_rate_per_ip", &self.auth_lookup_rate_per_ip)
@@ -625,6 +646,14 @@ impl Config {
                     7 * 86_400_000,
                 )?,
                 retention_days: v.parse("RELINK_WEBHOOK_RETENTION_DAYS", 30, 1, 3_660)?,
+            },
+            jobs: JobConfig {
+                enabled: v.bool("RELINK_JOBS_ENABLED", true)?,
+                poll: v.millis("RELINK_JOB_POLL_MS", 1_000, 10, 60_000)?,
+                lease: v.millis("RELINK_JOB_LEASE_MS", 60_000, 100, 3_600_000)?,
+                slice: v.millis("RELINK_JOB_SLICE_MS", 2_000, 10, 60_000)?,
+                max_upload: v.parse::<u64>("RELINK_JOB_MAX_UPLOAD_MB", 256, 1, 4_096)? << 20,
+                retention_days: v.parse("RELINK_JOB_RETENTION_DAYS", 7, 1, 3_660)?,
             },
             api_rate: Rate {
                 per_second: v.parse("RELINK_API_RATE", 10.0, 0.01, 100_000.0)?,
@@ -1079,6 +1108,50 @@ mod tests {
             ("RELINK_LIVE_ANNOUNCE_MS", "99"),
             ("RELINK_LIVE_KEEPALIVE_MS", "soon"),
             ("RELINK_LIVE_MAX_AGE_S", "86401"),
+        ] {
+            let e = from(&[base, (name, bad)]).unwrap_err();
+            assert!(e.starts_with(&format!("{name}:")), "{name}={bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn job_settings_are_bounded() {
+        let base = ("RELINK_DATABASE_URL", "postgres://x/y");
+        let c = from(&[base]).unwrap();
+        assert_eq!(
+            c.jobs,
+            JobConfig {
+                enabled: true,
+                poll: Duration::from_secs(1),
+                lease: Duration::from_secs(60),
+                slice: Duration::from_secs(2),
+                max_upload: 256 << 20,
+                retention_days: 7,
+            }
+        );
+        let c = from(&[
+            base,
+            ("RELINK_JOBS_ENABLED", "false"),
+            ("RELINK_JOB_POLL_MS", "20"),
+            ("RELINK_JOB_LEASE_MS", "500"),
+            ("RELINK_JOB_SLICE_MS", "50"),
+            ("RELINK_JOB_MAX_UPLOAD_MB", "1"),
+            ("RELINK_JOB_RETENTION_DAYS", "1"),
+        ])
+        .unwrap();
+        assert!(!c.jobs.enabled);
+        assert_eq!(c.jobs.poll, Duration::from_millis(20));
+        assert_eq!(c.jobs.lease, Duration::from_millis(500));
+        assert_eq!(c.jobs.slice, Duration::from_millis(50));
+        assert_eq!(c.jobs.max_upload, 1 << 20);
+        assert_eq!(c.jobs.retention_days, 1);
+        for (name, bad) in [
+            ("RELINK_JOB_POLL_MS", "9"),
+            ("RELINK_JOB_LEASE_MS", "99"),
+            ("RELINK_JOB_SLICE_MS", "60001"),
+            ("RELINK_JOB_MAX_UPLOAD_MB", "0"),
+            ("RELINK_JOB_MAX_UPLOAD_MB", "4097"),
+            ("RELINK_JOB_RETENTION_DAYS", "soon"),
         ] {
             let e = from(&[base, (name, bad)]).unwrap_err();
             assert!(e.starts_with(&format!("{name}:")), "{name}={bad:?}: {e}");

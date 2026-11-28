@@ -72,6 +72,28 @@ impl fmt::Display for Via {
     }
 }
 
+impl Via {
+    /// Reads the form [`Via`]'s `Display` writes, as the audit log and
+    /// background jobs store it.
+    pub fn parse(s: &str) -> Option<Via> {
+        let id = |n: &str| -> Option<i64> {
+            (!n.starts_with('0') && n.len() <= 19 && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse().ok())
+                .flatten()
+                .filter(|&n: &i64| n > 0)
+        };
+        match s {
+            "cli" => Some(Via::Cli),
+            "system" => Some(Via::System),
+            _ => match s.split_once(':')? {
+                ("key", n) => id(n).map(Via::Key),
+                ("session", n) => id(n).map(Via::Session),
+                _ => None,
+            },
+        }
+    }
+}
+
 impl Actor {
     /// An operator at the command line.
     pub fn cli() -> Actor {
@@ -138,6 +160,8 @@ pub enum Action {
     WebhookCreate,
     WebhookUpdate,
     WebhookDelete,
+    JobCreate,
+    JobCancel,
 }
 
 impl Action {
@@ -168,6 +192,8 @@ impl Action {
             Action::WebhookCreate => "webhook.create",
             Action::WebhookUpdate => "webhook.update",
             Action::WebhookDelete => "webhook.delete",
+            Action::JobCreate => "job.create",
+            Action::JobCancel => "job.cancel",
         }
     }
 }
@@ -626,6 +652,36 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn via_round_trips_through_its_text() {
+        for via in [
+            Via::Key(1),
+            Via::Key(i64::MAX),
+            Via::Session(42),
+            Via::Cli,
+            Via::System,
+        ] {
+            assert_eq!(Via::parse(&via.to_string()), Some(via));
+        }
+        for bad in [
+            "",
+            "key",
+            "key:",
+            "key:0",
+            "key:01",
+            "key:-1",
+            "key:+1",
+            "key:1x",
+            "session:9223372036854775808",
+            "keys:1",
+            "Cli",
+            "system ",
+            "user:1",
+        ] {
+            assert_eq!(Via::parse(bad), None, "{bad:?}");
+        }
+    }
 
     fn entry(seq: i64, prev: [u8; 32]) -> Entry {
         let mut e = Entry {

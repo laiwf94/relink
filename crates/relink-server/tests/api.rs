@@ -705,6 +705,42 @@ async fn openapi_matches_the_router_and_responses() {
     .await
     .unwrap();
     let schedule_body = format!(r#"{{"run_at":"{run_at}","url":"https://example.com/"}}"#);
+    // A finished export for the routes that name a job, and a queued job no
+    // worker takes (its lease is far off) to cancel.
+    let (status, export) = h
+        .api(
+            Method::POST,
+            "/v1/jobs/export",
+            &h.alice,
+            Some(json!({"format": "csv"})),
+        )
+        .await;
+    assert_eq!(status, 202, "{export}");
+    let export_id = export["id"].to_string();
+    assert!(
+        common::eventually(Duration::from_secs(20), || async {
+            let (_, job) = h
+                .api(
+                    Method::GET,
+                    &format!("/v1/jobs/{export_id}"),
+                    &h.alice,
+                    None,
+                )
+                .await;
+            job["state"] == "succeeded"
+        })
+        .await,
+        "the export did not finish"
+    );
+    let cancel_id: i64 = sqlx::query_scalar(
+        "INSERT INTO jobs (workspace_id, kind, format, created_by, via, lease_until) \
+         SELECT workspace_id, 'export', 'csv', 'alice', 'cli', now() + interval '1 day' \
+           FROM jobs WHERE id = $1 RETURNING id",
+    )
+    .bind(export["id"].as_i64().unwrap())
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
     // Deletion last, and the link's own last of all, so the other routes
     // still find the link.
     let mut ordered: Vec<&(String, String)> = routes.iter().collect();
@@ -718,6 +754,8 @@ async fn openapi_matches_the_router_and_responses() {
                 .replace("/schedules/{id}", &format!("/schedules/{schedule_id}"))
                 .replace("/webhooks/{id}", &format!("/webhooks/{webhook_id}"))
                 .replace("{delivery}", &delivery_id.to_string())
+                .replace("/jobs/{id}/cancel", &format!("/jobs/{cancel_id}/cancel"))
+                .replace("/jobs/{id}", &format!("/jobs/{export_id}"))
         );
         let m = Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
         let edge = path.starts_with("/v1/edge/");
@@ -726,6 +764,7 @@ async fn openapi_matches_the_router_and_responses() {
         if (method == "post" || method == "patch")
             && !path.ends_with("/verify")
             && !path.ends_with("/retry")
+            && !path.ends_with("/cancel")
         {
             let body = if edge {
                 r#"{"clicks":[]}"#
@@ -743,11 +782,22 @@ async fn openapi_matches_the_router_and_responses() {
                 schedule_body.as_str()
             } else if path == "/v1/conversions" {
                 conversion_body.as_str()
+            } else if path == "/v1/jobs/import" {
+                "url\nhttps://example.com/imported\n"
+            } else if path == "/v1/jobs/export" {
+                r#"{"format":"ndjson"}"#
+            } else if path == "/v1/jobs/patch" {
+                r#"{"filter":{"all":true},"patch":{"enabled":true}}"#
             } else {
                 r#"{"enabled":true,"url":"https://example.com/"}"#
             };
+            let content_type = if path == "/v1/jobs/import" {
+                "text/csv"
+            } else {
+                "application/json"
+            };
             req = req
-                .header("content-type", "application/json")
+                .header("content-type", content_type)
                 .body(body.to_owned());
         }
         let resp = req.send().await.unwrap();
@@ -819,6 +869,16 @@ async fn openapi_matches_the_router_and_responses() {
     let (_, list) = h.api(Method::GET, "/v1/links", &h.alice, None).await;
     let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("LinkList"));
+    let (_, list) = h.api(Method::GET, "/v1/jobs", &h.alice, None).await;
+    let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, schema_keys("JobList"));
+    let keys: BTreeSet<String> = list["jobs"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, schema_keys("Job"));
     let (_, list) = h.api(Method::GET, "/v1/webhooks", &h.alice, None).await;
     let keys: BTreeSet<String> = list.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, schema_keys("WebhookList"));

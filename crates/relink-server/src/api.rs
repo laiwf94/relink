@@ -71,7 +71,11 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
+    pub(crate) fn new(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> ApiError {
         ApiError {
             status,
             code,
@@ -476,7 +480,7 @@ pub struct GeoInput {
     pub countries: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateLink {
     pub url: Option<String>,
@@ -917,47 +921,45 @@ fn validate_window(days: u16) -> Result<u16, ApiError> {
     }
 }
 
-pub async fn create_link(
-    State(app): State<Arc<App>>,
-    ws: Allowed<LinksWrite>,
-    StrictJson(req): StrictJson<CreateLink>,
-) -> Result<Response, ApiError> {
+/// Validates a create request into the link it makes, created by `owner`.
+/// Shared by `POST /v1/links` and bulk imports (src/jobs.rs).
+pub(crate) async fn validate_create(
+    app: &App,
+    owner: String,
+    req: CreateLink,
+) -> Result<NewLink, ApiError> {
     if let Some(alias) = &req.alias {
         validate_alias(alias).map_err(|e| ApiError::invalid(format!("alias: {e}")))?;
     }
-    let destinations = validate_destinations(&app, req.url, req.destinations, true)?
+    let destinations = validate_destinations(app, req.url, req.destinations, true)?
         .expect("required destinations are present");
     // Checked before the password is hashed, so a bad request costs no hash.
     let rules = req
         .rules
-        .map(|r| validate_rules(&app, r))
+        .map(|r| validate_rules(app, r))
         .transpose()?
         .unwrap_or_default();
-    let app_link = req
-        .app
-        .map(|a| validate_app(&app, a))
-        .transpose()?
-        .flatten();
+    let app_link = req.app.map(|a| validate_app(app, a)).transpose()?.flatten();
     let redirect_status = validate_status(req.redirect_type.unwrap_or(302))?;
     let expires_at = req.expires_at.map(validate_expiry).transpose()?;
     let max_clicks = req.max_clicks.map(validate_max_clicks).transpose()?;
     let geo = req.geo.map(validate_geo).transpose()?;
     let fallback_url = req
         .fallback_url
-        .map(|u| validate_fallback(&app, u))
+        .map(|u| validate_fallback(app, u))
         .transpose()?;
     let conversion_window_days = req
         .conversion_window_days
         .map(validate_window)
         .transpose()?;
     let protection = match req.protection {
-        Some(p) => validate_protection(&app, p, true)
+        Some(p) => validate_protection(app, p, true)
             .await?
             .apply(&Protection::default()),
         None => Protection::default(),
     };
-    let new = NewLink {
-        owner: ws.principal.owner.clone(),
+    Ok(NewLink {
+        owner,
         alias: req.alias,
         destinations,
         redirect_status,
@@ -972,7 +974,15 @@ pub async fn create_link(
         protection,
         conversion_window_days,
         domain: domain_param(req.domain),
-    };
+    })
+}
+
+pub async fn create_link(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksWrite>,
+    StrictJson(req): StrictJson<CreateLink>,
+) -> Result<Response, ApiError> {
+    let new = validate_create(&app, ws.principal.owner.clone(), req).await?;
     let link = ws
         .tenant(&app.db)
         .insert_link(&new, app.cfg.code_length)
@@ -1050,15 +1060,12 @@ pub async fn get_link(
     ))
 }
 
-pub async fn update_link(
-    State(app): State<Arc<App>>,
-    ws: Allowed<LinksWrite>,
-    Path(code): Path<String>,
-    StrictQuery(q): StrictQuery<DomainQuery>,
-    StrictJson(req): StrictJson<PatchLink>,
-) -> Result<Response, ApiError> {
+/// Validates a change request into the patch it makes; a request that
+/// changes nothing is refused. Shared by `PATCH /v1/links/{code}` and bulk
+/// patches (src/jobs.rs).
+pub(crate) async fn validate_patch(app: &App, req: PatchLink) -> Result<LinkPatch, ApiError> {
     let mut patch = LinkPatch {
-        destinations: validate_destinations(&app, req.url, req.destinations, false)?,
+        destinations: validate_destinations(app, req.url, req.destinations, false)?,
         redirect_status: req.redirect_type.map(validate_status).transpose()?,
         expires_at: req
             .expires_at
@@ -1074,18 +1081,18 @@ pub async fn update_link(
             .transpose()?,
         fallback_url: req
             .fallback_url
-            .map(|f| f.map(|u| validate_fallback(&app, u)).transpose())
+            .map(|f| f.map(|u| validate_fallback(app, u)).transpose())
             .transpose()?,
         enabled: req.enabled,
         health_check: req.health_check,
         rules: req
             .rules
-            .map(|r| validate_rules(&app, r.unwrap_or_default()))
+            .map(|r| validate_rules(app, r.unwrap_or_default()))
             .transpose()?,
         app: req
             .app
             .map(|a| {
-                a.map(|a| validate_app(&app, a))
+                a.map(|a| validate_app(app, a))
                     .transpose()
                     .map(Option::flatten)
             })
@@ -1100,7 +1107,7 @@ pub async fn update_link(
     patch.protection = match req.protection {
         None => None,
         Some(None) => Some(ProtectionPatch::CLEAR),
-        Some(Some(p)) => Some(validate_protection(&app, p, false).await?),
+        Some(Some(p)) => Some(validate_protection(app, p, false).await?),
     };
     let empty = patch.destinations.is_none()
         && patch.redirect_status.is_none()
@@ -1120,6 +1127,17 @@ pub async fn update_link(
     if empty {
         return Err(ApiError::invalid("the request changes nothing"));
     }
+    Ok(patch)
+}
+
+pub async fn update_link(
+    State(app): State<Arc<App>>,
+    ws: Allowed<LinksWrite>,
+    Path(code): Path<String>,
+    StrictQuery(q): StrictQuery<DomainQuery>,
+    StrictJson(req): StrictJson<PatchLink>,
+) -> Result<Response, ApiError> {
+    let patch = validate_patch(&app, req).await?;
     let domain = domain_param(q.domain);
     let link = ws
         .tenant(&app.db)
@@ -1494,6 +1512,13 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/webhooks/{id}/deliveries"),
     ("get", "/v1/webhooks/{id}/deliveries/{delivery}"),
     ("post", "/v1/webhooks/{id}/deliveries/{delivery}/retry"),
+    ("post", "/v1/jobs/import"),
+    ("post", "/v1/jobs/export"),
+    ("post", "/v1/jobs/patch"),
+    ("get", "/v1/jobs"),
+    ("get", "/v1/jobs/{id}"),
+    ("post", "/v1/jobs/{id}/cancel"),
+    ("get", "/v1/jobs/{id}/output"),
     ("get", "/v1/auth/login"),
     ("get", "/v1/auth/callback"),
     ("get", "/v1/auth/session"),

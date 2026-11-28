@@ -29,6 +29,7 @@ use crate::dns::{DnsClient, parse_resolv_conf};
 use crate::domains::{self, DomainMap};
 use crate::health::HealthWorker;
 use crate::invite;
+use crate::jobs::{self, JobWorker};
 use crate::kvsync::{CloudflareHostnames, CloudflareKv, KvSync};
 use crate::limiter::{ClickLimiter, LeaseStore};
 use crate::live::{LIVE_CHANNEL, LiveHub, LiveSink};
@@ -254,6 +255,12 @@ pub fn public_router(app: Arc<App>) -> Router {
             "/v1/webhooks/{id}/deliveries/{delivery}/retry",
             post(webhooks::retry_delivery),
         )
+        .route("/v1/jobs", get(jobs::list_jobs))
+        .route("/v1/jobs/export", post(jobs::create_export))
+        .route("/v1/jobs/patch", post(jobs::create_patch))
+        .route("/v1/jobs/{id}", get(jobs::get_job))
+        .route("/v1/jobs/{id}/cancel", post(jobs::cancel_job))
+        .route("/v1/jobs/{id}/output", get(jobs::job_output))
         .route("/v1/auth/login", get(oidc::login))
         .route("/v1/auth/callback", get(oidc::callback))
         .route("/v1/auth/session", get(session::get_session))
@@ -272,9 +279,14 @@ pub fn public_router(app: Arc<App>) -> Router {
     let edge = Router::new()
         .route("/v1/edge/clicks", post(api::edge_clicks))
         .layer(DefaultBodyLimit::max(api::MAX_EDGE_BODY));
+    // The upload is streamed, and bounded, by the handler itself.
+    let import = Router::new()
+        .route("/v1/jobs/import", post(jobs::create_import))
+        .layer(DefaultBodyLimit::disable());
     Router::new()
         .merge(api)
         .merge(edge)
+        .merge(import)
         .route("/healthz", get(api::healthz))
         .route("/readyz", get(api::readyz))
         .route("/openapi.json", get(api::openapi))
@@ -482,6 +494,11 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         None
     };
 
+    let job_worker = cfg
+        .jobs
+        .enabled
+        .then(|| tokio::spawn(JobWorker::new(app.clone()).run(bg_rx.clone())));
+
     let kv = match &cfg.kv {
         Some(kv_cfg) => {
             let api = CloudflareKv::new(kv_cfg)
@@ -561,6 +578,7 @@ pub async fn start(cfg: Config, db: Db) -> Result<Running, String> {
         let mut tasks: Vec<JoinHandle<()>> = vec![flusher, listener, relay, maintenance, scheduler];
         tasks.extend(health);
         tasks.extend(deliveries);
+        tasks.extend(job_worker);
         tasks.extend(kv);
         tasks.extend(certificates);
         for mut task in tasks {

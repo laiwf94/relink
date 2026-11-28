@@ -15,7 +15,8 @@
 //! link's version history and applies scheduled changes; [`protect`] puts
 //! a password or consent page in front of a link; [`health`] probes
 //! destinations; [`webhooks`] tells a workspace's endpoints about link
-//! changes, expiries and health; [`kvsync`] publishes links for the edge; [`store`] is
+//! changes, expiries and health; [`jobs`] runs imports, exports and bulk
+//! patches in the background; [`kvsync`] publishes links for the edge; [`store`] is
 //! Postgres and [`server`] wires it together; [`cli`] parses the key
 //! commands. The rules shared with the edge come from `relink_core` and are
 //! re-exported below.
@@ -36,6 +37,7 @@ pub mod dns;
 pub mod domains;
 pub mod health;
 pub mod invite;
+pub mod jobs;
 pub mod kvsync;
 pub mod limiter;
 pub mod live;

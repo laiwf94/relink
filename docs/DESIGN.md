@@ -2077,6 +2077,94 @@ not kept per destination.
 `relink_conversions_total`, `relink_conversions_duplicate_total` and
 `relink_conversions_rejected_total` count posts by outcome.
 
+## Bulk jobs
+
+Imports, exports and changes to many links run as background jobs
+(`src/jobs.rs`, migration 0024). Each one is a row in `jobs`, under
+row-level security like links, with its kind, its parameters, a state
+(`queued`, `running`, `succeeded`, `failed`, `cancelled`), counters and a
+cursor saying where its next step starts.
+
+**Uploads.** `POST /v1/jobs/import` takes the file as the body, `text/csv`
+or `application/x-ndjson`, up to `RELINK_JOB_MAX_UPLOAD_MB` (256 MB). The
+handler reads it as it arrives and cuts it into chunks of whole records,
+at most 500 records or 1 MiB each, written to `job_chunks` in the same
+transaction as the job; an upload that fails half-way leaves nothing, and
+the server holds one chunk at a time. Record boundaries are found by a
+scan that tracks whether it is inside a quoted CSV field, so a quoted
+field may hold newlines and the cut falls in the same place however the
+body arrives (a property test cuts random files at random places). A
+byte order mark and blank lines are dropped. What refuses a whole upload
+is what can be told without looking at a record's meaning: an unknown or
+repeated CSV column, no `url` column, a record over 64 KiB, an open quote
+at the end, no rows. The limit on queued and running jobs (10 per
+workspace) is checked last, with the workspace row locked, just before the
+commit, so a slow upload does not hold the lock.
+
+**Rows.** A CSV record becomes the body `POST /v1/links` would take (the
+columns are `url` and any of `code`, `domain`, `redirect_type`,
+`expires_at`, `max_clicks`, `enabled`, `health_check`, `fallback_url`,
+`conversion_window_days`, with an export's other columns skipped); an
+NDJSON line is that body. Each is checked by the same function as the API
+(`api::validate_create`) and inserted by the same one
+(`Tenant::insert_in`), with its audit entry, first version, change
+notification and `link.created` event. A record that fails is counted and
+the first 100 are kept in `job_errors` with their number and the error
+code and message the API would have answered; the rest of the chunk still
+goes in. Every reason to refuse a row (the checks, a taken code, the
+plan's link limit, an unverified domain) is found before anything of the
+row is written, which is why the link insert is `ON CONFLICT DO NOTHING`:
+a step needs no savepoint per row, so it never opens hundreds of
+subtransactions, which past 64 would slow every snapshot on the server.
+
+**Steps, exactly once.** `JobWorker` claims the runnable job that ran
+least recently (`ORDER BY last_run_at NULLS FIRST`, `FOR UPDATE SKIP
+LOCKED`), setting a lease (`RELINK_JOB_LEASE_MS`, 60 s) and a random
+token. A step is one transaction in the job's workspace: lock the job row,
+check it is still running under this token, do one chunk of an import (or
+a page of an export or patch), move the cursor and counters on, extend the
+lease, commit. A worker that dies mid-step loses that step only; once its
+lease runs out another worker claims the job and does the step again from
+the stored cursor, and a worker that comes back after losing its lease
+finds a different token and stops before writing. So each record is done
+exactly once (`tests/jobs.rs` takes a job over mid-way and counts the
+links). A step may run for half the lease. After `RELINK_JOB_SLICE_MS`
+(2 s) the worker releases the job and claims again, so jobs take turns
+and one big import does not hold up another workspace's export. A step
+that fails is tried again after the poll interval; five in a row fail the
+job, as does a patch whose change no longer passes its checks (a time
+that has since passed).
+
+**Exports and patches.** An export reads its workspace's links in ID order
+up to the newest one when the job was made, 1,000 a step, and writes each
+step's lines as one output chunk (at most about 1 MiB); `GET
+/v1/jobs/{id}/output` streams the chunks back one at a time once it has
+succeeded. CSV holds a link's first destination and imports again as it
+is; NDJSON lines are the link as the API shows it. A patch applies one
+`PATCH /v1/links/{code}` body, checked when the job is made, to up to
+1,000 codes or to every link (on one domain), 200 links a step, each
+through `Tenant::apply_patch` with its version, audit entry and
+`link.updated` event. Codes the workspace does not have are listed as
+failed rows when the job is made.
+
+**Progress and retention.** `GET /v1/jobs/{id}` has the state, `total`,
+`processed` (succeeded plus failed), `progress` from 0 to 1, the first
+100 failed rows and, for a failed job, why. `POST .../cancel` stops a job
+before its next step; what it did stays. Making and cancelling a job are in
+the audit log (`job.create`, `job.cancel`). An import's chunks are
+deleted when it finishes; finished jobs, with an export's file, are
+deleted after `RELINK_JOB_RETENTION_DAYS` (7). `RELINK_JOBS_ENABLED=false`
+keeps an instance from running jobs; any other instance runs them.
+
+**How fast.** On a 4-core container with Postgres 16 on the same machine,
+a 1,000,000-row CSV (46 MB) uploads in 0.7 s and imports in 13 minutes
+(775 s), about 1,290 links a second, each with everything a single
+`POST /v1/links` writes; the server's resident memory stayed under 19 MB
+throughout. Exporting the million as CSV takes 8 s and downloading the
+172 MB file 0.5 s, with the server under 24 MB. The import is bound by the per-link writes on one
+connection; set-based inserts of a step's links would be the next step
+if it needs to be faster.
+
 ## Health checks and SSRF
 
 The worker claims due links with `FOR NO KEY UPDATE SKIP LOCKED`, so several
@@ -2184,6 +2272,7 @@ and counts the clicks it could not write.
 | App targets | deep link 1,024 printable ASCII characters; package name 255; stored object 8 KiB |
 | Version history | the newest 100 versions per link |
 | Conversions | attribution window 1 to 365 days; event 64 characters; `external_id` 128; value 0 to 10¹⁵ minor units; 5 minutes of clock skew either way |
+| Jobs | 10 queued or running per workspace; uploads up to 256 MiB (`RELINK_JOB_MAX_UPLOAD_MB`, 1 to 4,096), records up to 64 KiB, chunks of 500 records or 1 MiB; 100 failed rows kept per job; patches of 1 to 1,000 codes or every link; 5 failed steps in a row fail a job; kept 7 days after they finish (`RELINK_JOB_RETENTION_DAYS`) |
 | Schedules | 20 pending per link; `run_at` within 10 years; due schedules looked for every second (`RELINK_SCHEDULE_POLL_MS`), 100 per query |
 | Domain apps | 8 iOS and 8 Android apps per domain, 8 fingerprints per Android app; bundle ID 155 characters |
 | Alias | 3 to 64 of `[A-Za-z0-9_-]`, alphanumeric at both ends |
